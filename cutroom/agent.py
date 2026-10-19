@@ -17,11 +17,14 @@ An agent exposes the same interface to both callers:
 Binaries: CUTROOM_CLAUDE_BIN (or CUTROOM_CLAUDE) and CUTROOM_CODEX_BIN override the PATH lookup. The real
 executable is always used, never a shell alias (subprocesses cannot see aliases anyway).
 """
+import collections
+import contextlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -606,3 +609,286 @@ def tag_schema():
     item = {"type": "object", "additionalProperties": False, "required": list(props), "properties": props}
     return {"type": "object", "additionalProperties": False, "required": ["tags"],
             "properties": {"tags": {"type": "array", "items": item}}}
+
+
+# ================================================================================================== factory roles
+# One headless agent run with a role prompt, a narrow tool set, a wall clock and a structured output.
+# Used by the factory (cutroom/factory). Never resumed: continuity lives in the project brain on disk.
+#
+#   run_role(role, prompt, cfg=cfg, tools=[...], sandbox="read-only", schema={...}, out_dir=<roles/x-1>,
+#            timeout=900, gov=gov) -> {ok, result_json, text, cost_usd, usage, refused, limited, timeout,
+#                                      error, stream_path, seconds, agent, killed}
+#
+# Account problems are recognised ONLY from harness lines: Claude's final `result` event when is_error, Codex's
+# `turn.failed` / non-retry `error` events, and the CLI's own stderr. Text the model wrote never counts (a role
+# that quotes "usage limit reached" must not pause the factory for hours).
+
+REFUSAL_PAT = re.compile(r"not logged in|please run /login|/login|invalid api key|oauth (token|session)[^\n]{0,40}"
+                         r"(expired|revoked|refreshed)|disabled claude subscription access|subscription access[^\n]{0,30}"
+                         r"disabled|authentication[_ ]error|unauthori[sz]ed|missing bearer|\b401\b|\b403\b|"
+                         r"not authenticated|login (has )?expired|credit balance is too low", re.I)
+OVERLOAD_PAT = re.compile(r"overloaded|\b529\b|\b50[0234]\b|internal server error|service unavailable|api error", re.I)
+
+
+def classify_failure(msg):
+    """'refused' | 'limited' | None for a harness error message."""
+    m = str(msg or "")
+    if not m.strip():
+        return None
+    if REFUSAL_PAT.search(m):
+        return "refused"
+    if LIMIT_PAT.search(m) or OVERLOAD_PAT.search(m):
+        return "limited"
+    return None
+
+
+def _extract_json(text):
+    """The last JSON object in `text` (a ```json fence, or the outermost {...})."""
+    if not text:
+        return None
+    if isinstance(text, (dict, list)):
+        return text
+    fences = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    for cand in reversed(fences):
+        try:
+            return json.loads(cand)
+        except ValueError:
+            continue
+    s = text.strip()
+    try:
+        v = json.loads(s)
+        if isinstance(v, dict):
+            return v
+    except ValueError:
+        pass
+    a, b = s.find("{"), s.rfind("}")
+    if 0 <= a < b:
+        try:
+            v = json.loads(s[a:b + 1])
+            return v if isinstance(v, dict) else None
+        except ValueError:
+            return None
+    return None
+
+
+def role_cmd(ag, *, tools, sandbox, schema_path, last_path, cwd, repo, images=(), model="", max_budget_usd=None,
+             add_dirs=()):
+    """argv for one role run of agent `ag` (ClaudeAgent | CodexAgent). The prompt goes to stdin."""
+    if ag.name == "codex":
+        c = [ag.path, "exec"]
+        for p in list(images)[:CodexAgent.max_images]:
+            c += ["-i", str(p)]
+        c += ["--ephemeral", "-s", "workspace-write" if sandbox == "workspace-write" else "read-only",
+              "-C", str(cwd), "--add-dir", str(repo)]
+        for d in add_dirs:
+            c += ["--add-dir", str(d)]
+        c += ["--json", "--skip-git-repo-check"]
+        if os.environ.get("CUTROOM_CODEX_ISOLATE", "1") != "0":
+            c.append("--ignore-user-config")
+        c += ["--output-schema", str(schema_path), "-o", str(last_path)]
+        if model:
+            c += ["-m", model]
+        return c + ["-"]
+    base = sorted({t.split("(")[0] for t in tools})
+    c = [ag.path, "-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence",
+         "--permission-mode", "acceptEdits", "--tools", *(base or [""]), "--allowedTools", *tools,
+         "--add-dir", str(repo)]
+    for d in add_dirs:
+        c += ["--add-dir", str(d)]
+    if os.environ.get("CUTROOM_CLAUDE_ISOLATE", "1") != "0":
+        c += ["--setting-sources", "project,local", "--strict-mcp-config"]
+    c += ["--json-schema", Path(schema_path).read_text()]
+    if model:
+        c += ["--model", model]
+    if max_budget_usd:
+        c += ["--max-budget-usd", f"{float(max_budget_usd):.2f}"]
+    return c
+
+
+def codex_cost(usage, price=None):
+    """Notional $ for Codex token usage (a subscription login has no per-call price; this is for budgets)."""
+    price = price or {"input": 1.25, "cached_input": 0.125, "output": 10.0}
+    u = usage or {}
+    cached = float(u.get("cached_input_tokens") or 0)
+    inp = max(0.0, float(u.get("input_tokens") or 0) - cached)
+    return round((inp * price["input"] + cached * price["cached_input"]
+                  + float(u.get("output_tokens") or 0) * price["output"]) / 1e6, 4)
+
+
+def run_role(role, prompt, *, cfg=None, agent=None, tools=(), sandbox="read-only", schema=None, images=(),
+             timeout=900, model="", cwd=None, env=None, out_dir=None, repo=None, add_dirs=(), max_budget_usd=None,
+             gov=None, on_event=None, on_proc=None, stop_check=None, price=None):
+    """One headless role run. Blocks until it ends, the wall clock (`timeout` s) hits, or stop_check() says
+    stop. With `gov`, waits for the machine-wide `agent` slot first and memory-caps the run."""
+    t0 = time.time()
+    ag = agent if isinstance(agent, _Agent) else (get(agent) if agent in AGENTS else choose(cfg))
+    out = {"ok": False, "result_json": None, "text": "", "cost_usd": 0.0, "usage": {}, "refused": False,
+           "limited": False, "timeout": False, "error": None, "stream_path": None, "seconds": 0.0,
+           "agent": ag.name, "killed": None, "stopped": False, "exit": None}
+    if not ag.path:
+        out["error"] = f"{ag.name} is not installed"
+        out["missing"] = True
+        return out
+    od = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix=f"role-{role}-"))
+    od.mkdir(parents=True, exist_ok=True)
+    (od / "prompt.md").write_text(prompt)
+    schema_path, last_path = od / "schema.json", od / "last.txt"
+    schema_path.write_text(json.dumps(schema or {"type": "object"}))
+    last_path.unlink(missing_ok=True)
+    cwd = Path(cwd or getattr(cfg, "work", ".") or ".")
+    repo = repo or Path(__file__).resolve().parents[1]
+    cmd = role_cmd(ag, tools=tools, sandbox=sandbox, schema_path=schema_path, last_path=last_path, cwd=cwd,
+                   repo=repo, images=images, model=model, max_budget_usd=max_budget_usd, add_dirs=add_dirs)
+    e = _quiet_env()
+    e.update(env or {})
+    e["CUTROOM_FACTORY_ROLE"] = role
+    stream_p, err_p = od / "stream.jsonl", od / "stderr.txt"
+    out["stream_path"] = str(stream_p)
+    (od / "cmd.json").write_text(json.dumps({"argv": [x if len(str(x)) < 2000 else str(x)[:2000] + "…" for x in cmd],
+                                             "cwd": str(cwd), "agent": ag.name}, indent=1))
+
+    def go():
+        try:
+            p = subprocess.Popen([str(c) for c in cmd], cwd=str(cwd), env=e, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                                 errors="replace", start_new_session=True)
+        except OSError as ex:
+            out["error"] = f"could not start {ag.name}: {ex}"
+            return
+        (od / "pid").write_text(str(p.pid))
+        if on_proc:
+            try:
+                on_proc(p)
+            except Exception:  # noqa: BLE001
+                pass
+        err = collections.deque(maxlen=400)
+        t_err = threading.Thread(target=lambda: [err.append(x) for x in p.stderr], daemon=True)
+        t_err.start()
+        try:
+            p.stdin.write(prompt)
+            p.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        fired = {"why": None}
+
+        def wall():
+            while p.poll() is None:
+                if time.time() - t0 > timeout:
+                    fired["why"] = "timeout"
+                    break
+                if stop_check and stop_check():
+                    fired["why"] = "stopped"
+                    break
+                time.sleep(0.25)
+            if fired["why"] and p.poll() is None:
+                from . import governor as _g
+                _g.kill_group(p.pid)
+        tw = threading.Thread(target=wall, daemon=True)
+        tw.start()
+        ctx = gov.watching(p, cmd, kind="agent") if gov is not None else contextlib.nullcontext({"killed": None})
+        st = ag.new_state()
+        harness = []
+        final = {}
+        with ctx as wstate, open(stream_p, "w") as sf:
+            for line in p.stdout:
+                sf.write(line)
+                sf.flush()
+                raw = line.strip()
+                if not raw:
+                    continue
+                ev = ag._decode(raw)
+                if ev and ag.name == "claude" and ev.get("type") == "result":
+                    final = ev
+                    if ev.get("is_error"):
+                        harness.append(str(ev.get("result") or ev.get("subtype") or "error"))
+                if ev and ag.name == "codex":
+                    if ev.get("type") == "turn.failed":
+                        er = ev.get("error") or {}
+                        harness.append(str(er.get("message") if isinstance(er, dict) else er))
+                    elif ev.get("type") == "turn.completed":
+                        for k, v in (ev.get("usage") or {}).items():
+                            if isinstance(v, (int, float)):
+                                out["usage"][k] = out["usage"].get(k, 0) + v
+                try:
+                    evs = ag.parse_event(raw, st)
+                except Exception:  # noqa: BLE001
+                    evs = []
+                for x in evs:
+                    if x.get("type") == "text":
+                        out["text"] += x.get("text") or ""
+                    if on_event and x.get("type") in ("tool", "text", "status"):
+                        try:
+                            on_event(x)
+                        except Exception:  # noqa: BLE001
+                            pass
+            out["exit"] = p.wait()
+            out["killed"] = (wstate or {}).get("killed")
+        tw.join(timeout=5)
+        t_err.join(timeout=3)
+        stderr = "".join(err)
+        err_p.write_text(stderr)
+        if ag.name == "codex" and st.get("last_error"):
+            harness.append(st["last_error"])
+        # ---- outcome
+        if fired["why"] == "timeout":
+            out["timeout"] = True
+            out["error"] = f"{role} hit its wall clock ({timeout:.0f}s) and was stopped"
+        elif fired["why"] == "stopped":
+            out["stopped"] = True
+            out["error"] = "stopped"
+        elif out["killed"]:
+            out["error"] = f"stopped by the governor: {out['killed']}"
+        if ag.name == "claude":
+            if final:
+                out["cost_usd"] = float(final.get("total_cost_usd") or final.get("cost_usd") or 0)
+                out["usage"] = final.get("usage") or {}
+                sj = final.get("structured_output")
+                out["result_json"] = sj if isinstance(sj, dict) else (None if final.get("is_error")
+                                                                       else _extract_json(final.get("result") or out["text"]))
+        else:
+            try:
+                last = last_path.read_text()
+            except OSError:
+                last = ""
+            out["result_json"] = _extract_json(last) or (None if harness else _extract_json(out["text"]))
+            out["cost_usd"] = codex_cost(out["usage"], price)
+        if not out["error"] and harness:
+            out["error"] = _short(" | ".join(harness), 800)
+        if not out["error"] and out["exit"] and out["result_json"] is None:
+            out["error"] = f"{ag.name} exited {out['exit']}: {_short(stderr[-600:] or 'no output', 600)}"
+            harness.append(stderr[-2000:])
+        if not out["error"] and out["result_json"] is None:
+            out["error"] = f"{role} ended without a result"
+        kind = None
+        if not out["timeout"] and not out["stopped"]:
+            for h in harness + ([stderr[-3000:]] if (out["exit"] and out["result_json"] is None) else []):
+                kind = classify_failure(h) or kind
+                if kind == "refused":
+                    break
+        out["refused"] = kind == "refused"
+        out["limited"] = kind == "limited"
+        out["ok"] = out["error"] is None and isinstance(out["result_json"], dict)
+
+    if gov is not None:
+        waited = False
+        while True:
+            if stop_check and stop_check():
+                out["stopped"], out["error"] = True, "stopped while waiting for the agent slot"
+                break
+            with gov.try_slot("agent", label=f"factory {role}") as got:
+                if got:
+                    go()
+                    break
+            if not waited and on_event:
+                on_event({"type": "status", "text": "waiting for the AI slot (another agent run is busy)"})
+            waited = True
+            time.sleep(2.0)
+    else:
+        go()
+    out["seconds"] = round(time.time() - t0, 1)
+    if isinstance(out["result_json"], dict):
+        (od / "result.json").write_text(json.dumps(out["result_json"], indent=1, ensure_ascii=False))
+    (od / "usage.json").write_text(json.dumps({k: out[k] for k in ("ok", "cost_usd", "usage", "refused", "limited",
+                                                                    "timeout", "stopped", "error", "seconds", "agent",
+                                                                    "killed", "exit")}, indent=1, default=str))
+    return out

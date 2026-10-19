@@ -172,9 +172,9 @@ Tags: **[creator-feedback]** means the creator asked for it or rejected somethin
 
 ## 5. Match cuts & transitions
 
-38. **Make transitions from the footage itself: match cuts, same-frame day-to-night, walk-throughs.** [creator-feedback]
-    Why: overlay transitions (light leaks, burns, scribbles, film strips, smears, VHS rewinds, frame-rate strobes, shape wipes) looked like template-app presets. The creator called the colours "so bad".
-    Check: the transition list may contain only hard cuts and footage-made devices. Reject any overlay asset in the render graph.
+38. **The reference wins. Rebuild every effect the creator's reference measurably has (film burns, light leaks, inset strobes, window-box gates, letterboxes, title cards, typed titles), matched to its measured colour, size and timing. Home-made decorative effects the reference does not have stay banned.** [creator-feedback]
+    Why: home-made leaks, burns, scribbles, film strips and smears that no reference had looked like template-app presets ("the colours are so bad", v019). Then a match without the reference's own devices was rejected the other way: "the flashes are missing, there's no Coming Up, the resolution change is missing". The forensic inventory of the reference intro found a "COMING UP" card, a two-frame film burn on every major boundary, an inset strobe on black and a window-box gate that drops on the biggest hit. Those are the creator's taste, not presets.
+    Check: QA `devices_vs_reference`: every device in the render (sidecar `devices`: burn, card, inset, gate, letterbox, typed_title, film) appears in the reference's measured devices (`cutroom ref` analysis `devices`, sidecar `reference.devices`). A device the reference lacks fails. Effects are generated from the measured numbers (cards.py), never stock or downloaded assets.
 
 39. **Remove the whoosh with the overlay transition it belonged to.** [measured-failure]
     Why: when the overlays were removed, their whooshes still fired over plain cuts.
@@ -540,9 +540,9 @@ predecessor cut and a cutroom render. These rules hold the measured numbers. Ren
     Why: the reference's floor steps 2.2 dB (median) across talk-to-talk cuts. The approved predecessor stepped 9.5 dB and the creator heard "loud silence".
     Check: QA `room_tone_steps`: median |step| ≤ 3 dB, p90 ≤ 8 dB, and the quietest 250 ms inside talk is above −55 dBFS.
 
-120. **Normalise exposure in log before the LUT, by at most one stop and by half the measured error. Run the same finishing curve on every shot. Never brighten after the LUT.** [measured-failure]
-    Why: a post-LUT brightness lift put the black point at 28/255 against the reference's 10, and the night interior went milky grey.
-    Check: QA `black_level`: median p1 ≤ 16. The sidecar shows one `finish` string on every piece.
+120. **The house grade is the LUT and nothing else. Exposure normalisation, the finishing curve, vibrance, saturation and looks are opt-in, only when the creator asks. Never brighten after the LUT, and never crush the toe.** [measured-failure]
+    Why: the stack after the LUT (a log exposure pull on every bright shot, a finishing curve with vibrance, saturation 1.05 and a night look at 40 %) took the approved LUT-only picture from black point 33 / saturation 54 to black point 2 / saturation 104 on the same frame; the creator called it "insane". Earlier, a post-LUT brightness lift put the black point at 28/255 and the night interior went milky. The approved v023 is LUT-only and measures p1 29–41 on daylight; the reference measures 8.
+    Check: QA `black_level`: median p1 between 8 and 35 (not crushed, not milky), and no daylight shot below p1 4. QA `grade_bounds`: every clip shot within ±15 luma of its LUT-only probe, black point no more than 12 below it, saturation at most +15 %. The sidecar's `grade_style` shows the opt-ins.
 
 121. **Build the cold open from teaser lines that pay off later. Cut it dense (about 0.45 s, faster than the beat), and keep the music full under the teaser voice.** [measured-failure]
     Why: the reference opens with 22 shots in 10.4 s. Its first word comes at 1.43 s, and the music runs 3.5–7 dB under the voice without ducking. The rough cut opened with 8 shots at 1.33 s each, then a title card.
@@ -552,9 +552,9 @@ predecessor cut and a cutroom render. These rules hold the measured numbers. Ren
     Why: in the reference, the bass falls 20 dB within one 10 ms frame at section cuts, and the montage music sits 7 LU above the talking. Natural sound under b-roll used to duck the music 18 dB.
     Check: music edges are within a frame of a cut, and the music under natural-sound b-roll is within 3 dB of the montage level.
 
-123. **A transition is light made from the footage (a flash or dip) or a footage device (a match cut or whip). It sits on a real event, lasts 2–5 frames, and its one SFX lands with the transient peak on the cut frame.** [measured-failure]
-    Why: 16 of the reference's 58 events are light bursts exactly at section and location changes, and 59 % of its transitions carry a transient. Pushing exposure past about +1 stop through the LUT turns magenta, so mix toward white instead. Overlay assets stay banned (rule 38).
-    Check: QA `flash_sfx_alignment`: the flash peak lands on the cut frame ±1, and the SFX transient within ±5 ms.
+123. **A flash is the reference's own device, in the reference's own shape. When the reference burns (the two-frame film burn: a red glow rising from the lower left on the last outgoing frame, an orange-yellow disc with a magenta fringe entering from the right on the first incoming frame, the cut between them), use `transition.kind: "burn"`. When it strobes, use 3-frame inset shots on black and the inset↔gate↔full-frame snaps. Mix-to-white flashes are only for references that have white flashes. Every flash sits on a real event and its one SFX lands with the transient peak on the cut frame.** [measured-failure]
+    Why: the reference's flashes are 2-frame warm burns (16 at section and location changes; the biggest hit of the intro at 7.32 s) and luma swings between an inset on black and full frame. v2's mix-to-white dips (luma 205–237) read as a CapCut white flash and the creator said the flashes were missing. Pushing exposure past about +1 stop through the LUT turns magenta, so a white flash mixes toward white rather than pushing exposure.
+    Check: QA `burn_timing`: the glow is on the frame before the cut and the disc on the cut frame, nowhere else. QA `flash_sfx_alignment`: a white flash peaks on the cut frame ±1, and every transition sound's transient lands within ±5 ms. QA `card_present` fails when the reference opens on a card and the render does not.
 
 124. **Lead the voice into the face (J-cut, about 0.3 s) and let it trail over b-roll (L-cut). Keep the b-roll's own sound under the music.** [measured-failure]
     Why: in the reference, speech is already running before the cut in 33 of 40 cuts into talk. B-roll keeps its location sound at about −35 dBFS between lines.

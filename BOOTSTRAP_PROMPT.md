@@ -24,7 +24,9 @@ Do all of this yourself, in order, and only stop to ask me if you truly need me 
 a password for an installer):
 
 1. **Install everything.** Create `.venv` in this folder and run `pip install -e '.[asr,voice]'` inside
-   it. If `ffmpeg` is missing, install it (`brew install ffmpeg` on a Mac, `sudo apt install ffmpeg` on
+   it. On an Apple Silicon Mac (`uname -m` prints `arm64`) install `'.[asr,mlx,voice]'` instead, so
+   transcription runs on the GPU with MLX Whisper; `cutroom doctor` then shows `ASR backend  mlx`.
+   If `ffmpeg` is missing, install it (`brew install ffmpeg` on a Mac, `sudo apt install ffmpeg` on
    Ubuntu/Debian). Check that Google Chrome or Chromium is available (it is optional, used for motion
    graphics); tell me if it isn't.
 2. **Create the project.** Run `cutroom init <WORK FOLDER> --library <FOOTAGE FOLDER>` (one `--library`
@@ -33,7 +35,9 @@ a password for an installer):
    yourself (optional items may stay missing) and run it again until it is clean.
 4. **Open the Studio.** Start `cutroom studio --open` in the background and give me the link
    (`http://127.0.0.1:8600` unless it says otherwise). From then on I talk to you in the Studio's chat
-   panel, or here in the terminal.
+   panel, or here in the terminal. The Studio also runs the **factory** (docs/FACTORY.md): when I comment
+   on a version and press Send to factory, a team of short AI runs builds, checks and hands me the next
+   version on the Review tab. It uses this same login; nothing else to set up.
 5. **Offer to understand my library.** Measure how fast this machine is on a few clips (for example a
    timed `cutroom index --limit 5` and `cutroom transcribe --limit 2`), then tell me how long the full
    overnight run ("Understand my library", `cutroom overnight`) will take, based on those measurements,
@@ -70,7 +74,9 @@ Do all of this yourself, in order, and only stop to ask me if you truly need me 
 approve a command that needs network access or to type a password for an installer):
 
 1. **Install everything.** Create `.venv` in this folder and run `pip install -e '.[asr,voice]'` inside
-   it. If `ffmpeg` is missing, install it (`brew install ffmpeg` on a Mac, `sudo apt install ffmpeg` on
+   it. On an Apple Silicon Mac (`uname -m` prints `arm64`) install `'.[asr,mlx,voice]'` instead, so
+   transcription runs on the GPU with MLX Whisper; `cutroom doctor` then shows `ASR backend  mlx`.
+   If `ffmpeg` is missing, install it (`brew install ffmpeg` on a Mac, `sudo apt install ffmpeg` on
    Ubuntu/Debian). Check that Google Chrome or Chromium is available (it is optional, used for motion
    graphics); tell me if it isn't.
 2. **Create the project.** Run `cutroom init <WORK FOLDER> --library <FOOTAGE FOLDER>` (one `--library`
@@ -81,7 +87,9 @@ approve a command that needs network access or to type a password for an install
    `cutroom.json`.
 4. **Open the Studio.** Start `cutroom studio --open` in the background and give me the link
    (`http://127.0.0.1:8600` unless it says otherwise). From then on I talk to you in the Studio's chat
-   panel, or here in the terminal.
+   panel, or here in the terminal. The Studio also runs the **factory** (docs/FACTORY.md): when I comment
+   on a version and press Send to factory, a team of short AI runs builds, checks and hands me the next
+   version on the Review tab. It uses this same login; nothing else to set up.
 5. **Offer to understand my library.** Measure how fast this machine is on a few clips (for example a
    timed `cutroom index --limit 5` and `cutroom transcribe --limit 2`), then tell me how long the full
    overnight run ("Understand my library", `cutroom overnight`) will take, based on those measurements,

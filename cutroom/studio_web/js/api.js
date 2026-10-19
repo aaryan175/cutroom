@@ -68,6 +68,28 @@ export const api = {
   importInfo: () => req('GET', '/api/import'),
   locate: (files, folder) => req('POST', '/api/import/locate', { files, folder }),
   importFootage: (paths) => req('POST', '/api/import/footage', { paths }),
+  fx: {
+    state: () => req('GET', '/api/factory/state'),
+    orders: (plan) => req('GET', '/api/factory/orders' + qs({ plan })),
+    order: (id) => req('GET', `/api/factory/orders/${enc(id)}`),
+    send: (body) => req('POST', '/api/factory/orders', body),
+    stop: (id) => req('POST', `/api/factory/orders/${enc(id)}/stop`),
+    retry: (id) => req('POST', `/api/factory/orders/${enc(id)}/retry`),
+    roleLog: (id, role) => req('GET', `/api/factory/orders/${enc(id)}/role/${enc(role)}/log`),
+    answer: (order, question, option, text) => req('POST', '/api/factory/answer', { order, question, option, text }),
+    verdict: (plan, version, disposition, text) => req('POST', '/api/factory/verdict', { plan, version, disposition, text }),
+    variants: (order, items) => req('POST', `/api/factory/variants/${enc(order)}`, { items }),
+    pause: () => req('POST', '/api/factory/pause'),
+    resume: () => req('POST', '/api/factory/resume'),
+    lessons: () => req('GET', '/api/factory/lessons'),
+    addLesson: (b) => req('POST', '/api/factory/lessons', b),
+    patchLesson: (b) => req('PATCH', '/api/factory/lessons', b),
+    brain: (slug) => req('GET', `/api/factory/brain/${enc(slug)}`),
+    putBrain: (slug, name, value) => req('PUT', `/api/factory/brain/${enc(slug)}/${enc(name)}`, { value }),
+    versions: (plan) => req('GET', '/api/factory/versions' + qs({ plan })),
+    review: () => req('GET', '/api/review'),
+    grade: (b) => req('POST', '/api/grades', b),
+  },
   planVersion: (slug, file) => req('GET', `/api/plan/${enc(slug)}/version/${enc(file)}`),
   text: async (url) => { const r = await fetch(url); if (!r.ok) throw new ApiError(`${r.status} ${url}`, r.status); return r.text(); },
   json: async (url) => { const r = await fetch(url); if (!r.ok) throw new ApiError(`${r.status} ${url}`, r.status); return r.json(); },
@@ -137,7 +159,7 @@ export async function chatStream(body, onEvent, signal) {
 /** Live /api/events with auto-reconnect and backoff. handlers: {name: fn(data)}, onState(state). */
 export function connectEvents(handlers, onState) {
   let es = null, retry = 1000, stopped = false, timer = null;
-  const names = ['hello', 'plan_changed', 'job', 'jobs', 'governor', 'render_done', 'qa_done', 'notes', 'markers', 'overnight', 'chat', 'bins_changed', 'comments', 'ref', 'library_changed', 'export_done'];
+  const names = ['hello', 'plan_changed', 'job', 'jobs', 'governor', 'render_done', 'qa_done', 'notes', 'markers', 'overnight', 'chat', 'bins_changed', 'comments', 'ref', 'library_changed', 'export_done', 'factory', 'factory_state'];
   const dispatch = (name, raw) => {
     let d; try { d = JSON.parse(raw); } catch { d = { text: raw }; }
     const n = (name && name !== 'message') ? name : (d && d.type);

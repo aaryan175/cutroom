@@ -21,10 +21,13 @@ from . import media
 
 # used only when nothing was measured (labelled "assumed" in the output)
 ASSUMED = {
-    "proxies": 2.0,          # x realtime, wall clock with the governor's heavy slots (4K 10-bit -> 540p, hardware)
-    "analyze": 10.0,         # x realtime, wall clock (2 workers on 540p proxies)
+    "proxies": 2.0,          # x realtime, wall clock with 2 heavy slots (4K 10-bit -> 540p, hardware); scaled by slots
+    "analyze": 10.0,         # x realtime, wall clock with 2 workers on 540p proxies; scaled by slots
     "vad": 120.0,            # x realtime (ffmpeg decode + Silero VAD)
     "asr": {"tiny": 12.0, "base": 8.0, "small": 4.0, "medium": 1.8, "large-v3": 0.8, "large-v3-turbo": 2.5},
+    # mlx backend (Apple GPU), x realtime, warm model: measured once on a 10-core-GPU M4 / 16 GB under heavy
+    # load (38 s talk clip). Bigger GPUs should be faster; models not listed fall back to the CPU figure.
+    "asr_mlx": {"small": 8.5, "medium": 5.2},
     "sheet_s": 0.6,          # seconds per clip
     "tag_call_s": 55.0,      # one tagging call (20-90 s measured)
     "speech_share": 0.35,    # share of footage with speech
@@ -96,11 +99,10 @@ def measured_rates(cfg) -> dict:
         xs = [h["x_realtime"] for h in hist[-3:] if h.get("x_realtime")]
         if xs:
             out[stage] = (statistics.median(xs), f"measured (last {len(xs)} run(s))")
-        if stage == "transcribe":
-            for h in reversed(hist):
+        if stage in ("transcribe", "upgrade"):
+            for h in hist:                                  # oldest first: the newest per backend+model wins
                 if h.get("model") and h.get("x_realtime"):
-                    out[f"asr:{h['model']}"] = (h["x_realtime"], "measured")
-                    break
+                    out[f"asr:{h.get('backend') or 'faster-whisper'}:{h['model']}"] = (h["x_realtime"], "measured")
     try:
         st = json.loads((od / "state.json").read_text())
     except (OSError, ValueError):
@@ -112,8 +114,8 @@ def measured_rates(cfg) -> dict:
         if w > 0 and el > 60 and stage not in out:
             src = "measured (current run)" if s.get("status") == "running" else "measured (last run)"
             out[stage] = (w / el, src)
-            if stage == "transcribe" and s.get("model"):
-                out[f"asr:{s['model']}"] = (w / el, src)
+            if stage in ("transcribe", "upgrade") and s.get("model"):
+                out[f"asr:{s.get('backend') or 'faster-whisper'}:{s['model']}"] = (w / el, src)
     if "tag" in (st.get("stages") or {}):
         s = st["stages"]["tag"]
         if s.get("calls") and s.get("started"):
@@ -179,6 +181,9 @@ def estimate(cfg, con, tb=None, hours=None, do_bench=False, echo=print) -> dict:
         if stage in b:
             par = slots * 0.8 if stage in ("proxies", "analyze") else 1.0
             return b[stage] * par, f"benchmark x{par:.1f} slots"
+        if stage in ("proxies", "analyze") and slots != 2:     # the assumptions are for 2 slots
+            par = slots / 2 * (0.8 if slots > 2 else 1.0)
+            return default * par, f"assumed, scaled to {slots} slots"
         return default, "assumed"
 
     model = getattr(cfg, "asr_model", "medium") or "medium"
@@ -187,12 +192,19 @@ def estimate(cfg, con, tb=None, hours=None, do_bench=False, echo=print) -> dict:
     r_px, s_px = rate("proxies", ASSUMED["proxies"])
     r_an, s_an = rate("analyze", ASSUMED["analyze"])
     r_vad, s_vad = rate("vad", ASSUMED["vad"])
-    if f"asr:{asr_model}" in rates:
-        r_asr, s_asr = rates[f"asr:{asr_model}"]
-    elif asr_model == model and "transcribe" in rates:
-        r_asr, s_asr = rates["transcribe"]
-    else:
-        r_asr, s_asr = ASSUMED["asr"].get(asr_model, 1.8), "assumed"
+    backend = asr_backend(cfg, asr_model)
+
+    def asr_rate(m):
+        """(x realtime, source) for model m on this project's backend; never another backend's speed."""
+        be = asr_backend(cfg, m)
+        if f"asr:{be}:{m}" in rates:
+            return rates[f"asr:{be}:{m}"]
+        if be == "mlx" and m in ASSUMED["asr_mlx"]:
+            return ASSUMED["asr_mlx"][m], "assumed (mlx, measured on another Apple Silicon machine)"
+        if be == "mlx":
+            return ASSUMED["asr"].get(m, 1.8), "assumed (no mlx figure for this model: CPU figure used)"
+        return ASSUMED["asr"].get(m, 1.8), "assumed"
+    r_asr, s_asr = asr_rate(asr_model)
     if getattr(cfg, "asr_remote", ""):
         s_asr += " (asr_remote set: the far machine's speed applies)"
     call_s, s_call = rates.get("tag_call_s", (ASSUMED["tag_call_s"], "assumed"))
@@ -222,10 +234,10 @@ def estimate(cfg, con, tb=None, hours=None, do_bench=False, echo=print) -> dict:
             ("analyze", f"{an_h:.1f} h footage", an_h / r_an, s_an, f"{r_an:.1f}x"),
             ("dedupe+highlights+sessions", f"{an_h:.1f} h footage", an_h / (r_vad * 0.6), "from VAD speed", "audio pass"),
             ("speech check (VAD)", f"{tx_h:.1f} h audio", tx_h / r_vad, s_vad, f"{r_vad:.0f}x"),
-            (f"transcribe ({asr_model})", f"{sp_h:.1f} h speech", sp_h / r_asr, s_asr, f"{r_asr:.2f}x"),
+            (f"transcribe ({asr_model}, {backend})", f"{sp_h:.1f} h speech", sp_h / r_asr, s_asr, f"{r_asr:.2f}x"),
         ]
         if fast and fast != model:
-            r_full = rates.get(f"asr:{model}", (ASSUMED["asr"].get(model, 1.8), "assumed"))
+            r_full = asr_rate(model)
             rows.append((f"upgrade pass ({model})", f"{sp_h:.1f} h speech", sp_h / r_full[0], r_full[1],
                          f"{r_full[0]:.2f}x"))
         rows.append(("AI tagging", f"{tag_clips:.0f} clips = {calls} calls", calls * (call_s + pause) / 3600, s_call,
@@ -241,7 +253,10 @@ def estimate(cfg, con, tb=None, hours=None, do_bench=False, echo=print) -> dict:
             "transcribed": facts["transcribed_hours"] / facts["audio_hours"] if facts["audio_hours"] else 0,
             "sheets": facts["sheets"] / facts["clips"] if facts["clips"] else 0,
             "tagged": facts["tagged"] / facts["clips"] if facts["clips"] else 0}
+    hw = getattr(gov, "hardware", None) or governor.hardware()
     out = {"facts": facts, "slots": slots, "this_library": project(facts["hours"], done),
+           "machine": {"chip": hw.get("chip") or "", "cpus": hw.get("cpus"), "perf_cores": hw.get("perf_cores"),
+                       "ram_gb": hw.get("ram_gb"), "heavy_slots": slots, "asr_backend": backend},
            "proxy_settings": {"height": int(getattr(cfg, "proxy_height", 540)), "bitrate": media.proxy_bitrate(cfg),
                               "mb_per_s": round(pmb, 4)}}
     target_h = None
@@ -255,8 +270,23 @@ def estimate(cfg, con, tb=None, hours=None, do_bench=False, echo=print) -> dict:
     return out
 
 
+def asr_backend(cfg, model):
+    if getattr(cfg, "asr_remote", ""):
+        return "remote"
+    from . import asr
+    try:
+        return asr.backend_for(cfg, model)
+    except (RuntimeError, ValueError):
+        return "faster-whisper"
+
+
 def print_estimate(res, echo=print):
     f = res["facts"]
+    m = res.get("machine")
+    if m:
+        echo(f"machine: {m['chip'] or 'unknown chip'} · {m['cpus']} cores"
+             + (f" ({m['perf_cores']} performance)" if m.get("perf_cores") else "")
+             + f" · {m['ram_gb']:g} GB RAM · heavy slots {m['heavy_slots']} · ASR 1 slot ({m['asr_backend']})")
     echo(f"library: {f['clips']} clips · {f['hours']:.1f} h · {f['bytes'] / 1e12:.2f} TB "
          f"({f['gb_per_hour']:.1f} GB per hour, mean clip {f['mean_clip_s']:.1f}s) · heavy slots {res['slots']}")
     echo(f"done so far: proxies {f['proxied_hours']:.1f} h · analysed {f['analyzed_hours']:.1f} h · "

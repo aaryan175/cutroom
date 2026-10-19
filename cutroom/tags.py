@@ -119,10 +119,49 @@ def _scale_maps(cfg, con, args) -> dict:
         lst = analyze.near(cfg, con, args.near, limit=max(50, getattr(args, "limit", 30) or 30))
         near_rank = {x["id"]: (i, x["dist"]) for i, x in enumerate(lst)}
         only = set(near_rank) if only is None else only & set(near_rank)
-    return {"hl": hl, "rep": rep, "sess": sess, "only": only, "near": near_rank}
+    ev = None
+    kind = getattr(args, "kind", None)
+    if kind:
+        ev = event_kind_map(con, kind)
+        only = set(ev) if only is None else only & set(ev)
+    return {"hl": hl, "rep": rep, "sess": sess, "only": only, "near": near_rank, "ev": ev}
+
+
+def event_kind_map(con, kind) -> dict:
+    """clip id -> {score, t, energy, windows, share} for clips with at least one window of this event kind
+    (`cutroom detect events`)."""
+    if kind not in analyze.EVENT_KINDS:
+        raise ValueError(f"kind must be one of {analyze.EVENT_KINDS}")
+    analyze.ensure_event_schema(con)
+    out = {}
+    for r in con.execute(f"SELECT clip_id, MAX({kind}) AS sc, COUNT(*) AS n, MAX(energy) AS en FROM event_windows "
+                         "WHERE kind = ? GROUP BY clip_id", (kind,)):
+        best = con.execute(f"SELECT t0 FROM event_windows WHERE clip_id=? AND kind=? ORDER BY {kind} DESC LIMIT 1",
+                           (r["clip_id"], kind)).fetchone()
+        tot = con.execute("SELECT COUNT(*) FROM event_windows WHERE clip_id=?", (r["clip_id"],)).fetchone()[0]
+        out[r["clip_id"]] = {"score": round(r["sc"], 3), "t": best["t0"], "energy": round(r["en"] or 0, 3),
+                             "windows": r["n"], "share": round(r["n"] / max(1, tot), 3)}
+    return out
+
+
+def print_soundbites(cfg, con, args) -> list:
+    rows = analyze.soundbite_list(con, limit=getattr(args, "limit", 30) or 30, text=getattr(args, "text", "") or None)
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=1))
+        return rows
+    if not rows:
+        print("no soundbites (transcribe the stage clips, then `cutroom detect events`)")
+        return rows
+    print(f"{'clip':10s} {'in':>7s} {'out':>7s} {'score':>5s}  loud pitch emph words resp  line")
+    for r in rows:
+        print(f"{r['clip_id']:10s} {r['t0']:7.2f} {r['t1']:7.2f} {r['score']:5.2f}  {r['loud']:4.2f} {r['pitch']:5.2f} "
+              f"{r['emphasis']:4.2f} {r['wording']:5.2f} {r['response']:4.2f}  \"{(r['text'] or '')[:70]}\"")
+    return rows
 
 
 def search(cfg, con, args):
+    if getattr(args, "soundbites", False):
+        return print_soundbites(cfg, con, args)
     words = [_norm(w) for w in (getattr(args, "text", "") or "").split() if _norm(w)]
     rows = con.execute("""
         SELECT c.id, c.rel, c.path, c.duration, c.sheet, c.proxy, c.status, t.data AS tags,
@@ -193,8 +232,11 @@ def search(cfg, con, args):
         c.update(quality=quality, shake=m["shake"] if m else None)
         out.append(c)
     hl = scale["hl"]
+    ev = scale.get("ev")
     if scale["near"] is not None:
         out.sort(key=lambda c: scale["near"].get(c["row"]["id"], (999, None))[0])
+    elif ev is not None:
+        out.sort(key=lambda c: (-c["score"], -ev[c["row"]["id"]]["score"] * (0.5 + ev[c["row"]["id"]]["share"])))
     elif getattr(args, "highlights", False):
         out.sort(key=lambda c: (-c["score"], -(hl.get(c["row"]["id"]) or (0,))[0], -(c["quality"] or 0)))
     else:
@@ -212,7 +254,8 @@ def search(cfg, con, args):
                     "sheet": r["sheet"], "proxy": r["proxy"], "tags": tags,
                     "highlight": _hl_dict(hl.get(r["id"])), "session": scale["sess"].get(r["id"]),
                     "dupe_of": (lambda rep: rep if rep and rep != r["id"] else None)(scale["rep"].get(r["id"])),
-                    "near_dist": (scale["near"] or {}).get(r["id"], (0, None))[1]})
+                    "near_dist": (scale["near"] or {}).get(r["id"], (0, None))[1],
+                    "event": (ev or {}).get(r["id"])})
     _note_usage(cfg, [x["id"] for x in res[:10]] if words else [])
     if getattr(args, "json", False):
         print(json.dumps(res, indent=1))
@@ -231,6 +274,9 @@ def search(cfg, con, args):
             desc = f"[hl {h['score']:.2f} @{h['t'] or 0:.0f}s{(' ' + h['kind']) if h['kind'] else ''}] {desc}"
         if x["near_dist"] is not None:
             desc = f"[near {x['near_dist']:.1f}] {desc}"
+        if x.get("event"):
+            e = x["event"]
+            desc = f"[{args.kind} {e['score']:.2f} @{e['t']:.0f}s, {100 * e['share']:.0f}% of clip, energy {e['energy']:.2f}] {desc}"
         if x["session"] is not None and getattr(args, "session", None) is None:
             desc = f"[shoot {x['session']}] {desc}"
         q = f"{x['quality']:.0f}" if x["quality"] is not None else "-"
@@ -283,6 +329,15 @@ def describe(cfg, con, ref, frames=0):
     pk = con.execute("SELECT score, t, kind FROM highlight_peaks WHERE clip_id=?", (cid,)).fetchone()
     if pk and pk["t"] is not None:
         print(f"  highlight {pk['score']:.2f} at {pk['t']:.0f}s" + (f" ({pk['kind']})" if pk["kind"] else ""))
+    analyze.ensure_event_schema(con)
+    ev = con.execute("SELECT * FROM event_clips WHERE clip_id=?", (cid,)).fetchone()
+    if ev:
+        print(f"  event    {ev['kind'] or 'mixed'} (stage {100 * ev['stage']:.0f}% · crowd {100 * ev['crowd']:.0f}% · "
+              f"wide {100 * ev['wide']:.0f}% of windows) · energy peak {ev['energy']:.2f}"
+              + (f" at {ev['energy_t']:.0f}s" if ev["energy_t"] is not None else ""))
+        nb = con.execute("SELECT COUNT(*), MAX(score) FROM soundbites WHERE clip_id=?", (cid,)).fetchone()
+        if nb[0]:
+            print(f"  soundbites {nb[0]} (best {nb[1]:.2f}; cutroom search --soundbites)")
     se = con.execute("SELECT session, place FROM sessions WHERE clip_id=?", (cid,)).fetchone()
     if se:
         print(f"  shoot    {se['session']}" + (f" · place {se['place']}" if se["place"] else ""))
@@ -371,7 +426,8 @@ _STATS_CHECKED = {}
 
 def query(cfg, con, text="", setting=None, time=None, people=None, shot=None, camera=None, max_shake=None,
           min_quality=None, speech=None, creator=False, min_dur=None, offset=0, limit=200,
-          include_unusable=False, day=None, highlights=False, dedupe=False, session=None, near=None) -> dict:
+          include_unusable=False, day=None, highlights=False, dedupe=False, session=None, near=None,
+          event_kind=None) -> dict:
     """Filtered, scored, paged clip search in SQL. Same filters and ranking as `search`
     (tags x3, speech x2, path x1 per word; then quality, then duration). speech: True = with
     speech, False = without, None = either. Returns {total, offset, limit, rows}."""
@@ -388,6 +444,10 @@ def query(cfg, con, text="", setting=None, time=None, people=None, shot=None, ca
         args.append(int(session))
     if dedupe:
         where.append("(d.clip_id IS NULL OR d.rep = c.id)")
+    if event_kind:                                                # stage | crowd | wide (cutroom detect events)
+        analyze.ensure_event_schema(con)
+        where.append("c.id IN (SELECT clip_id FROM event_windows WHERE kind = ?)")
+        args.append(str(event_kind))
     if highlights:
         where.append("COALESCE(hp.score, 0) >= ?")
         args.append(HL_MIN)

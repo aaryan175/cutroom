@@ -11,6 +11,7 @@ import json
 import math
 import multiprocessing
 import os
+import re
 import statistics
 import subprocess
 import time
@@ -1099,3 +1100,379 @@ def gate_reason(cfg, row, q) -> str | None:
         if sh and (q.get("shake") or 0) > sh:
             return f"very shaky (shake {q['shake']:.1f})"
     return None
+
+
+# ==================================================================================================
+# Event recap detectors (live seminar / conference footage): what kind of shot each 2 s window is,
+# where the crowd energy peaks, and which spoken lines are soundbites. Every number is a cheap,
+# explainable measurement; the kinds are estimates the AI confirms on the frames before it trusts them.
+#
+#   event_windows   per 2 s window: stage / crowd / wide scores (0-1), kind, energy (0-1), peak flag and
+#                   the raw cues they come from (loudness, applause, local motion, faces, face size,
+#                   stage-light share, edge density)
+#   event_clips     per clip: dominant kind, share of each kind, strongest energy moment
+#   soundbites      short spoken lines scored by loudness, pitch, emphasis, wording and the crowd's
+#                   response right after (needs a transcript; nothing here runs speech-to-text)
+# ==================================================================================================
+
+EVENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS event_windows (clip_id TEXT, t0 REAL, t1 REAL, kind TEXT, stage REAL, crowd REAL,
+  wide REAL, energy REAL, peak INTEGER, loud REAL, applause REAL, local_motion REAL, faces INTEGER, face_h REAL,
+  lights REAL, edges REAL, luma REAL, PRIMARY KEY (clip_id, t0));
+CREATE INDEX IF NOT EXISTS event_windows_kind ON event_windows(kind);
+CREATE TABLE IF NOT EXISTS event_clips (clip_id TEXT PRIMARY KEY, kind TEXT, stage REAL, crowd REAL, wide REAL,
+  energy REAL, energy_t REAL, updated REAL);
+CREATE TABLE IF NOT EXISTS soundbites (clip_id TEXT, t0 REAL, t1 REAL, text TEXT, score REAL, loud REAL,
+  pitch REAL, emphasis REAL, wording REAL, response REAL, PRIMARY KEY (clip_id, t0));
+CREATE INDEX IF NOT EXISTS soundbites_score ON soundbites(score);
+"""
+EVENT_KINDS = ("stage", "crowd", "wide")
+EV_FPS = 4.0                     # picture sampling for the event pass (local motion needs ~4 fps)
+EV_W = 320                       # analysis width (faces use 2x this)
+EV_KIND_MIN = 0.35               # a kind needs at least this score, and a margin over the runner-up
+EV_KIND_MARGIN = 0.08
+EV_PEAK = 0.5                    # energy at or above this, and a local maximum in its clip = a peak
+BITE_MIN_S, BITE_MAX_S = 0.8, 7.0
+BITE_MIN_WORDS, BITE_MAX_WORDS = 3, 18
+_QUOTE = re.compile(r"\b(you|your|we|our|together|today|tonight|now|never|always|everything|nothing|believe|"
+                    r"dream|change|future|win|life|stand|rise|ready|let's|lets)\b", re.I)
+
+
+def ensure_event_schema(con):
+    con.executescript(EVENT_SCHEMA)
+
+
+def _clamp01(x) -> float:
+    return float(min(1.0, max(0.0, x)))
+
+
+def event_frame_features(ffmpeg_bin, src, duration, window=WINDOW, fps=EV_FPS, width=EV_W, ffprobe_bin="ffprobe") -> list:
+    """One small decode of the proxy. Per 2 s window: faces (count and the largest face's height as a share
+    of the frame), local motion (mean absolute frame difference after removing the global camera shift, so
+    a pan alone stays low and a jumping crowd stays high), edge density, mean luma, dark share and the
+    stage-light share (bright pixels inside a mostly dark frame, or bright saturated colour)."""
+    import cv2
+    w = int(width)
+    probe = subprocess.run([ffprobe_bin or "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                            "-of", "csv=p=0", str(src)], capture_output=True, text=True)
+    try:
+        pw, ph = (int(x) for x in probe.stdout.strip().split(",")[:2])
+    except ValueError:
+        pw, ph = 16, 9
+    h = max(2, int(round(w * ph / pw / 2)) * 2)
+    fw, fh = 2 * w, 2 * h
+    cmd = [ffmpeg_bin, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(src), "-an",
+           "-vf", f"fps={fps},scale={fw}:{fh}", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    fsize = fw * fh * 3
+    cascade = _face_cascade()
+    min_face = max(16, int(fh * 0.05))
+    wins = {}
+    prev, i = None, 0
+    while True:
+        buf = proc.stdout.read(fsize)
+        if len(buf) < fsize:
+            break
+        big = np.frombuffer(buf, np.uint8).reshape(fh, fw, 3)
+        frame = cv2.resize(big, (w, h), interpolation=cv2.INTER_AREA)
+        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        t = i / fps
+        x = wins.setdefault(int(t // window), {"faces": 0, "face_h": 0.0, "lm": [], "edges": [], "luma": [],
+                                                "dark": [], "lights": []})
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        dark = float((grey < 45).mean())
+        bright = float((grey > 200).mean())
+        colour = float(((hsv[..., 2] > 170) & (hsv[..., 1] > 110)).mean())
+        # spotlights: some bright pixels inside a frame that is mostly dark; or strong coloured light
+        x["lights"].append(_clamp01(min(bright, 0.3) / 0.08) * _clamp01((dark - 0.35) / 0.3) + 0.5 * _clamp01(colour / 0.1))
+        x["dark"].append(dark)
+        x["luma"].append(float(grey.mean()))
+        x["edges"].append(float((cv2.Canny(grey, 60, 140) > 0).mean()))
+        g = grey.astype(np.float32)
+        if prev is not None:
+            try:
+                (dx, dy), _ = cv2.phaseCorrelate(prev, g)
+            except cv2.error:
+                dx = dy = 0.0
+            m = np.float32([[1, 0, dx], [0, 1, dy]])
+            warped = cv2.warpAffine(prev, m, (w, h), borderMode=cv2.BORDER_REPLICATE)
+            mx = int(min(w // 4, abs(dx) + 2)), int(min(h // 4, abs(dy) + 2))
+            d = np.abs(g - warped)[mx[1]:h - mx[1], mx[0]:w - mx[0]]
+            x["lm"].append(float(d.mean()) if d.size else 0.0)
+        prev = g
+        if cascade is not None and i % 2 == 0:
+            gb = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+            faces = cascade.detectMultiScale(gb, scaleFactor=1.15, minNeighbors=5, minSize=(min_face, min_face))
+            if len(faces):
+                x["faces"] = max(x["faces"], len(faces))
+                x["face_h"] = max(x["face_h"], float(max(f[3] for f in faces)) / fh)
+        i += 1
+    proc.stdout.close()
+    proc.wait()
+    dur = float(duration or i / fps)
+    out = []
+    for k in sorted(wins):
+        x = wins[k]
+        mean = lambda a: float(np.mean(a)) if a else 0.0   # noqa: E731
+        out.append({"t0": round(k * window, 3), "t1": round(min((k + 1) * window, dur), 3), "faces": int(x["faces"]),
+                    "face_h": round(x["face_h"], 4), "local_motion": round(mean(x["lm"]), 3),
+                    "edges": round(mean(x["edges"]), 4), "luma": round(mean(x["luma"]), 1),
+                    "dark": round(mean(x["dark"]), 3), "lights": round(mean(x["lights"]), 3)})
+    return out
+
+
+def _applause(a) -> float:
+    """Applause / cheering evidence 0-1 from audio_window_features: a noise-like (flat) spectrum full of
+    transients, or dense transients with a 2-8 Hz rhythm (cheering, chanting, laughter)."""
+    if not a:
+        return 0.0
+    ap = _clamp01((a["flat"] - 0.3) / 0.25) * _clamp01(a["onsets"] / 8)
+    ch = _clamp01((a["mod"] - 0.3) / 0.4) * _clamp01(a["onsets"] / 7)
+    return max(ap, ch)
+
+
+def _speechlike(a) -> float:
+    """Voice-like audio 0-1: rhythmic (2-8 Hz modulation), not noise-like, with some level."""
+    if not a:
+        return 0.0
+    return _clamp01((a["mod"] - 0.15) / 0.35) * _clamp01((0.35 - a["flat"]) / 0.25) * _clamp01((a["loud"] + 55) / 20)
+
+
+def event_scores(pic, audio_feats, metrics=None) -> list:
+    """Combine picture, audio and camera evidence per window into stage / crowd / wide scores, a kind and
+    a crowd-energy value. Pure function (tests feed it numbers).
+      stage  a dominant speaker (one to three faces, the largest >= ~8 % of the frame height) or
+             spotlights in a dark frame, with voice-like sound
+      crowd  many faces and/or lots of local motion in a busy (edge-dense) frame, applause or cheering
+      wide   a busy frame with little local motion and no big face (an establishing view of the room)
+      energy loudness (absolute: -50 dBFS -> 0, -15 dBFS -> 1) + applause/cheering + local motion"""
+    A = {round(f["t0"] / WINDOW): f for f in (audio_feats or [])}
+    M = {round(m["t0"] / WINDOW): m for m in (metrics or [])}
+    out = []
+    for p in pic:
+        k = round(p["t0"] / WINDOW)
+        a, m = A.get(k), M.get(k)
+        lm = _clamp01((p["local_motion"] - 2.0) / 8.0)
+        busy = _clamp01((p["edges"] - 0.03) / 0.09)
+        big_face = _clamp01((p["face_h"] - 0.06) / 0.1) if 1 <= p["faces"] <= 3 else 0.0
+        many_faces = _clamp01((p["faces"] - 2) / 4)
+        app = _applause(a)
+        speech = _speechlike(a)
+        loud = _clamp01((a["loud"] + 50) / 35) if a else 0.0
+        cam = _clamp01(((m or {}).get("motion") or 0) / 12)
+        stage = max(big_face, 0.9 * p["lights"]) * (0.7 + 0.3 * speech) * (1 - 0.6 * many_faces) * (1 - 0.5 * app)
+        crowd = max(many_faces, 0.85 * lm * (0.4 + 0.6 * busy)) * (0.75 + 0.25 * max(app, loud))
+        crowd = max(crowd, 0.6 * app * (0.5 + 0.5 * lm))
+        wide = busy * (1 - lm) * (1 - big_face) * (1 - 0.5 * many_faces) * (1 - 0.6 * p["lights"]) * (1 - 0.3 * cam)
+        sc = {"stage": stage, "crowd": crowd, "wide": wide}
+        best = sorted(sc, key=lambda x: -sc[x])
+        kind = best[0] if sc[best[0]] >= EV_KIND_MIN and sc[best[0]] - sc[best[1]] >= EV_KIND_MARGIN else None
+        energy = 0.4 * loud + 0.35 * app + 0.25 * lm
+        out.append({**p, "stage": round(stage, 3), "crowd": round(crowd, 3), "wide": round(wide, 3), "kind": kind,
+                    "energy": round(energy, 3), "loud": None if a is None else round(a["loud"], 1),
+                    "applause": round(app, 3)})
+    for i, w in enumerate(out):            # peaks: local maxima of energy above EV_PEAK
+        nb = [out[j]["energy"] for j in (i - 1, i + 1) if 0 <= j < len(out)]
+        w["peak"] = int(w["energy"] >= EV_PEAK and all(w["energy"] >= x for x in nb))
+    return out
+
+
+def _f0_track(y, sr):
+    """(f0 Hz per 20 ms frame, voiced mask) via YIN on the voice range; None when librosa is missing."""
+    try:
+        import librosa
+    except ImportError:
+        return None, None
+    if len(y) < sr // 4:
+        return None, None
+    hop = int(sr * 0.02)
+    f0 = librosa.yin(y.astype(np.float32), fmin=70, fmax=420, sr=sr, frame_length=1024, hop_length=hop)
+    n = len(f0)
+    rms = np.array([np.sqrt(np.mean(y[i * hop:i * hop + 1024] ** 2) + 1e-12) if i * hop < len(y) else 0.0
+                    for i in range(n)])
+    voiced = (20 * np.log10(rms + 1e-9) > -45) & (f0 > 72) & (f0 < 415)
+    return f0, voiced
+
+
+def _rms_db(y) -> float:
+    return float(20 * np.log10(np.sqrt(np.mean(y ** 2)) + 1e-9)) if len(y) else -120.0
+
+
+def soundbite_candidates(words_list, lo=BITE_MIN_S, hi=BITE_MAX_S) -> list:
+    """Sentences (and the clauses of long ones) short enough to quote: [(t0, t1, text, [words])]."""
+    from . import asr
+    out = []
+    for t0, t1, text in asr.sentences(words_list):
+        ws = [w for w in words_list if t0 <= w[0] and w[1] <= t1 + 1e-6]
+        parts = [ws]
+        if t1 - t0 > hi or len(ws) > BITE_MAX_WORDS:             # split long sentences at commas / pauses
+            parts, cur = [], []
+            for k, w in enumerate(ws):
+                cur.append(w)
+                nxt = ws[k + 1] if k + 1 < len(ws) else None
+                if nxt is None or re.search(r"[,;:]$", w[2]) or nxt[0] - w[1] > 0.35:
+                    parts.append(cur)
+                    cur = []
+        for p in parts:
+            if not p:
+                continue
+            a, b = p[0][0], p[-1][1]
+            if lo <= b - a <= hi and BITE_MIN_WORDS <= len(p) <= BITE_MAX_WORDS:
+                out.append((a, b, " ".join(w[2] for w in p), p))
+    return out
+
+
+def score_soundbites(words_list, audio, sr=16000, after_s=4.0) -> list:
+    """Score quotable lines in one clip. Per line, relative to the clip's own speech:
+      loud      line loudness vs the clip's median line (z, squashed to 0-1)
+      pitch     median pitch vs the clip's median (semitones) plus pitch range inside the line
+      emphasis  loudness swing across the line's words + '!' / ALL-CAPS words
+      wording   short, direct, quotable words (you/we/never/dream ... numbers, superlatives)
+      response  the crowd right after the line (0-after_s s): louder than the line and applause-like
+    score = 0.25 loud + 0.2 pitch + 0.15 emphasis + 0.15 wording + 0.25 response."""
+    from .render import _STAKES
+    cands = soundbite_candidates(words_list)
+    if not cands:
+        return []
+    n = len(audio)
+    rows = []
+    f0_all, voiced_all = _f0_track(audio, sr) if audio is not None and len(audio) else (None, None)
+    hop = int(sr * 0.02)
+    clip_f0 = float(np.median(f0_all[voiced_all])) if f0_all is not None and voiced_all.any() else None
+    for t0, t1, text, ws in cands:
+        seg = audio[int(t0 * sr):int(t1 * sr)] if n else np.zeros(0, np.float32)
+        loud = _rms_db(seg)
+        wl = [_rms_db(audio[int(w[0] * sr):int(w[1] * sr)]) for w in ws] if n else []
+        swing = float(np.percentile(wl, 90) - np.percentile(wl, 10)) if len(wl) >= 3 else 0.0
+        st_med = st_rng = 0.0
+        if f0_all is not None and clip_f0:
+            i0, i1 = int(t0 * sr / hop), int(t1 * sr / hop) + 1
+            f, v = f0_all[i0:i1], voiced_all[i0:i1]
+            if v.sum() >= 5:
+                semi = 12 * np.log2(f[v] / clip_f0)
+                st_med = float(np.median(semi))
+                st_rng = float(np.percentile(semi, 90) - np.percentile(semi, 10))
+        after = audio[int(t1 * sr) + int(0.15 * sr):int((t1 + after_s) * sr)] if n else np.zeros(0, np.float32)
+        resp = 0.0
+        if len(after) >= sr:
+            af = audio_window_features(after, sr, window=min(2.0, len(after) / sr))
+            app = max((_applause(x) for x in af), default=0.0)
+            jump = _rms_db(after) - loud
+            resp = _clamp01(0.6 * app + 0.4 * _clamp01((jump + 6) / 12))
+        caps = sum(1 for w in ws if len(w[2]) > 2 and w[2].strip(".,!?").isupper())
+        excl = 1 if "!" in text else 0
+        nw = len(ws)
+        wording = _clamp01(0.25 * len(_QUOTE.findall(text)) + 0.3 * len(_STAKES.findall(text))
+                           + (0.3 if 4 <= nw <= 12 else 0.0) + (0.15 if re.search(r"[.!?]$", text) else 0.0))
+        rows.append({"t0": round(t0, 3), "t1": round(t1, 3), "text": text, "_loud": loud, "_swing": swing,
+                     "_st": st_med, "_rng": st_rng, "_caps": caps, "_excl": excl, "wording": round(wording, 3),
+                     "response": round(resp, 3)})
+    med_loud = float(np.median([r["_loud"] for r in rows]))
+    for r in rows:
+        r["loud"] = round(_sig((r["_loud"] - med_loud) / 3.0), 3)
+        r["pitch"] = round(_clamp01(0.5 + r["_st"] / 6.0) * 0.6 + _clamp01(r["_rng"] / 8.0) * 0.4, 3)
+        r["emphasis"] = round(_clamp01(r["_swing"] / 15.0) * 0.7 + 0.15 * min(1, r["_caps"]) + 0.15 * r["_excl"], 3)
+        r["score"] = round(0.25 * r["loud"] + 0.2 * r["pitch"] + 0.15 * r["emphasis"] + 0.15 * r["wording"]
+                           + 0.25 * r["response"], 4)
+        for k in [k for k in r if k.startswith("_")]:
+            r.pop(k)
+    rows.sort(key=lambda r: -r["score"])
+    return rows
+
+
+def events_clip(cfg, con, row) -> dict:
+    """Event windows, the clip summary and soundbites for one analysed clip (stored; returns the summary)."""
+    from . import asr
+    ensure_event_schema(con)
+    cid = row["id"]
+    src = row["proxy"] if row["proxy"] and os.path.exists(row["proxy"]) else row["path"]
+    dur = float(row["duration"] or 0)
+    pic = event_frame_features(getattr(cfg, "ffmpeg", "ffmpeg") or "ffmpeg", src, dur,
+                               ffprobe_bin=getattr(cfg, "ffprobe", "ffprobe") or "ffprobe")
+    audio = None
+    feats = []
+    if row["has_audio"]:
+        try:
+            audio = asr.load_audio(cfg, src, timeout=600)
+            feats = audio_window_features(audio)
+        except Exception:  # noqa: BLE001 - picture-only scores
+            audio, feats = None, []
+    mets = [dict(r) for r in con.execute("SELECT t0, motion FROM metrics WHERE clip_id=? ORDER BY t0", (cid,))]
+    wins = event_scores(pic, feats, mets)
+    con.execute("DELETE FROM event_windows WHERE clip_id=?", (cid,))
+    con.executemany("INSERT INTO event_windows VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [(cid, w["t0"], w["t1"], w["kind"], w["stage"], w["crowd"], w["wide"], w["energy"], w["peak"],
+                      w["loud"], w["applause"], w["local_motion"], w["faces"], w["face_h"], w["lights"], w["edges"],
+                      w["luma"]) for w in wins])
+    n = max(1, len(wins))
+    share = {k: round(sum(1 for w in wins if w["kind"] == k) / n, 3) for k in EVENT_KINDS}
+    top = max(share, key=lambda k: share[k])
+    kind = top if share[top] >= 0.3 else None
+    best = max(wins, key=lambda w: w["energy"], default=None)
+    summ = {"kind": kind, **share, "energy": best["energy"] if best else 0.0, "energy_t": best["t0"] if best else None}
+    con.execute("INSERT OR REPLACE INTO event_clips VALUES (?,?,?,?,?,?,?,?)",
+                (cid, kind, share["stage"], share["crowd"], share["wide"], summ["energy"], summ["energy_t"], time.time()))
+    con.execute("DELETE FROM soundbites WHERE clip_id=?", (cid,))
+    ws = asr.words(cfg, cid)
+    bites = score_soundbites(ws, audio if audio is not None else np.zeros(0, np.float32)) if ws else []
+    con.executemany("INSERT OR REPLACE INTO soundbites VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    [(cid, b["t0"], b["t1"], b["text"][:300], b["score"], b["loud"], b["pitch"], b["emphasis"],
+                      b["wording"], b["response"]) for b in bites])
+    con.commit()
+    summ["soundbites"] = len(bites)
+    return summ
+
+
+def events_pending(con) -> list:
+    """Analysed clips without event scores, or whose analysis / transcript is newer than them."""
+    ensure_event_schema(con)
+    return con.execute(
+        "SELECT c.* FROM clips c LEFT JOIN event_clips e ON e.clip_id = c.id LEFT JOIN transcripts tr ON tr.clip_id = c.id "
+        "WHERE c.status='analyzed' AND (e.clip_id IS NULL OR e.updated < c.updated OR e.updated < COALESCE(tr.updated, 0))"
+    ).fetchall()
+
+
+def events_all(cfg, con, echo=print) -> int:
+    rows = events_pending(con)
+    gov = governor.for_cfg(cfg)
+    kinds = {}
+    for i, r in enumerate(rows, 1):
+        try:
+            with gov.slot("heavy", label=f"events {r['id']}"):
+                s = events_clip(cfg, con, r)
+            kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1
+        except Exception as e:  # noqa: BLE001
+            _say(echo, f"  ! events {r['rel']}: {str(e)[-160:]}")
+        if i % 50 == 0:
+            _say(echo, f"  events {i}/{len(rows)}")
+    nb = con.execute("SELECT COUNT(*) FROM soundbites").fetchone()[0]
+    _say(echo, f"events: {len(rows)} clip(s) scored ("
+               + ", ".join(f"{k or 'mixed'} {v}" for k, v in sorted(kinds.items(), key=lambda x: str(x[0])))
+               + f"); {nb} soundbite(s) in the library")
+    return len(rows)
+
+
+def event_pool(con, kind, limit=200, min_score=0.0) -> list:
+    """Best windows of one kind across the library: [{clip_id, t0, t1, score, energy, local_motion, face_h,
+    faces, peak}], strongest first (crowd by energy, stage by score, wide by score with steady camera)."""
+    ensure_event_schema(con)
+    order = {"crowd": "w.energy * 0.6 + w.crowd * 0.4", "stage": "w.stage", "wide": "w.wide"}[kind]
+    rows = con.execute(
+        f"SELECT w.*, ({order}) AS rank_score, COALESCE(m.shake, 0) AS shake FROM event_windows w "
+        "LEFT JOIN metrics m ON m.clip_id = w.clip_id AND m.t0 = w.t0 "
+        f"WHERE w.kind = ? AND w.{kind} >= ? ORDER BY rank_score DESC LIMIT ?", (kind, float(min_score), int(limit))).fetchall()
+    return [dict(r) for r in rows]
+
+
+def soundbite_list(con, limit=50, text=None) -> list:
+    ensure_event_schema(con)
+    rows = con.execute("SELECT * FROM soundbites ORDER BY score DESC").fetchall()
+    out = []
+    words = [w.lower() for w in (text or "").split() if w]
+    for r in rows:
+        if words and not all(w in (r["text"] or "").lower() for w in words):
+            continue
+        out.append(dict(r))
+        if len(out) >= limit:
+            break
+    return out

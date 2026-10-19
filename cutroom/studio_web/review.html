@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#08080a">
+<title>Cutroom · Review</title>
+<style>
+:root { --bg: #08080a; --panel: #121214; --raise: #1b1b1f; --line: rgba(255,255,255,.08); --text: #ececef; --text-2: #a1a1aa;
+  --text-3: #71717a; --accent: #2563ff; --ok: #45c08a; --warn: #e7a93d; --bad: #ef5b5b;
+  --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 var(--ui); -webkit-text-size-adjust: 100%; padding-bottom: env(safe-area-inset-bottom); }
+header { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px; padding: 12px 16px; padding-top: max(12px, env(safe-area-inset-top)); background: rgba(8,8,10,.92); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
+header h1 { font-size: 17px; margin: 0; letter-spacing: -.01em; }
+.light { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-2); max-width: 60%; }
+.light span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-3); flex: none; }
+.light.working .dot { background: #6b97ff; } .light.needs_you .dot { background: var(--warn); } .light.blocked .dot { background: var(--bad); }
+main { padding: 12px; display: flex; flex-direction: column; gap: 14px; max-width: 760px; margin: 0 auto; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-3); margin: 8px 4px 0; }
+.card { background: var(--panel); border-radius: 14px; padding: 12px; box-shadow: 0 0 0 1px var(--line); }
+.card h3 { margin: 0 0 4px; font-size: 16px; }
+.sub { color: var(--text-2); font-size: 13px; }
+video { width: 100%; border-radius: 10px; background: #000; margin: 10px 0 6px; display: block; }
+.row { padding: 9px 0; border-top: 1px solid var(--line); font-size: 14px; }
+.row .said { color: var(--text-2); font-style: italic; }
+.row .chg { margin: 3px 0; }
+.t { display: inline-block; font: 600 12px ui-monospace, Menlo, monospace; background: rgba(37,99,255,.18); color: #cddcff; border-radius: 6px; padding: 3px 8px; border: 0; }
+.btns { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+button { font: inherit; }
+.b { flex: 1 1 30%; min-height: 48px; border-radius: 12px; border: 1px solid var(--line); background: var(--raise); color: var(--text); font-weight: 700; letter-spacing: .03em; font-size: 15px; }
+.b.approve { background: #1f7a52; } .b.reject { background: #8a2f2f; } .b.notes { background: #23324f; }
+.b:disabled { opacity: .4; }
+textarea { width: 100%; min-height: 64px; border-radius: 10px; border: 1px solid var(--line); background: #0d0d10; color: var(--text); padding: 10px; font: 15px var(--ui); margin-top: 8px; }
+.q { background: rgba(231,169,61,.12); box-shadow: 0 0 0 1px rgba(231,169,61,.35); }
+.q .opts { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.q .opt { text-align: left; min-height: 46px; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--raise); color: var(--text); font-size: 15px; }
+.q .opt b { color: #cddcff; margin-right: 8px; }
+.badge { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 99px; padding: 2px 8px; margin-right: 4px; background: rgba(255,255,255,.08); color: var(--text-2); }
+.badge.ok { background: rgba(69,192,138,.16); color: #8fe0b9; } .badge.bad { background: rgba(239,91,91,.16); color: #f3a6a3; }
+.tiles { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 8px; }
+.tile { background: var(--raise); border-radius: 12px; padding: 8px; }
+.tile video { margin: 0 0 6px; }
+.tile .btns .b { min-height: 42px; font-size: 14px; }
+.empty { text-align: center; color: var(--text-3); padding: 40px 10px; }
+.toast { position: fixed; left: 12px; right: 12px; bottom: max(14px, env(safe-area-inset-bottom)); background: #1d2a44; color: #e6eeff; padding: 12px 14px; border-radius: 12px; font-size: 14px; box-shadow: 0 8px 30px rgba(0,0,0,.6); z-index: 9; }
+details { margin-top: 8px; } summary { color: var(--text-2); font-size: 13px; }
+.chk { font-size: 13px; color: var(--text-2); padding: 2px 0; }
+@media (min-width: 700px) { .tiles { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body>
+<header><h1>Review</h1><span id="light" class="light"><span class="dot"></span><span>…</span></span></header>
+<main id="main"><div class="empty">Loading…</div></main>
+<script type="module" src="js/reviewpage.js"></script>
+</body>
+</html>

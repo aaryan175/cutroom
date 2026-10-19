@@ -246,6 +246,24 @@ async function grab() {
 }
 
 // ---------------------------------------------------------------- init
+// ---------------------------------------------------------------- clip grader (factory lint + editor read it)
+function graderEl() {
+  const send = async (fields) => {
+    const c = S.source.clip;
+    if (!c) { toast('Load a clip in the Source monitor first', 'warn'); return; }
+    const t0 = S.source.in !== null && S.source.in !== undefined ? S.source.in : null;
+    const t1 = S.source.out !== null && S.source.out !== undefined ? S.source.out : null;
+    try {
+      await api.fx.grade({ clip: c.id, t0, t1, ...fields });
+      toast(`${(c.rel || c.id).split('/').pop()}${t0 !== null ? ` ${t0.toFixed(1)}–${(t1 ?? t0).toFixed(1)}s` : ' (whole clip)'}: ${fields.grade || fields.ident}`, 'ok', 2200);
+    } catch (e) { toast(`Grade: ${e.message}`, 'error'); }
+  };
+  const b = (label, title, f) => h('button.gr-btn', { title, on: { click: () => send(f) } }, label);
+  return h('span.grader.nw2', { title: 'Grade the In/Out span (or the whole clip): the factory never uses NEVER, and NOT ME is never a talking shot' },
+    b('HERO', 'A hero shot', { grade: 'HERO' }), b('BROLL', 'Fine as b-roll', { grade: 'BROLL' }), b('NEVER', 'Never use this', { grade: 'NEVER' }),
+    h('span.gr-sep'), b('ME', 'This is me', { ident: 'ME' }), b('NOT ME', 'Not me (a stranger)', { ident: 'NOTME' }));
+}
+
 export function initSource(body) {
   video = h('video', { preload: 'auto', playsInline: true });
   frameEl = h('div.mon-frame', { hidden: true }, video);
@@ -272,6 +290,7 @@ export function initSource(body) {
     h('button.ib.nw2', { title: 'Add as cutaway over the segment at the playhead', html: icon('cutaway'), on: { click: cutawayFromSource } }),
     h('button.ib', { title: 'Grab frame to chat', html: icon('grab'), on: { click: grab } }),
     h('span.grow'),
+    graderEl(),
     ioWrap);
   void durEl;
   trEl = h('div.transcript');

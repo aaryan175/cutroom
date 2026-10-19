@@ -108,12 +108,20 @@ def doctor(cfg) -> list:
         res.append(("h264_videotoolbox (mac hw)", "h264_videotoolbox" in enc, "optional"))
         res.append(("h264_nvenc (nvidia hw)", "h264_nvenc" in enc, "optional"))
     for mod, why in (("cv2", "analysis"), ("librosa", "beats"), ("scenedetect", "shot detection"),
-                     ("faster_whisper", "transcription (optional extra 'asr')"), ("df", "voice clean (optional extra 'voice')")):
+                     ("df", "voice clean (optional extra 'voice')")):
         try:
             __import__(mod)
             res.append((f"python: {mod}", True, why))
         except Exception as e:  # noqa
             res.append((f"python: {mod}", False, f"{why}: {type(e).__name__}"))
+    from . import asr
+    fw = asr.faster_whisper_available()
+    res.append(("python: faster_whisper", fw, "transcription (optional extra 'asr')" + ("" if fw else ": not installed")))
+    if asr.is_apple_silicon():
+        ml = asr.mlx_available()
+        res.append(("python: mlx_whisper", ml, "Apple GPU transcription (optional extra 'mlx')"
+                    + ("" if ml else ": not installed")))
+    res.append(("ASR backend", *asr.backend_summary(cfg)))
     res.append(("python", sys.version_info >= (3, 10), sys.version.split()[0]))
     return res
 

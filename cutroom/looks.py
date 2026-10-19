@@ -69,7 +69,8 @@ BUILTIN = [
                       "b": [[0, .12], [.5, .46], [1, .84]]},
            "eq": {"saturation": .74}, "vignette": .35},
      "css": {"sepia": .4, "contrast": .86, "saturate": .78, "brightness": 1.02}},
-    {"name": "night_cinematic", "label": "Night Cinematic", "desc": "Dark, cool and dramatic.",
+    {"name": "night_cinematic", "label": "Night Cinematic", "desc": "Dark, cool and dramatic. Night footage only.",
+     "night": True,
      "p": {"cb": {"rs": -.05, "bs": .12, "bm": .06, "rh": .02},
            "eq": {"brightness": -.04, "gamma": .9, "contrast": 1.1, "saturation": .82}, "vignette": .5},
      "css": {"brightness": .82, "contrast": 1.12, "saturate": .8, "hue": 14}},
@@ -385,7 +386,8 @@ def image_stats(path):
     mx, mn = a.max(2), a.min(2)
     sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6) * 255.0, 0.0)
     return {"luma": round(float(luma.mean()), 2), "contrast": round(float(luma.std()), 2),
-            "sat": round(float(sat.mean()), 2), "warmth": round(float(r.mean() - b.mean()), 2)}
+            "sat": round(float(sat.mean()), 2), "warmth": round(float(r.mean() - b.mean()), 2),
+            "p1": round(float(np.percentile(luma, 1)), 2)}
 
 
 # weights: one unit of each stat matters about as much as the others for how a look reads
@@ -396,16 +398,39 @@ def distance(a, b):
     return float(np.sqrt(sum(((a[k] - b[k]) * w) ** 2 for k, w in _W.items())))
 
 
-def match(base_stats, look_stats, target):
+NIGHT_SCENE_LUMA = 70.0     # footage brighter than this (mean luma through the LUT) is daylight: no night looks
+MATCH_MIN_P1 = 15.0         # a matched look may not push the black point below this (unless the base is lower)
+MATCH_MAX_SAT = 1.15        # nor saturation more than +15 % over the LUT-only picture
+
+
+def is_night_look(name):
+    return bool((BUILTIN_BY_NAME.get(name) or {}).get("night"))
+
+
+def match(base_stats, look_stats, target, scene_luma=None):
     """Pick the look and intensity whose result is closest to `target` colour stats.
     look_stats: {name: stats at intensity 1}. Stats move ~linearly with intensity, so each look is a
     line from base (k=0) to its full stats; the best k on that line is found by a fine scan.
+    Guards (the creator called a night look on daylight footage "insane"): a night look is never picked
+    for daylight footage (`scene_luma`, default the base's own luma, >= NIGHT_SCENE_LUMA), and the
+    intensity is capped so the black point stays >= MATCH_MIN_P1 and saturation within +15 % of the
+    LUT-only base.
     Returns {name, intensity, distance, base_distance, ranked: [{name, intensity, distance}]}."""
     ranked = []
+    day = float(scene_luma if scene_luma is not None else base_stats.get("luma", 0)) >= NIGHT_SCENE_LUMA
     for name, st in look_stats.items():
         best = (distance(base_stats, target), 0.0)
+        if day and is_night_look(name):
+            ranked.append({"name": name, "intensity": 0.0, "distance": round(best[0], 3), "excluded": "night look on daylight"})
+            continue
         for k in np.linspace(0.2, 1.0, 17):
             s = {key: base_stats[key] + (st[key] - base_stats[key]) * k for key in _W}
+            if "p1" in base_stats and "p1" in st:
+                p1k = base_stats["p1"] + (st["p1"] - base_stats["p1"]) * k
+                if p1k < min(MATCH_MIN_P1, base_stats["p1"]) - 1e-6:
+                    break
+            if s["sat"] > base_stats["sat"] * MATCH_MAX_SAT + 1e-6:
+                break
             d = distance(s, target)
             if d < best[0] - 1e-9:
                 best = (d, float(k))

@@ -19,7 +19,7 @@ in the docstring at the top of `cutroom/plan.py`; this page explains it with exa
   "output": {"width": 1920, "height": 1080, "fps": 25},
   "style": {
     "captions": {"enabled": true, "size": 32, "position": "bottom", "max_words": 5},
-    "grade": {"lut": "", "normalize_exposure": true, "look": {"name": "warm_film", "intensity": 0.8}},
+    "grade": {"lut": ""},
     "voice": {"clean": true, "atten_lim_db": 20},
     "music_under_speech": "mute"
   },
@@ -76,6 +76,16 @@ drop or a downbeat. A section without `music` has no music.
 {"type": "still", "clip": "C0150", "t": 8.0, "dur": 1.5, "zoom": 1.06}
 ```
 
+**card**: the reference's "COMING UP" card, generated (cutroom/cards.py): yellow `#FBFF09` text in a heavy
+rounded soft-serif (Cooper Black if installed, else the closest installed face: Superclarendon, Rockwell,
+Georgia; `font` takes a path or a name) at 14.2 % of the frame height, centred, on a near-black crumpled-paper
+texture that re-randomises every 2.5 frames. The text scales 87 % → 100 % (ease-out) over 10 frames, then
+holds; it leaves on a hard cut or a burn. A riser rides under it (its peak on the card's last frame).
+```json
+{"type": "card", "text": "COMING UP", "dur": 0.84, "color": "#FBFF09", "size": 0.142, "font": "",
+ "scale_from": 0.873, "scale_frames": 10, "boil": 2.5, "sfx": "riser"}
+```
+
 ## Common optional fields
 `speed`, `zoom`, `crop` (`"center"`, `"face"` or `[x, y, w, h]` fractions), `sfx`
 (`[{"name": "whoosh", "at": 0.0, "gain_db": -8}]` or `[{"name": "hit", "on": "cut"}]`; built-ins are whoosh,
@@ -88,17 +98,28 @@ sample-level audit of a reference vlog; change them only when the creator asks.
 **Captions.** `style.captions.size` is 43 px at 1080 (text about 3 % of the frame height, as in the reference) and
 scales with the output height. Position and the no-outline rule are unchanged.
 
-**Grade (house grade v2).** The exposure correction runs in the LOG domain *before* the LUT: half of the
-measured error, at most ±1 stop, nothing inside ±1/3 stop, and night scenes aim at luma 70 instead of 118.
-Then one fixed finishing curve runs on every shot (black point ~10/255, soft highlight shoulder, light
-vibrance). Nothing is brightened after the LUT, because that turns blacks milky.
+**Grade (house grade = the LUT only).** The default is the creator's approved look: the log→709 LUT and
+nothing after it (`normalize_exposure: false`, `finish.enabled: false`, vibrance 0, saturation 1.0, no
+look). The stack that used to run after the LUT (exposure pull, finishing curve, vibrance, saturation, a
+look) doubled the saturation and crushed the black point from 33 to 2 on the same frame ("insane"). Each
+part stays available as an opt-in:
 ```json
-"grade": {"exposure": {"strength": 0.5, "max_stops": 1.0, "deadband_stops": 0.33, "target_luma": 118,
+"grade": {"normalize_exposure": true,
+          "exposure": {"strength": 0.5, "max_stops": 1.0, "deadband_stops": 0.33, "target_luma": 118,
                        "night_luma": 60, "night_target": 70},
           "finish": {"enabled": true, "black": 0.028, "shoulder": 0.96, "vibrance": 0.18}}
 ```
+The exposure correction runs in the LOG domain *before* the LUT: half of the measured error, at most ±1
+stop. Nothing is ever brightened after the LUT, because that turns blacks milky.
+
+**Film / lens** (`style.film`, cutroom/film.py), all off by default: `grain` (std, 0–12), `grain_size`
+(1–3 px), `soften` (gaussian sigma px at 1080), `vignette` (corner fall-off 0–0.6), `halation` / `bloom`
+(0–1), `ca` (lateral fringe px at the corners), `rolloff` (`{"knee": 0.86, "ceiling": 0.96}`), `black`
+(lift 0–0.1). Fill it from a measurement only: `film.match(ref_stats, ours_stats)` returns the traits the
+reference measurably has more of (rule 38).
 `"exposure_stops": 0.5` on a segment is a manual trim the creator names (rule 94). The sidecar records each
-piece's applied `stops`.
+piece's applied `stops` and its LUT-only probe numbers (`lut_stats`: luma, p1, p99, sat) that QA
+`grade_bounds` checks the render against.
 
 **Dialogue audio.**
 ```json
@@ -144,14 +165,21 @@ first segment):
 ```json
 "transition": {"kind": "flash", "frames": 4, "sfx": "hit", "gain_db": -6, "break": 0.3}
 ```
+- `burn` is the reference's two-frame film burn (cutroom/cards.py): on the last outgoing frame a red glow
+  rises from the lower left, on the first incoming frame an orange-yellow disc with a magenta/blue fringe and
+  a blown core enters from the right; the cut sits between them, nothing fades. It is light composited onto
+  the picture (a normal mix toward the light, then a screen), different on every cut (`seed`), with a
+  whoosh-into-impact (`sfx: "burn"`) whose impact lands on the cut. Fields: `frames` (2), `palette`
+  (`warm` | `red` | `gold`), `side` (`right` | `left`, where the disc enters), `strength` (0.1–1.5).
 - `flash` mixes toward white, made from the footage itself, with a small log-domain exposure push
-  underneath. Its peak is on the cut frame.
+  underneath. Its peak is on the cut frame. Use it only when the reference has white flashes.
 - `dip` goes through black, `dip_white` through white.
 - `whip` is a temporal mix plus a horizontal smear on the 3 frames either side, with a `whoosh` by default.
 - `frames` is split between the outgoing and incoming side; `frames_out` and `frames_in` set them
   directly.
 - The sound's transient *peak*, not its file start, lands on the cut frame.
-- Never use overlay assets (leaks, scribbles, film strips). The creator banned them (rule 38).
+- The reference wins (rule 38): rebuild the devices it measurably has (burns, insets, gates, cards, typed
+  titles); never add one it doesn't. No stock or downloaded overlay assets.
 - Segment SFX can bind the same way: `{"name": "hit", "on": "cut"|"end"}`.
 
 **Frame-rate conform.** `style.conform` (or per segment/shot `conform`) is `"auto"` by default.
@@ -182,21 +210,63 @@ does a slow digital move. It uses sub-pixel `perspective`, the smoothest of the 
   whenever the face is held longer than that.
 - Take the numbers from the reference's sections (`cutroom ref show <id>`): ASL per section type.
 
+**Frames ("resolution change").** `frame` on a section, a segment or a montage shot (shot wins, then the
+segment, then the section; `"full"` turns it off). All hard snaps, no animation; the picture is cropped to
+the window, never squeezed.
+```json
+"frame": {"kind": "gate", "w": 0.973, "h": 0.906, "radius": 9, "color": "#0F0100"}
+"frame": {"kind": "gate", "inner": {"w": 0.77, "h": 0.74}}          // an inner black matte inside the gate
+"frame": {"kind": "inset", "scale": 0.62, "radius": 5, "bg": "#000"} // or "w"/"h" for the reference's 61 x 77 %
+"frame": {"kind": "letterbox", "aspect": 2.46}
+```
+The gate's numbers are the reference's: 97.3 % × 90.6 %, margins 25/45/27/56 px, near-black `#0F0100`,
+9 px corners. A montage of 3-frame shots in an inset on black is the reference's strobe. A burn into an
+unframed segment drops the gate under the light.
+
+**Typed title** (overlay `kind: "typed_title"`): golden `#FFCD00` condensed caps (Bebas Neue if installed,
+else Anton, League Gothic, Oswald, Impact …; `font` takes a path or a name) at 9.2 % of the frame height,
+centred, typed one character every `char_s` (0.07 s default; the reference types 17 characters in 0.36 s)
+starting `start` s after the overlay begins, then held until the segment's cut or burn. `sfx: "hiss"` adds
+the reference's broadband hiss under the typing.
+```json
+{"kind": "typed_title", "text": "DAY THREE", "at": 0.0, "dur": 2.7, "start": 1.12, "char_s": 0.07}
+```
+
 **Cold open (teaser template).** A plan-level object. It renders as a generated first section (index −1
 in the sidecar and in `resolve_timeline`):
 ```json
 "cold_open": {"style": "teaser", "dur": 10, "lines": [{"from": "villa/0"}, {"clip": "C0107", "in": 41.2, "out": 43.0}],
-              "shots": "auto", "asl": 0.45, "from_reference": "9fe6442b1b", "face_s": 0.8,
-              "music": {"song": "...", "offset": 52.0, "under_db": -5}, "end_flash": true}
+              "shots": "auto", "asl": 0.45, "from_reference": "9fe6442b1b",
+              "music": {"song": "...", "offset": 52.0, "under_db": -5}}
 ```
+`"style": "reference"` rebuilds the reference's measured cold open element by element (needs
+`from_reference`; the reference's `devices` are measured on demand):
+```json
+"cold_open": {"style": "reference", "from_reference": "9fe6442b1b", "card": {"text": "COMING UP"},
+              "lines": [...3 lines...], "shots": [...picks...],
+              "end_shot": {"clip": "C5655", "in": 6.6, "dur": 2.7}, "title": {"text": "DAY THREE"},
+              "loudness": {"I": -12}, "music": {"song": "...", "offset": 17.8}}
+```
+card → inset strobe (the reference's 3-frame shots) → line 1 in the gate → strobe block in the reference's
+mattes → line 2 → block → burn → line 3 → burn (the biggest hit; the gate drops) → the end shot, held, with
+the typed title → burn into the edit. Optional: `inset` / `gate` (override the measured frame), `burns`
+(false or `{palette, strength}`), `ticks` (a tick per strobe image, default on), `captions` (on the lines).
+- `face_s` (default null = the whole line): every line stays on the creator's face for its whole length
+  (rule 49). A number cuts away to b-roll after that many seconds (style "teaser").
+- `loudness.I` (−12 LUFS): the cold open's own dialogue target, about 2 LU over the programme, so the intro
+  is not quieter than the body. `music.lift_db` raises the bed between lines (reference ≈ +10 dB).
+- `end_flash` defaults to false.
+- `card`, `inset`, `gate`, `burns`, `end_shot` and `title` also work in style "teaser".
 - Lines are teaser lines from later in the edit. `{"from": "<section>/<segment>"}` picks the strongest
   0.8–2.6 s claim in that talk segment by itself (numbers, superlatives, stakes words, clean edges).
-- Micro-cuts run between and under the lines. Each line starts on the face for `face_s`, then cuts away.
+- Micro-cuts run between the lines (and under them when `face_s` is a number).
   The rhythm comes from `from_reference` (that reference's cold-open cut map, one-to-one) or from `asl`
   (~0.45 s, varied, pulled onto the half-beat grid).
-- `shots: "auto"` takes the edit's own b-roll at windows the edit does *not* use later.
+- `shots: "auto"` takes the edit's own b-roll at windows the edit does *not* use later: talk ranges,
+  cutaways, cover clips, b-roll, montage shots, stills and match-cut frames are all marked used, and an
+  explicit `shots` list keeps those marks.
 - The music runs `under` the voice (not ducked). Defaults: the first section's song.
-- A flash goes into the second block of micro-cuts and out of the cold open.
+- Style "teaser" puts a flash (or a burn with `burns: true`) into the second block of micro-cuts.
 
 ## Looks
 `style.grade.look` colours the whole edit; `look` on a segment overrides it for that segment
@@ -205,9 +275,12 @@ in the sidecar and in `resolve_timeline`):
 `moody_matte`, `punchy`, `soft_pastel`, `bw`, `vintage_fade`, `night_cinematic`; a `.cube` in the project's
 `luts/` folder is `"lut:<file name>"`. The look runs after the base grade (LUT / log curve, saturation)
 and the exposure correction, on every shot of the segment including its cutaways (`cutroom/looks.py`).
+Looks are opt-in (the house grade is the LUT only). Matching a reference's colour (`looks.match`, the
+Studio's "match look") never picks `night_cinematic` for daylight footage and caps the intensity so the
+black point stays ≥ 15 and saturation within +15 % of the LUT-only picture.
 
 ## Overlays
-`kind` is one of `callout`, `lower_third`, `title` or `label`. `position` is one of `auto`, `top-left`,
+`kind` is one of `callout`, `lower_third`, `title`, `label` or `typed_title` (above). `position` is one of `auto`, `top-left`,
 `top-right`, `bottom-left`, `bottom-right` or `center`. `auto` places the overlay away from faces.
 Keep the text short. Creators usually want at most one overlay per talking section.
 

@@ -1,0 +1,94 @@
+{
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "findings",
+  "per_note",
+  "summary"
+ ],
+ "properties": {
+  "findings": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "id",
+     "sev",
+     "t",
+     "note",
+     "rule",
+     "text",
+     "evidence"
+    ],
+    "properties": {
+     "id": {
+      "type": "string"
+     },
+     "sev": {
+      "type": "string",
+      "enum": [
+       "HARD",
+       "SOFT"
+      ]
+     },
+     "t": {
+      "type": [
+       "number",
+       "null"
+      ]
+     },
+     "note": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "rule": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "text": {
+      "type": "string"
+     },
+     "evidence": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "per_note": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "note",
+     "addressed",
+     "why"
+    ],
+    "properties": {
+     "note": {
+      "type": "string"
+     },
+     "addressed": {
+      "type": "string",
+      "enum": [
+       "yes",
+       "no",
+       "partial"
+      ]
+     },
+     "why": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "summary": {
+   "type": "string"
+  }
+ }
+}

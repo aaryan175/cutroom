@@ -57,7 +57,7 @@ shows what is installed and logged in.
 To drive it by hand instead:
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e '.[asr,voice]'
+pip install -e '.[asr,voice]'     # Apple Silicon: '.[asr,mlx,voice]' for GPU transcription
 brew install ffmpeg        # or apt/dnf install ffmpeg
 cutroom init ~/EditRoom --library /Volumes/Footage --music ~/Music/songs
 cd ~/EditRoom
@@ -88,7 +88,8 @@ footage (read-only) ──► index ──► library.db + proxies + contact she
 | `CLAUDE.md` | operating manual for the AI (Claude Code loads it automatically) |
 | `AGENTS.md` | the same for Codex: points it at `CLAUDE.md`, the skills and `docs/ARCHITECTURE.md` |
 | `BOOTSTRAP_PROMPT.md` | the paste-in prompts (Claude Code and Codex) that set everything up |
-| `.claude/skills/` | indexing, tagging, planning, render-and-qa, review-loop, reference-matching, deliverables-and-scale and extending-cutroom skills |
+| `.claude/skills/` | indexing, tagging, planning, render-and-qa, review-loop, reference-matching, deliverables-and-scale, event-recap and extending-cutroom skills |
+| `cutroom recap` | event recap mode: stage / crowd / wide detection, energy peaks and soundbites (`cutroom detect events`), then a draft hype-recap plan (`event-recap` skill) |
 | `docs/ARCHITECTURE.md` | map of the code for the AI that extends the tool |
 | `docs/STUDIO.md` | the browser editor and its API, including the Claude Code / Codex bridge |
 | `docs/OVERNIGHT.md` | the unattended "understand my library" run and the resource governor |
@@ -104,6 +105,9 @@ footage (read-only) ──► index ──► library.db + proxies + contact she
 - Python 3.10+ and ffmpeg (with libx264).
 - macOS, Linux or Windows (WSL).
 - For transcription, `faster-whisper`. It runs on CUDA if available, otherwise CPU.
+- On Apple Silicon Macs, add the `mlx` extra (`pip install -e '.[asr,mlx,voice]'`): transcription then runs on
+  the GPU with MLX Whisper (`asr_backend: "auto"` picks it for `medium` and larger; `cutroom doctor` shows which
+  backend is active).
 - For best voice cleaning, `deepfilternet`. An ffmpeg fallback is built in.
 - Optional: Chrome or Chromium for HTML motion graphics.
 - Disk for the project: about 3% of the library size plus about 20 GB for render caches.

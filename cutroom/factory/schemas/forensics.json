@@ -1,0 +1,44 @@
+{
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "reference_md",
+  "pairs",
+  "summary"
+ ],
+ "properties": {
+  "reference_md": {
+   "type": "string"
+  },
+  "pairs": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "label",
+     "desc",
+     "ref_t",
+     "our_t"
+    ],
+    "properties": {
+     "label": {
+      "type": "string"
+     },
+     "desc": {
+      "type": "string"
+     },
+     "ref_t": {
+      "type": "number"
+     },
+     "our_t": {
+      "type": "number"
+     }
+    }
+   }
+  },
+  "summary": {
+   "type": "string"
+  }
+ }
+}

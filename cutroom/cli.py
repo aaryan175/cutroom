@@ -12,7 +12,9 @@
                  [--speech] [--no-speech] [--limit 30] [--json]
                  [--highlights] [--dedupe] [--session N] [--near REF]          highlight moments, one per duplicate
                                                                               group, one shoot, look-alikes of a clip
-  cutroom detect [dedupe|highlights|sessions|takes|all]              the cheap library passes (overnight runs them)
+                 [--kind crowd|stage|wide] [--soundbites]                     event footage: shot kind, quotable lines
+  cutroom detect [dedupe|highlights|sessions|takes|events|all]       the cheap library passes (overnight runs them)
+  cutroom recap NAME [--len 120] [--song X] [--ref REF]              event recap draft plan (event-recap skill)
   cutroom takes [--clip REF]                                         repeated lines and which take is best
   cutroom estimate [--tb 4 | --hours 100] [--bench] [--json]         time + disk for indexing, before you start
   cutroom clip REF [--frames 6]                                      everything known about one clip (+ frame grabs)
@@ -37,9 +39,13 @@
   cutroom ref list | ref show ID | ref analyze ID [--force]           references: status, summary + sheets
   cutroom ref cutmap ID [--json]                                     one row per shot, to rebuild one-to-one
   cutroom ref compare ID RENDER.mp4 [--json]                         your render vs the reference, gaps in words
+  cutroom factory run|tick|status|orders|order ID|send|stop ID|retry ID|pause|resume
+  cutroom factory answer ORDER Q N | verdict PLAN V APPROVE|REJECT|NOTES | lessons | brain SLUG
+                                                                     the factory (docs/FACTORY.md)
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -90,6 +96,38 @@ def _agent_checks(cfg):
     return rows
 
 
+def _factory_checks(cfg):
+    """Doctor rows for the factory (docs/FACTORY.md): agent slots, free RAM, git for the extender, its folder."""
+    rows = []
+    try:
+        from . import governor
+        from .factory import fconfig, worktree
+        g = governor.Governor(cfg)
+        fr = governor.free_ram()
+        rows.append(("factory: agent slots", True, f"{g.agent_slots} AI run(s) at a time machine-wide, "
+                     f"{g.agent_mem_cap_gb:g} GB cap each (CUTROOM_AGENT_SLOTS overrides)"))
+        ok_ram = fr is None or fr / governor.GB >= g.min_free_ram_gb
+        rows.append(("factory: free RAM", ok_ram, (f"{fr / governor.GB:.1f} GB free" if fr is not None else "unknown")
+                     + f" (agents wait below {g.min_free_ram_gb:.1f} GB)" + ("" if ok_ram else " (optional: it waits)")))
+        ok, detail = worktree.available()
+        rows.append(("factory: git (extender)", ok, detail + ("" if ok else " (optional: the extender is a stub)")))
+        if getattr(cfg, "work", ""):
+            d = fconfig.factory_dir(cfg)
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                t = d / ".doctor"
+                t.write_text("ok")
+                t.unlink()
+                fc = fconfig.load(cfg)
+                rows.append(("factory: folder", True, f"{d} · autostart {fc['autostart']} · "
+                             f"${fc['budgets']['cost_usd']:g} per order · agent {fc['agent']}"))
+            except OSError as e:
+                rows.append(("factory: folder", False, f"{d} not writable: {e}"))
+    except Exception as e:  # noqa: BLE001
+        rows.append(("factory", False, f"could not check: {e} (optional)"))
+    return rows
+
+
 def cmd_doctor(a):
     from .config import Config
     from .media import doctor
@@ -98,7 +136,7 @@ def cmd_doctor(a):
     except SystemExit:
         cfg = Config()
     bad = 0
-    for name, ok, detail in doctor(cfg) + _agent_checks(cfg):
+    for name, ok, detail in doctor(cfg) + _agent_checks(cfg) + _factory_checks(cfg):
         print(f"  {'ok ' if ok else 'MISSING'}  {name:34s} {detail}")
         bad += (not ok) and "optional" not in detail
     sys.exit(1 if bad else 0)
@@ -287,6 +325,38 @@ def cmd_detect(a):
                   f"{s['hours']:.2f} h" + (f"  place {s['place']} ({s['lat']}, {s['lon']})" if s["place"] else ""))
     if what in ("takes", "all"):
         analyze.takes(cfg, con)
+    if what in ("events", "all"):
+        analyze.events_all(cfg, con)
+
+
+def cmd_recap(a):
+    from . import recap
+    cfg, con = _cfg_con()
+    try:
+        path, rep, errs = recap.write(cfg, con, a.name, length=a.len, song=a.song, ref=a.ref)
+    except (recap.RecapError, KeyError) as e:
+        sys.exit(f"recap: {str(e).strip(chr(39))}")
+    if a.json:
+        print(json.dumps({"plan": str(path), "report": rep, "errors": errs}, indent=1, default=str))
+        sys.exit(1 if errs else 0)
+    print(f"recap draft -> {path}")
+    print(f"  {rep['duration']:.1f}s (target {rep['target']:.0f}s) · song {rep['song']} · climax on the drop at "
+          f"{rep['drop']:.1f}s · {rep['flashes']} flash(es), max {rep['flash_max_per_10s']:g} per 10 s · "
+          f"{rep['ramps']} ramp(s)")
+    for s_ in rep["sections"]:
+        print(f"  {s_['name']:10s} {s_['start']:6.1f}-{s_['end']:6.1f}s")
+    for b in rep["soundbites"]:
+        print(f"  soundbite {b['clip']} {b['t0']:.2f}-{b['t1']:.2f}s ({b['score']:.2f}) \"{b['text'][:80]}\"")
+    if rep.get("reference"):
+        r = rep["reference"]
+        print(f"  from reference {r['id']}: cold open {r['cold_open_s']:.1f}s, {r['flash_per_10s']:g} flashes per 10 s, "
+              f"montage ASL {r['montage_asl']:.2f}s, talk {r['talk_pct']:.0f}%")
+    for w in rep.get("warnings") or []:
+        print(f"  ! {w}")
+    for e in errs:
+        print("  ✗", e)
+    print("next: refine it with the event-recap skill, then `cutroom plan check` and `cutroom render --preview`")
+    sys.exit(1 if errs else 0)
 
 
 def cmd_takes(a):
@@ -409,6 +479,111 @@ def cmd_markers(a):
         drew = f"  (drew {studio.drawing_words(m['drawing'])})" if m.get("drawing") else ""
         print(f"{m['id']}  {m.get('status', 'open'):9s}  {m.get('plan') or '-':16s} @ {float(m.get('t') or 0):7.2f}s{rng}"
               f"  [{m.get('kind', 'note')}] {m.get('text', '')}{drew}" + (f"\n    frame: {frame}" if frame else ""))
+
+
+def cmd_factory(a):
+    """The factory (docs/FACTORY.md): orders, the runner, verdicts, lessons, the brain."""
+    from .config import Config
+    from .factory import brain, bus, lessons, runner
+    cfg = Config.load()
+    act, args = a.action, a.args
+    js = lambda o: print(json.dumps(o, indent=1, ensure_ascii=False, default=str))   # noqa: E731
+
+    def need(k, usage):
+        if len(args) < k:
+            sys.exit(f"usage: cutroom factory {usage}")
+    if act == "run":
+        runner.run_forever(cfg, link_base=a.link_base)
+    elif act == "tick":
+        r = runner.FactoryRunner(cfg, link_base=a.link_base)
+        if not r.acquire():
+            sys.exit("another factory runner holds this project")
+        try:
+            r._recover_orphans()
+            r.tick()
+            if r.driver is not None:
+                r.driver.join()
+            print(json.dumps(runner.light(cfg)) if a.json else runner.light(cfg)["text"])
+        finally:
+            r.release()
+    elif act == "status":
+        lt = runner.light(cfg)
+        if a.json:
+            return js(lt)
+        print(f"factory: {lt['light']} · {lt['text']}")
+        print(f"  runner: {'alive pid ' + str(lt['runner_pid']) if lt['runner_alive'] else 'not running'}"
+              f"{' · gate: ' + lt['gate'] if lt.get('gate') else ''} · queued {lt['queued']}")
+        for o in runner.list_view(cfg)[:10]:
+            print(f"  {o['id']}  {o['kind']:8s} {o['plan'] or '-':16s} {o['state']:9s} {o['phase'] or '':10s} "
+                  f"{('v' + str(o['version'])) if o['version'] else '':5s} {o['why'] or o['line'] or ''}"[:160])
+    elif act == "orders":
+        rows = runner.list_view(cfg, plan=a.plan, state=a.state)
+        if a.json:
+            return js(rows)
+        for o in rows:
+            print(f"{o['id']}  {o['kind']:8s} {o['plan'] or '-':16s} {o['state']:9s} {o['phase'] or '':10s} "
+                  f"${o['cost_usd'] or 0:.2f}  {o['why'] or o['line'] or ''}"[:170])
+    elif act == "order":
+        need(1, "order ID")
+        d = runner.order_detail(cfg, args[0])
+        if a.json:
+            return js(d)
+        st = d["status"]
+        print(f"{args[0]} {d['order']['kind']} on {d['order']['plan']}: {st['state']} {st.get('phase') or ''} "
+              f"{st.get('why') or st.get('text') or ''}")
+        for p in d["phases"]:
+            print(f"  {p['name']:18s} {p['state']}" + (f" ({p['skipped']})" if p.get("skipped") else ""))
+        for q in st.get("questions") or []:
+            print(f"  ? {q['id']}: {q['line']}" + (f"  [answered {q['answered']['option']}]" if q.get("answered") else ""))
+        if d.get("card"):
+            print(f"  card: {bus.order_dir(cfg, args[0]) / 'card.md'}")
+    elif act == "send":
+        if not a.plan:
+            sys.exit("usage: cutroom factory send --plan SLUG [--comments ID,ID | --all-open] [--text T] [--kind revise]")
+        res = runner.submit(cfg, a.kind or "revise", a.plan, comment_ids=[x for x in (a.comments or "").split(",") if x],
+                            all_open=a.all_open, text=a.text or "", by={"user": "you", "via": "cli"})
+        print(f"order {res['order']['id']}" + (f" (folded into {res['folded_into']})" if res.get("folded_into") else ""))
+    elif act in ("stop", "retry"):
+        need(1, f"{act} ID")
+        st = runner.stop(cfg, args[0]) if act == "stop" else runner.retry(cfg, args[0])
+        print(f"{args[0]}: {st['state']}")
+    elif act == "pause":
+        runner.pause(cfg)
+        print("factory paused (the running role finishes; nothing new starts). `cutroom factory resume` to go on.")
+    elif act == "resume":
+        n = runner.resume(cfg)
+        print(f"factory resumed{f'; {n} order(s) requeued after the login problem' if n else ''}")
+    elif act == "answer":
+        need(3, "answer ORDER QUESTION OPTION [--text T]")
+        js(runner.answer(cfg, args[0], args[1], args[2], text=a.text or ""))
+    elif act == "verdict":
+        need(3, "verdict PLAN VERSION APPROVE|REJECT|NOTES [--text T]")
+        js(runner.verdict(cfg, args[0], int(args[1]), args[2], text=a.text or ""))
+    elif act == "lessons":
+        sub = args[0] if args else "list"
+        if sub == "inbox":
+            for r in lessons.inbox(cfg):
+                print(f"{r['id']} [{r['kind']}] {r['text'][:140]}")
+        elif sub == "add":
+            need(2, "lessons add 'RULE' [--text SYMPTOM]")
+            print(lessons.add_lesson(cfg, args[1], symptom=a.text or "")["id"])
+        elif sub == "supersede":
+            need(2, "lessons supersede ID [NEW_ID]")
+            print(lessons.supersede(cfg, args[1], by=args[2] if len(args) > 2 else None)["status"])
+        else:
+            for x in lessons.active(cfg) if not a.all else lessons.load(cfg)["lessons"]:
+                if x["scope"] == "global" and not a.all and not a.json:
+                    continue
+                print(f"{x['id']} [{x['scope']}] {x['rule'][:150]}" + (f"  (check {x['check']})" if x.get("check") else ""))
+    elif act == "brain":
+        need(1, "brain SLUG [FILE]")
+        if len(args) > 1:
+            v = brain.read_file(cfg, args[0], args[1])
+            print(v if isinstance(v, str) else json.dumps(v, indent=1, ensure_ascii=False))
+        else:
+            js(brain.summary(cfg, args[0]))
+    else:
+        sys.exit(f"unknown factory action {act}")
 
 
 def _echo(m):
@@ -549,6 +724,9 @@ def cmd_governor(a):
     print(f"  limits: {st['limits']}")
 
 
+FACTORY_REFUSED = ("render", "transcribe", "export", "cutdown", "overnight", "index", "studio", "factory")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="cutroom", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -578,10 +756,19 @@ def main(argv=None):
     p.add_argument("--dedupe", action="store_true", help="one clip per duplicate / near-duplicate group")
     p.add_argument("--session", type=int, help="only this shoot (`cutroom detect sessions` lists them)")
     p.add_argument("--near", help="clips that look like this one (perceptual hash), closest first")
+    p.add_argument("--kind", choices=["crowd", "stage", "wide"], help="event footage: clips with this shot kind "
+                                                                      "(`cutroom detect events`), best window first")
+    p.add_argument("--soundbites", action="store_true", help="quotable spoken lines, best first (TEXT filters them)")
     p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_search)
-    p = sp.add_parser("detect", help="duplicates, highlights, shoots/places, best takes")
-    p.add_argument("what", nargs="?", default="all", choices=["dedupe", "highlights", "sessions", "takes", "all"])
+    p = sp.add_parser("detect", help="duplicates, highlights, shoots/places, best takes, event shot kinds")
+    p.add_argument("what", nargs="?", default="all",
+                   choices=["dedupe", "highlights", "sessions", "takes", "events", "all"])
     p.set_defaults(fn=cmd_detect)
+    p = sp.add_parser("recap", help="event recap: write a draft plan (cold open, build, climax, end card)")
+    p.add_argument("name"); p.add_argument("--len", type=float, default=120.0)
+    p.add_argument("--song", help="song id, path or title fragment (default: the fastest long-enough song)")
+    p.add_argument("--ref", help="a measured reference: copy its pacing, flash rate and section structure")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_recap)
     p = sp.add_parser("takes"); p.add_argument("--clip"); p.set_defaults(fn=cmd_takes)
     p = sp.add_parser("estimate", help="time and disk for indexing this library (or --tb 4)")
     p.add_argument("--tb", type=float); p.add_argument("--hours", type=float)
@@ -636,6 +823,14 @@ def main(argv=None):
     p = sp.add_parser("studio"); p.add_argument("--port", type=int, default=8600)
     p.add_argument("--host", default="127.0.0.1"); p.add_argument("--open", action="store_true")
     p.set_defaults(fn=cmd_studio)
+    p = sp.add_parser("factory", help="the factory: comment -> team -> next version (docs/FACTORY.md)")
+    p.add_argument("action", choices=["run", "tick", "status", "orders", "order", "send", "stop", "retry", "pause",
+                                      "resume", "answer", "verdict", "lessons", "brain"])
+    p.add_argument("args", nargs="*"); p.add_argument("--plan"); p.add_argument("--state")
+    p.add_argument("--comments"); p.add_argument("--all-open", action="store_true"); p.add_argument("--text")
+    p.add_argument("--kind", choices=["revise", "reject", "request", "variants"]); p.add_argument("--all", action="store_true")
+    p.add_argument("--link-base", help="studio URL for the review-link check, e.g. http://127.0.0.1:8600")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_factory)
     for name in ("comments", "markers"):            # one command, two names (markers = the old name)
         p = sp.add_parser(name, help="studio review comments pinned to timeline times")
         p.add_argument("action", nargs="?", default="list", choices=["list", "done", "needs", "reply", "open"])
@@ -644,6 +839,12 @@ def main(argv=None):
         p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_markers)
 
     a = ap.parse_args(argv)
+    role = os.environ.get("CUTROOM_FACTORY_ROLE")
+    if role and a.cmd in FACTORY_REFUSED:
+        # heavy work stays in the factory runner, where the governor sees it (docs/FACTORY.md)
+        print(f"cutroom {a.cmd}: refused inside the factory ({role} role). The factory runner renders, transcribes "
+              "and exports; your job ends at the plan.", file=sys.stderr)
+        sys.exit(2)
     a.fn(a)
 
 

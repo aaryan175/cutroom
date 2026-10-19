@@ -38,3 +38,10 @@ Never patch around a bug in the plan file when the renderer is wrong.
 - Heavy commands queue through the governor. If they wait, `cutroom governor` shows why.
 - Never run two transcriptions at once.
 - Keep footage out of `tests/`; use ffmpeg lavfi to make test clips.
+
+## The factory's extender (planned)
+When a factory order needs a capability cutroom lacks, it becomes an `extend` sub-order (needs you). The
+extender role is a stub in this build: build the feature by hand with this skill (plan.py → render.py → UI →
+qa.py check → tests), then answer the sub-order's question. Never apply a factory-built patch without the
+creator pressing Apply. A lesson that needs new measuring code becomes a `qa.py` check or a
+`cutroom/factory/lint.py` check type, with a test.

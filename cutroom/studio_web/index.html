@@ -11,6 +11,7 @@
 <link rel="stylesheet" href="css/comments.css">
 <link rel="stylesheet" href="css/looks.css">
 <link rel="stylesheet" href="css/tour.css">
+<link rel="stylesheet" href="css/factory.css">
 </head>
 <body>
 <div id="app">
@@ -48,6 +49,7 @@
     </div>
     <div class="hdr-r">
       <div id="lib-status" class="lib-status"></div>
+      <button id="fx-light" class="fx-light idle" title="Factory"><span class="dot"></span><span class="txt">factory idle</span></button>
       <button id="gov-pill" class="gov-pill" title="Machine health"><span class="dot"></span><span class="txt">—</span></button>
       <span id="conn" class="conn" title="Live connection"></span>
       <button id="btn-help" class="tb-icon" title="Keyboard shortcuts (?)"><i data-icon="help"></i></button>
@@ -82,6 +84,7 @@
           <div class="ptabs">
             <button class="ptab on" data-ptab="program">Program</button>
             <button class="ptab" data-ptab="reference">Reference</button>
+            <button class="ptab" data-ptab="review" title="Versions side by side, the delivery card, verdicts">Review<span class="badge" id="badge-review"></span></button>
             <div class="ptab-tools" id="program-tools"></div>
           </div>
           <div class="pbody" id="program-body"></div>
@@ -114,6 +117,7 @@
       <button class="ptab" data-tab="comments" title="Review comments pinned to frames">Comments<span class="badge" id="badge-markers"></span></button>
       <button class="ptab" data-tab="looks" title="Colour looks, previewed on your own frame">Looks</button>
       <button class="ptab" data-tab="qa">QA<span class="badge" id="badge-qa"></span></button>
+      <button class="ptab" data-tab="factory" title="The factory: orders, team activity, lessons, brain">Factory<span class="badge" id="badge-factory"></span></button>
       <button class="ptab" data-tab="jobs">Jobs<span class="badge" id="badge-jobs"></span></button>
       <button class="ptab" data-tab="overnight">Overnight</button>
     </div>

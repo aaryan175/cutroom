@@ -1,17 +1,25 @@
-"""Speech: word-timestamp transcription (faster-whisper) plus the word-level helpers the planner
-and renderer use — tightening pauses, caption cues, director cues ("okay cut"), repeated takes and
-overused words.
+"""Speech: word-timestamp transcription plus the word-level helpers the planner and renderer use —
+tightening pauses, caption cues, director cues ("okay cut"), repeated takes and overused words.
+
+Two ASR backends (`asr_backend` in cutroom.json):
+    faster-whisper   CTranslate2; CUDA when present, else CPU (int8). Optional extra `.[asr]`.
+    mlx              Apple's MLX on the Apple Silicon GPU (`mlx-whisper`). Optional extra `.[mlx]`.
+    auto (default)   mlx on Apple Silicon macOS when `mlx_whisper` imports and the model is medium or
+                     larger (greedy MLX decoding costs the small models accuracy), else faster-whisper.
+Both write exactly the same transcript shape, so tighten / cues / captions never see a difference.
 
 Transcripts live in <work>/transcripts/<id>.json:
-    {"language", "model", "speech_s", "segments": [{"start", "end", "text",
+    {"language", "model", "backend", "speech_s", "segments": [{"start", "end", "text",
                                        "words": [{"start", "end", "word", "probability"}]}]}
 
-Run ONE transcription at a time: the model is loaded once per process and clips are processed
-sequentially (parallel ASR on a 16 GB machine is a reliable way to exhaust memory).
+Run ONE transcription at a time, whichever backend: the model is loaded once per process and clips are
+processed sequentially (parallel ASR on a 16 GB machine is a reliable way to exhaust memory). Both
+backends run inside the governor's single machine-wide ASR slot.
 """
 import difflib
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -122,10 +130,211 @@ def get_model(name):
     if name not in _MODEL:
         from faster_whisper import WhisperModel
         _MODEL.clear()                                   # never hold two models in memory
+        _mlx_release_model()
         dev, ct = _device(_DEVICE_WANT["v"])
         kw = {"cpu_threads": min(8, os.cpu_count() or 4)} if dev == "cpu" else {}
         _MODEL[name] = WhisperModel(name, device=dev, compute_type=ct, **kw)
     return _MODEL[name]
+
+
+# --------------------------------------------------------------------------------------------- backends
+BACKENDS = ("auto", "faster-whisper", "mlx")
+
+# cutroom model names -> MLX weights on the Hugging Face Hub. Every repo here was checked to exist
+# (mlx-community, Oct 2026). A name with "/" (another repo) or a local folder is passed through as is.
+MLX_REPOS = {
+    "tiny": "mlx-community/whisper-tiny-mlx",
+    "tiny.en": "mlx-community/whisper-tiny.en-mlx",
+    "base": "mlx-community/whisper-base-mlx",
+    "base.en": "mlx-community/whisper-base.en-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "small.en": "mlx-community/whisper-small.en-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "medium.en": "mlx-community/whisper-medium.en-mlx",
+    "large-v2": "mlx-community/whisper-large-v2-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large": "mlx-community/whisper-large-v3-mlx",              # faster-whisper's "large" is large-v3 too
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "turbo": "mlx-community/whisper-large-v3-turbo",
+}
+
+# `auto` only moves these to MLX. mlx-whisper has no beam search (greedy decoding), which costs the small
+# models real accuracy: on a talk clip MLX `small` agreed with faster-whisper `small` on 83 % of words, MLX
+# `medium` with faster-whisper `medium` on 94 %, and MLX `tiny` hears "okay, cut" as "okay, caught". The
+# small models are fast on the CPU anyway; the big ones are where the GPU pays (~9x for medium).
+MLX_AUTO_MODELS = {"medium", "medium.en", "large", "large-v2", "large-v3", "large-v3-turbo", "turbo"}
+
+_AVAIL = {}
+
+
+def is_apple_silicon() -> bool:
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def mlx_available() -> bool:
+    """True when `mlx_whisper` imports (cached; the import takes a couple of seconds)."""
+    if "mlx" not in _AVAIL:
+        try:
+            import mlx_whisper  # noqa: F401
+            _AVAIL["mlx"] = True
+        except Exception:  # noqa: BLE001 - not installed, Intel Mac, Rosetta python...
+            _AVAIL["mlx"] = False
+    return _AVAIL["mlx"]
+
+
+def faster_whisper_available() -> bool:
+    if "fw" not in _AVAIL:
+        try:
+            import faster_whisper  # noqa: F401
+            _AVAIL["fw"] = True
+        except Exception:  # noqa: BLE001
+            _AVAIL["fw"] = False
+    return _AVAIL["fw"]
+
+
+def any_backend_available() -> bool:
+    return faster_whisper_available() or (is_apple_silicon() and mlx_available())
+
+
+def mlx_repo(model_name) -> str | None:
+    """MLX weights for a cutroom model name, or None when there is no known mapping."""
+    name = str(model_name or "").strip()
+    if "/" in name or (name and Path(name).expanduser().is_dir()):
+        return name
+    return MLX_REPOS.get(name)
+
+
+def select_backend(want="auto", model_name=None, *, apple=None, mlx_ok=None) -> str:
+    """'faster-whisper' or 'mlx' for an `asr_backend` setting. Pure apart from the two probes, which
+    tests pass in (apple=, mlx_ok=).
+      auto            mlx on Apple Silicon macOS when mlx_whisper imports and the model is medium or
+                      larger (MLX_AUTO_MODELS, or an explicit MLX repo id / folder), else faster-whisper
+      mlx             mlx, or a clear error saying why it can't run here
+      faster-whisper  always faster-whisper"""
+    w = (want or "auto").strip().lower().replace("_", "-")
+    if w in ("faster", "fw", "ctranslate2"):
+        w = "faster-whisper"
+    if w not in BACKENDS:
+        raise ValueError(f"asr_backend {want!r} is not one of {', '.join(BACKENDS)}")
+    if w == "faster-whisper":
+        return w
+    apple = is_apple_silicon() if apple is None else apple
+    mapped = model_name is None or mlx_repo(model_name) is not None
+    if w == "mlx":
+        if not apple:
+            raise RuntimeError("asr_backend is 'mlx' but this is not an Apple Silicon Mac")
+        if not (mlx_available() if mlx_ok is None else mlx_ok):
+            raise RuntimeError("asr_backend is 'mlx' but mlx_whisper does not import (pip install -e '.[mlx]')")
+        if not mapped:
+            raise RuntimeError(f"no MLX weights known for model {model_name!r} "
+                               f"(known: {', '.join(MLX_REPOS)}; or give an mlx-community repo id)")
+        return "mlx"
+    name = str(model_name or "").strip()
+    auto_ok = model_name is None or name in MLX_AUTO_MODELS or (mapped and name not in MLX_REPOS)
+    if apple and auto_ok and (mlx_available() if mlx_ok is None else mlx_ok):
+        return "mlx"
+    return "faster-whisper"
+
+
+def backend_for(cfg, model_name=None) -> str:
+    """The backend this project would use for `model_name` (asr_remote runs whatever the far side has)."""
+    return select_backend(getattr(cfg, "asr_backend", "") or "auto", model_name)
+
+
+def backend_summary(cfg) -> tuple:
+    """(ok, detail) for `cutroom doctor`: which ASR backend is active and why."""
+    want = (getattr(cfg, "asr_backend", "") or "auto")
+    model = getattr(cfg, "asr_model", "") or "medium"
+    if getattr(cfg, "asr_remote", ""):
+        return True, f"remote (asr_remote set); setting {want}"
+    try:
+        b = backend_for(cfg, model)
+    except (RuntimeError, ValueError) as e:
+        return False, str(e)
+    if b == "mlx":
+        return True, f"mlx on the Apple GPU ({mlx_repo(model)}); setting {want}"
+    if not faster_whisper_available():
+        hint = " or '.[mlx]'" if is_apple_silicon() else ""
+        return False, f"none installed (optional extra: pip install -e '.[asr]'{hint}); setting {want}"
+    dev, ct = _device(getattr(cfg, "asr_device", "") or "")
+    why = ""
+    if want == "auto" and is_apple_silicon():
+        why = " (mlx_whisper not installed: pip install -e '.[mlx]' for the GPU)" if not mlx_available() else \
+            f" (auto uses MLX for medium and larger; {model!r} stays on the CPU, asr_backend 'mlx' forces it)"
+    return True, f"faster-whisper on {dev} ({ct}){why}; setting {want}"
+
+
+def _clip_spans(spans, total_s, pad=0.2, merge_gap=1.0) -> list:
+    """VAD spans -> a flat [start, end, start, end, ...] list for mlx_whisper's clip_timestamps:
+    padded, merged across short gaps (so a breath doesn't split a sentence), clamped to the audio."""
+    out = []
+    for a, b in spans:
+        a, b = max(0.0, a - pad), min(total_s, b + pad)
+        if b <= a:
+            continue
+        if out and a - out[-1][1] <= merge_gap:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [round(x, 3) for ab in out for x in ab]
+
+
+def mlx_to_segments(res) -> tuple:
+    """mlx_whisper.transcribe() result -> (language, segments) in the transcript shape, with the same
+    hallucination guard and rounding as the faster-whisper path."""
+    out = []
+    for s in res.get("segments") or []:
+        nsp, alp = float(s.get("no_speech_prob", 0.0)), float(s.get("avg_logprob", 0.0))
+        if nsp > 0.8 and alp < -1.0:
+            continue
+        text = str(s.get("text", "")).strip()
+        ws = [{"start": round(float(w["start"]), 3), "end": round(float(w["end"]), 3), "word": str(w["word"]),
+               "probability": round(float(w.get("probability", 0.0)), 3)} for w in (s.get("words") or [])]
+        if not ws and not text:
+            continue
+        out.append({"start": round(float(s["start"]), 3), "end": round(float(s["end"]), 3), "text": text,
+                    "words": ws})
+    return res.get("language"), out
+
+
+def _run_mlx(cfg, audio, model_name):
+    """MLX Whisper on the Apple GPU. The VAD spans become clip_timestamps, so (like faster-whisper's
+    vad_filter) silence is never decoded. mlx-whisper has no beam search: greedy with temperature fallback."""
+    import mlx_whisper
+    repo = mlx_repo(model_name)
+    if not repo:
+        raise RuntimeError(f"no MLX weights known for model {model_name!r}")
+    _MODEL.clear()                                       # never hold a faster-whisper and an MLX model
+    total = len(audio) / SR
+    clips = _clip_spans(speech_spans(audio), total)
+    if not clips:
+        return None, []
+    res = mlx_whisper.transcribe(
+        np.ascontiguousarray(audio, dtype=np.float32), path_or_hf_repo=repo, verbose=None,
+        language=(cfg.asr_language or None), word_timestamps=True, condition_on_previous_text=False,
+        clip_timestamps=clips)
+    _mlx_clear_cache()
+    return mlx_to_segments(res)
+
+
+def _mlx_clear_cache():
+    """Hand MLX's buffer cache back to the system between clips (the loaded model stays)."""
+    try:
+        import mlx.core as mx
+        (getattr(mx, "clear_cache", None) or mx.metal.clear_cache)()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _mlx_release_model():
+    if "mlx_whisper.transcribe" not in sys.modules:      # never loaded: nothing to release (and no import)
+        return
+    try:
+        from mlx_whisper.transcribe import ModelHolder
+        ModelHolder.model = ModelHolder.model_path = None
+    except Exception:  # noqa: BLE001
+        pass
+    _mlx_clear_cache()
 
 
 def _fmt_eta(s):
@@ -157,6 +366,7 @@ def release_if_bloated(gov):
     except MemoryError:
         import gc
         _MODEL.clear()
+        _mlx_release_model()
         gc.collect()
         gov.check_self(what="transcription process (model released)")
 
@@ -178,12 +388,15 @@ def _transcribe_clip(cfg, con, c, model_name, audio=None, speech_s=None):
     language, out = _run_model(cfg, audio, model_name)
     n_words = sum(len(s["words"]) for s in out)
     sp = speech_s if speech_s is not None else sum(s["end"] - s["start"] for s in out)
-    return _store(cfg, con, c["id"], language, model_name, out, n_words, sp)
+    backend = "remote" if getattr(cfg, "asr_remote", "") else backend_for(cfg, model_name)
+    return _store(cfg, con, c["id"], language, model_name, out, n_words, sp, backend=backend)
 
 
 def _run_model(cfg, audio, model_name):
     if getattr(cfg, "asr_remote", ""):
         return _run_remote(cfg, audio, model_name)
+    if backend_for(cfg, model_name) == "mlx":
+        return _run_mlx(cfg, audio, model_name)
     _DEVICE_WANT["v"] = getattr(cfg, "asr_device", "") or ""
     model = get_model(model_name)
     segs, info = model.transcribe(
@@ -236,12 +449,14 @@ def _run_remote(cfg, audio, model_name):
         out.unlink(missing_ok=True)
 
 
-def _store(cfg, con, cid, language, model_name, segments, n_words, speech_s):
+def _store(cfg, con, cid, language, model_name, segments, n_words, speech_s, backend=None):
     path = cfg.p("transcripts", f"{cid}.json")
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"language": language, "model": model_name, "speech_s": round(speech_s, 2),
-                               "segments": segments}, ensure_ascii=False))
+    doc = {"language": language, "model": model_name, "speech_s": round(speech_s, 2), "segments": segments}
+    if backend:
+        doc["backend"] = backend
+    tmp.write_text(json.dumps(doc, ensure_ascii=False))
     os.replace(tmp, path)
     _WORDS.pop(cid, None)
     row = {"clip_id": cid, "path": str(path), "language": language, "n_words": int(n_words),
@@ -542,24 +757,28 @@ def upgrade_pending(con, fast_model, model_name) -> list:
 
 # --------------------------------------------------------------------------------------------- remote side
 def _main(argv=None):
-    """`python -m cutroom.asr AUDIO OUT.json [--model M] [--language xx] [--device cpu|cuda]`:
+    """`python -m cutroom.asr AUDIO OUT.json [--model M] [--language xx] [--device cpu|cuda]
+    [--backend auto|faster-whisper|mlx]`:
     transcribe one audio file and write the transcript JSON (the far side of `asr_remote`)."""
     import argparse
     ap = argparse.ArgumentParser(prog="python -m cutroom.asr")
     ap.add_argument("audio"); ap.add_argument("out")
     ap.add_argument("--model", default="medium"); ap.add_argument("--language", default="")
     ap.add_argument("--device", default="")
+    ap.add_argument("--backend", default="auto", choices=BACKENDS)
     a = ap.parse_args(argv)
 
     class _C:                               # minimal config: no project needed on the far side
         ffmpeg = "ffmpeg"
         asr_language = "" if a.language in ("", "auto") else a.language
         asr_device = a.device
+        asr_backend = a.backend
         asr_remote = ""
     audio = load_audio(_C, a.audio)
     language, segs = _run_model(_C, audio, a.model)
     tmp = Path(a.out).with_suffix(".tmp")
-    tmp.write_text(json.dumps({"language": language, "model": a.model, "segments": segs}, ensure_ascii=False))
+    tmp.write_text(json.dumps({"language": language, "model": a.model, "backend": backend_for(_C, a.model),
+                               "segments": segs}, ensure_ascii=False))
     os.replace(tmp, a.out)
     print(f"{a.out}: {sum(len(s['words']) for s in segs)} words")
 

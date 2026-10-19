@@ -227,6 +227,17 @@ def record_failure(cfg, stage, cid, reason) -> int:
         return f["counts"][key]
 
 
+def _asr_backend_label(cfg, model):
+    """'faster-whisper' / 'mlx' / 'remote' for rates.json, so estimates never mix backends' speeds."""
+    from . import asr
+    if getattr(cfg, "asr_remote", ""):
+        return "remote"
+    try:
+        return asr.backend_for(cfg, model)
+    except (RuntimeError, ValueError):
+        return None
+
+
 def record_rate(cfg, stage, st, slots):
     """Remember how fast a stage really ran on this machine (overnight/rates.json, last 20 per stage);
     `cutroom estimate` projects from these."""
@@ -244,7 +255,7 @@ def record_rate(cfg, stage, st, slots):
         rates.setdefault(stage, []).append({"t": time.time(), "seconds": round(el, 1), "items": n,
                                             "footage_s": round(w, 1), "x_realtime": round(w / el, 3) if w else None,
                                             "items_per_h": round(n / el * 3600, 1), "load": load, "slots": slots,
-                                            "model": st.get("model")})
+                                            "model": st.get("model"), "backend": st.get("backend")})
         rates[stage] = rates[stage][-20:]
         _jsave(d / "rates.json", rates)
 
@@ -790,7 +801,7 @@ class Pipeline:
         pending = self.order([r for r in rows if r["id"] not in done_ids and r["id"] not in copies],
                              lambda r: -(r["duration"] or 0))
         self.stage_begin("transcribe", total=len(pending), weight_total=sum(r["duration"] or 0 for r in pending),
-                         model=model, phase="speech check")
+                         model=model, backend=_asr_backend_label(self.cfg, model), phase="speech check")
         speech = {}
 
         def vad(r):
@@ -867,7 +878,8 @@ class Pipeline:
         ids = asr.upgrade_pending(self.con, fast, full)
         rows = [self.con.execute("SELECT * FROM clips WHERE id=?", (i,)).fetchone() for i in ids]
         rows = self.order([r for r in rows if r is not None], lambda r: -(r["duration"] or 0))
-        self.stage_begin("upgrade", total=len(rows), weight_total=sum(r["duration"] or 0 for r in rows), model=full)
+        self.stage_begin("upgrade", total=len(rows), weight_total=sum(r["duration"] or 0 for r in rows), model=full,
+                         backend=_asr_backend_label(self.cfg, full))
 
         def tx_err(r, e):
             self.fail_counts[f"upgrade:{r['id']}"] = record_failure(self.cfg, "upgrade", r["id"], e)

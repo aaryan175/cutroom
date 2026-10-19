@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 asr = ["faster-whisper>=1.0"]
+mlx = ["mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'"]   # Apple Silicon GPU ASR
 voice = ["deepfilternet>=0.5"]
 dev = ["pytest>=7"]
 
@@ -29,3 +30,6 @@ cutroom = "cutroom.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["cutroom*"]
+
+[tool.setuptools.package-data]
+cutroom = ["studio_web/**/*", "factory/prompts/*.md", "factory/schemas/*.json"]

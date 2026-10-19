@@ -1,0 +1,24 @@
+{
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "capability",
+  "patch_summary",
+  "tests",
+  "summary"
+ ],
+ "properties": {
+  "capability": {
+   "type": "string"
+  },
+  "patch_summary": {
+   "type": "string"
+  },
+  "tests": {
+   "type": "string"
+  },
+  "summary": {
+   "type": "string"
+  }
+ }
+}

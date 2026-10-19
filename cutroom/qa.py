@@ -59,8 +59,15 @@ REPEAT_WINDOW = 10.0           # rule 92
 MIN_MONTAGE_SHOT = 0.3
 FLOOR_STEP_MEDIAN, FLOOR_STEP_P90 = 3.0, 8.0   # room tone across talk joins (reference: 2.2 / 4.9 dB)
 TALK_MIN_WINDOW_DB = -55.0      # quietest 250 ms inside talk (reference -39; a gated cut sits at -65..-73)
-BLACK_P1_MILKY = 16.0           # median black point (p1 luma, 0-255): reference 10; > 16 reads milky
-BLACK_P1_SHOT = 24.0            # one shot's black point this high is visibly lifted
+BLACK_P1_RANGE = (8.0, 35.0)    # median black point (p1 luma, 0-255): not crushed and not milky. Reference 8,
+                                # the approved LUT-only house grade 29-41 on daylight; v2's "insane" grade 2-4
+BLACK_P1_MILKY = BLACK_P1_RANGE[1]
+BLACK_P1_SHOT = 45.0            # one shot's black point this high is visibly lifted
+BLACK_P1_CRUSH_SHOT = 4.0       # one daylight shot's black point this low is crushed
+GRADE_LUMA_TOL = 15.0           # grade_bounds: rendered vs LUT-only (same source frame), luma 0-255
+GRADE_P1_DROP = 12.0            #   p1 may fall at most this far below the LUT-only black point
+GRADE_SAT_GAIN = 1.15           #   saturation at most +15 % over LUT-only
+SMALL_FACE_H = 0.08             # face detections smaller than this (frame height) inside a caption band are text, not faces
 DUP_RATE = 0.8                  # duplicated frames per second in a moving shot (24 -> 25 judder ~1/s)
 CAPTION_PCT = (3.3, 4.7)        # caption FONT px as % of frame height. Reference: 43 px at 1080 = 3.98 %
                                 # (its visible text height measures ~2.96 %; don't compare font size to text height)
@@ -73,7 +80,7 @@ MAX_EVIDENCE = 400
 JPEG_Q = 72
 
 INTENTIONAL_STILL = {"still", "title", "black", "card", "freeze"}
-INTENTIONAL_BLACK = {"black", "title", "fade"}
+INTENTIONAL_BLACK = {"black", "title", "fade", "card"}
 TALK_KINDS = {"talk", "speech", "aroll", "a-roll"}
 MONTAGE_KINDS = {"montage", "mont", "teaser", "tease"}
 
@@ -654,6 +661,7 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
 
     # ---------------------------------------------------------------- loudness
     talk_spans, montage_spans, still_spans, black_ok = [], [], [], []
+    framed = [(float(x["start"]), float(x["end"]), x["frame"]) for x in (raw_side.get("segments") or []) if x.get("frame")]
     if side:
         for s in side["segments"]:
             k = s["kind"]
@@ -672,14 +680,24 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
             iss.append(rep.issue("warn", "ebur128 summary missing"))
         else:
             lo, hi = LUFS_RANGE
+            mb = ((raw_side.get("loudness") or {}).get("measured_before") or {})
+            dlg = None
+            if mb.get("anchor") == "dialogue" and (mb.get("dialogue") or {}).get("I") is not None:
+                # dialogue-anchored: the DIALOGUE sits on the target; music sections may lift the
+                # programme up to 2 LU over it (render.PROGRAMME_OVER_LU)
+                dlg = round(float(mb["dialogue"]["I"]) + float(mb.get("gain_db") or 0.0), 1)
+                hi += 2.0
             off = lo - I if I < lo else (I - hi if I > hi else 0.0)
             if off > 0:
                 iss.append(rep.issue("fail" if off > LUFS_SLACK else "warn",
-                                     f"integrated loudness {I:.1f} LUFS, target {lo:g}..{hi:g}"))
+                                     f"integrated loudness {I:.1f} LUFS, target {lo:g}..{hi:g}"
+                                     + (f" (dialogue-anchored; dialogue {dlg:.1f})" if dlg is not None else "")))
         if TP is not None and TP > TP_MAX:
             iss.append(rep.issue("fail", f"true peak {TP:.1f} dBTP > {TP_MAX:g} (lower the gain or limit)"))
         mom = au.momentary
         value = {"integrated_lufs": I, "true_peak_dbtp": TP, "lra": au.lra}
+        if I is not None and dlg is not None:
+            value["dialogue_lufs"] = dlg
 
         def span_lufs(spans):
             if not spans or not len(mom):
@@ -930,8 +948,18 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
             value={"median": _nanmed([s["shake"] for s in real])})
     iss = []
     for s in real:
-        if s["luma"] < DARK_LUMA:
-            iss.append(shot_issue("warn", s, f"dark (mean luma {s['luma']:.0f} < {DARK_LUMA:g}; rule 90)", "dark"))
+        fr = next((w for a, b, w in framed if a - 1e-3 <= s["start"] < b), None)
+        luma = s["luma"]
+        if fr:                                   # an inset / gate: judge the picture inside its window
+            img = vs.frame(s["sample_frames"][len(s["sample_frames"]) // 2])
+            if img is not None:
+                hh, ww = img.shape[:2]
+                x0, y0, x1, y1 = fr["window"]
+                win = img[int(y0 * hh):int(y1 * hh), int(x0 * ww):int(x1 * ww)]
+                if win.size:
+                    luma = float(win.mean())
+        if luma < DARK_LUMA:
+            iss.append(shot_issue("warn", s, f"dark (mean luma {luma:.0f} < {DARK_LUMA:g}; rule 90)", "dark"))
         if s["sharpness"] is not None and s["sharpness"] < SHARP_FLOOR and s["dur"] >= 0.3:
             iss.append(shot_issue("warn", s, f"soft (Laplacian variance {s['sharpness']:.0f} < {SHARP_FLOOR:g}; rule 90)", "soft"))
     rep.add("exposure_sharpness", "shots", "Dark or soft shots (rule 90)", iss)
@@ -950,6 +978,8 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
     # picture must fill the frame: no plates, picture-in-picture or letterbox bars (rule 37)
     iss, bordered = [], {}
     for s in real:
+        if any(a - 1e-3 <= s["start"] < b for a, b, _ in framed):
+            continue                             # a planned gate / inset / letterbox (the reference's frames, rule 38)
         g = vs.g64[s["sample_frames"][len(s["sample_frames"]) // 2]].astype(np.float32)
         ring = np.concatenate([g[:3].ravel(), g[-3:].ravel(), g[:, :4].ravel(), g[:, -4:].ravel()])
         inner = g[8:-8, 10:-10]
@@ -1051,6 +1081,8 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
                     continue
                 checked += 1
                 for fb in detect_faces(vs.frame(f)):
+                    if kind == "caption" and fb[3] < SMALL_FACE_H and overlap(fb, box) > 0.5:
+                        continue                 # a "face" this small inside the caption band is the caption text
                     ov = overlap(head_box(fb), box)
                     if ov > 0.02:
                         hits.append((f, ov))
@@ -1068,6 +1100,7 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
     # ---------------------------------------------------------------- craft checks (reference-measured)
     _craft_checks(rep, vs, au, shots, real, fps, n, H, duration, raw_side, side, talk_spans, black_ok, still_spans,
                   frozen, cfg)
+    _reference_checks(rep, vs, fps, n, raw_side, framed)
 
     # ---------------------------------------------------------------- contact sheets
     issue_frames = {}
@@ -1160,7 +1193,13 @@ def sfx_offset(audio, sr, t_expected_start, sfx_wav, search=0.06):
     if xsr != sr:
         idx = np.arange(0, len(x), xsr / sr).astype(int)
         x = x[idx[idx < len(x)]]
-    ex = _env_1ms(x, sr)[:150]
+    full = _env_1ms(x, sr)
+    if not len(full):
+        return None
+    # match 150 ms around the effect's own transient (a whoosh-into-impact is quiet for its first 0.35 s)
+    k0 = max(0, int(np.argmax(full)) - 40)
+    ex = full[k0:k0 + 150]
+    t_expected_start = t_expected_start + k0 / 1000.0
     a0 = int((t_expected_start - search) * sr)
     if a0 < 0 or a0 + int((2 * search + 0.2) * sr) > len(audio) or not len(ex):
         return None
@@ -1215,28 +1254,38 @@ def _craft_checks(rep, vs, au, shots, real, fps, n, H, duration, raw, side, talk
     # ---- black level (milky blacks)
     def is_black_ok(s):
         return _within(s["start"], s["end"], black_ok + still_spans, pad=1 / fps)
+    framed_t = [(float(x["start"]), float(x["end"])) for x in (raw.get("segments") or []) if x.get("frame")]
     iss, rows = [], []
     for s in real:
-        if is_black_ok(s) or s["f1"] - s["f0"] < 3:
-            continue
+        if is_black_ok(s) or s["f1"] - s["f0"] < 3 or _within(s["start"], s["end"], framed_t, pad=1 / fps):
+            continue                             # a gate / inset border is not the picture's black point
         a, b = s["f0"] + 1, s["f1"] - 1                  # skip boundary frames (flashes, dips)
         p1 = float(np.median(vs.p1[a:b])) if b > a else float(vs.p1[s["f0"]])
         s["black_p1"] = round(p1, 1)
         night = s["luma"] < 50
         rows.append((s, p1, night))
         if not night and p1 > BLACK_P1_SHOT:
-            iss.append(rep.issue("warn", f"shot {s['idx'] + 1}: lifted blacks (p1 luma {p1:.0f}, reference ~10); "
-                                         "exposure belongs before the LUT, never a post-LUT brightness lift",
+            iss.append(rep.issue("warn", f"shot {s['idx'] + 1}: lifted blacks (p1 luma {p1:.0f}); exposure belongs "
+                                         "before the LUT, never a post-LUT brightness lift",
+                                 t=s["start"], t_end=s["end"], frames=[(s["f0"] + s["f1"]) // 2], tag="black"))
+        if not night and s["luma"] > 90 and p1 < BLACK_P1_CRUSH_SHOT:
+            iss.append(rep.issue("warn", f"shot {s['idx'] + 1}: crushed blacks on a daylight shot (p1 luma {p1:.1f}); "
+                                         "the house grade is the LUT only (rule 120)",
                                  t=s["start"], t_end=s["end"], frames=[(s["f0"] + s["f1"]) // 2], tag="black"))
     vals = [p for _, p, night in rows if not night]
     med = float(np.median(vals)) if vals else None
-    if med is not None and med > BLACK_P1_MILKY:
-        iss.insert(0, rep.issue("warn", f"milky blacks: median black point p1 {med:.1f} (reference 10; > {BLACK_P1_MILKY:g})"))
-    rep.add("black_level", "picture", "Black level (p1 luma per shot; reference ~10)", iss[:40],
+    lo, hi = BLACK_P1_RANGE
+    if med is not None and med > hi:
+        iss.insert(0, rep.issue("warn", f"milky blacks: median black point p1 {med:.1f} (> {hi:g}; reference 8, "
+                                        "LUT-only daylight 29-41)"))
+    elif med is not None and med < lo:
+        iss.insert(0, rep.issue("warn", f"crushed blacks: median black point p1 {med:.1f} (< {lo:g}); a curve, look or "
+                                        "exposure pull is crushing the toe (rule 120)"))
+    rep.add("black_level", "picture", f"Black level (median p1 {lo:g}-{hi:g}: not crushed, not milky)", iss[:40],
             value={"median_p1": None if med is None else round(med, 1),
                    "p10_p1": round(float(np.percentile(vals, 10)), 1) if vals else None,
                    "p90_p1": round(float(np.percentile(vals, 90)), 1) if vals else None, "shots": len(vals),
-                   "reference_p1": 10.4})
+                   "reference_p1": 8.5, "range": list(BLACK_P1_RANGE)})
 
     # ---- duplicate frames (frame-rate judder from 23.976 / 29.97 sources)
     iss, total_d, per = [], 0, []
@@ -1289,7 +1338,12 @@ def _craft_checks(rep, vs, au, shots, real, fps, n, H, duration, raw, side, talk
             w = vs.luma[f - 3:f + 4]
             row["peak_frame_offset"] = int(np.argmin(w)) - 3
         ev = sfx_ev.get(f"transition:{k}")
-        if ev and au and len(au.audio):
+        other = [e for e in (raw.get("sfx") or []) if e is not ev and e.get("align") == "peak" and ev is not None
+                 and abs(float(e["t"]) - float(ev["t"])) < 0.06]
+        if ev and other:
+            row["sfx_offset_ms"] = None            # two transients on one frame (a riser into a burn): not separable
+            row["note"] = f"shares the cut with {other[0]['name']}"
+        elif ev and au and len(au.audio):
             path = ev["name"]
             if not os.path.exists(str(path)):
                 try:
@@ -1329,6 +1383,136 @@ def _craft_checks(rep, vs, au, shots, real, fps, n, H, duration, raw, side, talk
     else:
         rep.add("caption_size", "captions", "Caption size vs reference (~43 px at 1080)", [], status="info",
                 detail="no caption size in the sidecar")
+
+
+DEVICE_KINDS = ("burn", "card", "inset", "gate", "letterbox", "typed_title", "film")
+
+
+def device_rule_issues(raw):
+    """Rule 38 (the reference wins): every device in the render (burns, cards, inset / gate / letterbox frames,
+    typed titles, film character) must be one the creator's reference measurably has. [(severity, message)]."""
+    used = [d for d in (raw.get("devices") or []) if d in DEVICE_KINDS]
+    if not used:
+        return []
+    ref = raw.get("reference") or {}
+    have = set(ref.get("devices") or [])
+    if "film" in used and (raw.get("film") or {}).get("from_reference"):
+        have.add("film")
+    out = []
+    for d in used:
+        if d not in have:
+            who = f"reference {ref['id']}" if ref.get("id") else "no reference"
+            out.append(("fail", f"{d}: not measured on the creator's reference ({who}); home-made decorative effects "
+                                "stay banned (rule 38)"))
+    return out
+
+
+def _warm_pct(img, side):
+    """Share of burn-coloured pixels: red glow (side "out") or orange disc (side "in"); img is BGR."""
+    b, g, r = (img[..., k].astype(np.int16) for k in range(3))
+    if side == "out":
+        m = (r > 170) & (g < 110) & (b < 110) & (r - g > 80)
+    else:
+        m = (r > 200) & (g > 70) & (g < 240) & (b < 130) & (r - b > 100)
+    return float(m.mean())
+
+
+def _sat(img):
+    a = img.astype(np.float32)
+    mx, mn = a.max(axis=2), a.min(axis=2)
+    return float(np.mean(np.where(mx > 0, (mx - mn) / np.maximum(mx, 1), 0)) * 255)
+
+
+def _reference_checks(rep, vs, fps, n, raw, framed):
+    """Checks for the reference-measured devices and the house grade: rule 38 device provenance, burn on the
+    cut, the card when the reference opens on one, and the grade within bounds of the LUT-only picture."""
+    if not raw:
+        return
+    # ---- rule 38: devices must come from the reference
+    iss = [rep.issue(sev, msg) for sev, msg in device_rule_issues(raw)]
+    rep.add("devices_vs_reference", "picture", "Effects measured on the reference only (rule 38)", iss,
+            value={"used": raw.get("devices") or [], "reference": (raw.get("reference") or {}).get("devices")},
+            status=None if raw.get("devices") else "info")
+    # ---- burns: outgoing glow on the last frame before the cut, incoming disc on the cut frame
+    iss, rows = [], []
+    for tr in raw.get("transitions") or []:
+        if tr.get("kind") != "burn":
+            continue
+        f = int(tr.get("frame", round(float(tr["t"]) * fps)))
+        if not 3 <= f < n - 3:
+            continue
+        fo, fi = int(tr.get("frames_out", 1)), int(tr.get("frames_in", 1))
+        pa = [_warm_pct(vs.frame(x), "out") for x in range(f - fo - 1, f + 1)]
+        pb = [_warm_pct(vs.frame(x), "in") for x in range(f - 1, f + fi + 1)]
+        lum = [float(vs.luma[x]) for x in range(f - 3, f + 3)]
+        a_on, a_before = pa[-2], pa[0]                 # glow on frame f-1, none on f-fo-1
+        b_on, b_after = pb[1], pb[-1]                  # disc on frame f, none after f+fi
+        row = {"t": tr["t"], "frame": f, "glow_pct": round(a_on, 3), "disc_pct": round(b_on, 3),
+               "luma": [round(x, 1) for x in lum], "jump": round(max(lum[2], lum[3]) - (lum[0] + lum[5]) / 2, 1)}
+        rows.append(row)
+        soft = float(tr.get("strength", 1.0)) < 0.8         # a soft burn (a card's exit) only warms the frame
+        if not soft and not (b_on > 0.08 and b_on > 2 * b_after):
+            iss.append(rep.issue("fail", f"burn at {fmt_t(tr['t'])}: no incoming disc on the cut frame "
+                                         f"({b_on * 100:.0f}% orange; rule 123)", t=tr["t"], frames=[f - 1, f], tag="burn"))
+        if float(tr.get("strength", 1.0)) >= 0.8 and not (a_on > 0.04 and a_on > 2 * max(a_before, 0.005)):
+            iss.append(rep.issue("warn", f"burn at {fmt_t(tr['t'])}: weak outgoing glow on the frame before the cut "
+                                         f"({a_on * 100:.0f}% red)", t=tr["t"], frames=[f - 1, f], tag="burn"))
+    rep.add("burn_timing", "picture", "Film burns: glow before the cut, disc on the cut (rule 123)", iss,
+            value={"burns": rows}, status=None if rows else "info")
+    # ---- the card, when the reference opens on one
+    ref = raw.get("reference") or {}
+    cards = [x for x in raw.get("segments") or [] if x.get("kind") == "card" or x.get("card")]
+    iss = []
+    if ref.get("card"):
+        if not cards or float(cards[0]["start"]) > 0.05:
+            iss.append(rep.issue("fail", "the reference opens on a title card (\"COMING UP\"); this render does not "
+                                         "(rule 45)", t=0.0))
+        else:
+            c = cards[0]
+            f = min(n - 1, int(round((float(c["start"]) + float(c["end"])) / 2 * fps)))
+            img = vs.frame(f)
+            b, g, r = (img[..., k].astype(np.int16) for k in range(3))
+            ink = float(((r > 180) & (g > 180) & (b < 110)).mean())
+            if ink < 0.004:
+                iss.append(rep.issue("fail", f"card at 0:00 shows almost no yellow text ({ink * 100:.2f}% of pixels)",
+                                     t=float(c["start"]), frames=[f], tag="card"))
+    rep.add("card_present", "picture", "Title card when the reference has one", iss,
+            value={"reference_card": bool(ref.get("card")), "cards": len(cards)}, status=None if ref.get("card") else "info")
+    # ---- grade within bounds of the LUT-only picture of the same source
+    iss, rows = [], []
+    for x in raw.get("segments") or []:
+        ls = x.get("lut_stats")
+        if not ls or x.get("frame") or x.get("kind") != "clip" or float(x["end"]) - float(x["start"]) < 0.3 \
+                or x.get("push") or x.get("cutaways"):
+            continue                             # a push or a cutaway shows another picture than the probe
+        crop = x.get("crop") or [0, 0, 1, 1]
+        if crop[2] < 0.9:                       # a tight crop sees a different part of the frame than the probe
+            continue
+        f = int(round((float(x["start"]) + float(x["end"])) / 2 * fps))
+        img = vs.frame(f)
+        if img is None:
+            continue
+        g = img[..., ::-1].astype(np.float32) @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+        hh = g.shape[0]
+        body = g[: int(hh * 0.8)]                # outside the caption band
+        st = {"luma": float(np.median(body)), "p1": float(np.percentile(body, 1)), "sat": _sat(img[: int(hh * 0.8)])}
+        row = {"t": round(float(x["start"]), 2), "clip": x.get("clip_rel"), "render": {k: round(v, 1) for k, v in st.items()},
+               "lut_only": ls}
+        rows.append(row)
+        why = []
+        if abs(st["luma"] - ls["luma"]) > GRADE_LUMA_TOL:
+            why.append(f"luma {st['luma']:.0f} vs {ls['luma']:.0f}")
+        if st["p1"] < min(ls["p1"], max(ls["p1"] - GRADE_P1_DROP, BLACK_P1_RANGE[0])) - 0.5:
+            why.append(f"black point {st['p1']:.0f} vs {ls['p1']:.0f} (crushed)")
+        if st["sat"] > ls["sat"] * GRADE_SAT_GAIN + 4:
+            why.append(f"saturation {st['sat']:.0f} vs {ls['sat']:.0f}")
+        if why:
+            iss.append(rep.issue("warn", f"{x.get('clip_rel') or 'shot'} at {fmt_t(x['start'])}: grade outside the LUT-only "
+                                         f"bounds ({'; '.join(why)}; rule 94/120)", t=float(x["start"]), frames=[f], tag="grade"))
+    rep.add("grade_bounds", "picture", "Grade within bounds of the LUT-only house grade (rules 94, 120)", iss[:30],
+            value={"shots": rows[:60], "tolerance": {"luma": GRADE_LUMA_TOL, "p1_drop": GRADE_P1_DROP,
+                                                     "sat_gain": GRADE_SAT_GAIN}},
+            status=None if rows else "info")
 
 
 def _nanmed(xs):

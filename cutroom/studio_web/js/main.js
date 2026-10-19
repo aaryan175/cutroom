@@ -15,6 +15,8 @@ import { initReference, _test as refTest } from './reference.js';
 import { initComments } from './comments.js';
 import { initLooks } from './looks.js';
 import { initTour } from './tour.js';
+import { initFactory } from './factory.js';
+import { initReview } from './review.js';
 
 // ---------------------------------------------------------------- header
 function fmtN(n) { return n === undefined || n === null ? '–' : Number(n).toLocaleString(undefined, { maximumFractionDigits: 1 }); }
@@ -245,6 +247,8 @@ function startEvents() {
     ref: (d) => emit('ref', d),
     library_changed: () => { refreshProject(); emit('libraryChanged'); },
     comments: (d) => emit('commentsRun', d),
+    factory: (d) => emit('factoryEvent', d),
+    factory_state: (d) => emit('factoryState', d),
   }, (state) => { const c = $('#conn'); c.className = 'conn ' + state; c.title = state === 'live' ? 'Live updates connected' : state === 'down' ? 'Live updates disconnected, retrying…' : 'Connecting…'; });
 }
 
@@ -263,6 +267,8 @@ async function boot() {
   initReference();
   initComments();
   initLooks();
+  initFactory();
+  initReview();
 
   on('project', () => { renderHeader(); renderPlanBits(); });
   on('plan', () => { renderPlanBits(); });

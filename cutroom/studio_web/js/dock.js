@@ -5,6 +5,7 @@ import { h, icon, tc, md, toast, eta, ago, LS, clamp } from './util.js';
 import { tabs } from './layout.js';
 import { renderComments } from './comments.js';
 import { renderLooks, lookField } from './looks.js';
+import { renderFactory } from './factory.js';
 
 let body, current = 'inspector';
 const pane = () => { body.innerHTML = ''; const p = h('div.dock-pane'); body.appendChild(p); return p; };
@@ -407,7 +408,7 @@ export function lightbox(url) {
 }
 
 // ================================================================ init
-const RENDER = { inspector: renderInspector, story: renderStory, markers: renderMarkers, comments: () => renderComments(pane()), looks: () => renderLooks(pane()), qa: renderQA, jobs: renderJobs, overnight: renderOvernight };
+const RENDER = { inspector: renderInspector, story: renderStory, markers: renderMarkers, comments: () => renderComments(pane()), looks: () => renderLooks(pane()), factory: () => renderFactory(pane()), qa: renderQA, jobs: renderJobs, overnight: renderOvernight };
 function show(name) { if (!RENDER[name]) name = 'inspector'; current = name; RENDER[name](); }
 export function initDock(el) {
   body = el;

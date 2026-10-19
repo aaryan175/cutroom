@@ -1,0 +1,43 @@
+{
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "variants",
+  "summary"
+ ],
+ "properties": {
+  "variants": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "name",
+     "candidate",
+     "segments",
+     "summary"
+    ],
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "candidate": {
+      "type": "string"
+     },
+     "segments": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "summary": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "summary": {
+   "type": "string"
+  }
+ }
+}

@@ -1,0 +1,104 @@
+{
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "candidate",
+  "ledger",
+  "proofs",
+  "unplaced",
+  "summary"
+ ],
+ "properties": {
+  "candidate": {
+   "type": "string"
+  },
+  "ledger": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "note",
+     "change",
+     "segments",
+     "t_out",
+     "proof"
+    ],
+    "properties": {
+     "note": {
+      "type": "string"
+     },
+     "change": {
+      "type": "string"
+     },
+     "segments": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "t_out": {
+      "type": [
+       "number",
+       "null"
+      ]
+     },
+     "proof": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "proofs": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "finding",
+     "proof"
+    ],
+    "properties": {
+     "finding": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "proof": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "unplaced": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "note",
+     "question",
+     "options"
+    ],
+    "properties": {
+     "note": {
+      "type": "string"
+     },
+     "question": {
+      "type": "string"
+     },
+     "options": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  },
+  "summary": {
+   "type": "string"
+  }
+ }
+}

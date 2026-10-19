@@ -25,6 +25,8 @@ render.py  expand plan → atomic pieces on a frame grid → cached per-piece en
 renders/<slug>_vN.mp4 + .json sidecar ── qa.py (machine checks + contact sheets)
    │
 studio.py (HTTP API + SSE + AI chat bridge) ── studio_web/ (the editor UI, plain ES modules)
+factory/ (comment -> producer / editor / critic role runs -> render -> machine QA -> version + card; code-driven
+          runner on a folder-per-order bus; docs/FACTORY.md)
 board.py (simple phone review page)
 ```
 
@@ -36,19 +38,23 @@ board.py (simple phone review page)
 | `media.py` | every ffmpeg/ffprobe call, hardware encoder choice | never call ffmpeg directly elsewhere; use `media.ffmpeg()` so the governor and logs apply |
 | `governor.py` | resource safety (slots, memory caps, disk floor, throttling) | new heavy work: wrap it in `gov.slot("heavy")` or run it via `gov.run()` |
 | `ingest.py` / `analyze.py` | indexing stages; analyze.py also holds the scale detectors (duplicates, highlights, shoots/places, best takes, the tagging gate) in their own tables | new per-clip analysis (add a stage, make it resumable via a status/column) |
-| `asr.py` | transcripts, `tighten`, caption `cues`, director-cue/repeat finders | caption splitting, new speech heuristics |
+| `recap.py` | event recap mode: `cutroom recap` builds a draft plan (cold open, build, climax, end card) from the event detectors in analyze.py (`event_windows`, `event_clips`, `soundbites`); its defaults live in `RECAP_DEFAULTS` | a new recap rule (flash limits, section shape) or another event template |
+| `asr.py` | transcripts (backends: faster-whisper, MLX on Apple Silicon; `select_backend`, one adapter to one transcript shape), `tighten`, caption `cues`, director-cue/repeat finders | caption splitting, new speech heuristics, a new ASR backend (map its output to the transcript shape) |
 | `music.py` | beats, drops, beat-snapping, music bed, built-in SFX | new music behaviour (e.g. stems, crossfades) |
 | `plan.py` | plan schema, defaults, validation | **any new edit feature starts here**: add the field or segment type, default and validation |
 | `render.py` | plan → video; `resolve_timeline` for the UI | implementing a new segment type, effect or transition |
 | `captions.py` / `overlays.py` | caption and card rendering | new caption styles or graphic cards (keep them minimal; see EDITING_RULES) |
+| `cards.py` | procedural reference devices: film-burn light frames, frame mattes (gate / inset / letterbox), the "COMING UP" card, typed titles; font lookup for display faces (nothing bundled) | a new device a creator's reference has: measure it (reference.py `devices`), generate it here from the numbers |
+| `film.py` | film / lens character: measure grain, softness, vignette, halation, fringing, roll-off, black lift, weave; rebuild it as a chain (`style.film`); `match()` a reference | a new film/lens trait (measure it in `measure_frame`, rebuild it in `chain`) |
 | `qa.py` | automated checks on renders | every new failure the creator catches should become a check here |
 | `looks.py` | colour looks: built-in filter chains scaled by intensity, user `.cube` LUTs (blended with identity), frame previews, colour stats + reference matching | a new look (add a BUILTIN entry: curves / colour balance / eq / vignette + a CSS approximation) |
-| `reference.py` | reference videos: cut map, pacing, sections, beat sync, captions, loudness; `compare` against a render | a new thing creators match by (measure it in `assemble`, add a row + gap in `compare_analyses`) |
+| `reference.py` | reference videos: cut map, pacing, sections, beat sync, captions, loudness, devices (cards, burns, frames, typed titles: `detect_devices`, `ensure_devices`); `compare` against a render | a new thing creators match by (measure it in `assemble` or `detect_devices`, add a row + gap in `compare_analyses` / `_compare_devices`) |
 | `export.py` | deliverables: platform presets, face-tracked reframes (9:16 / 4:5 / 1:1), .srt/.vtt, chapters, thumbnail candidates, cutdown plans | a new platform (add a PRESETS entry: size, rate, loudness, safe area) or a new deliverable |
 | `estimate.py` | `cutroom estimate`: time and disk projection from measured stage speeds (`overnight/rates.json`) | a new overnight stage (add a row in `project()`) |
 | `imports.py` | Studio Import: streaming uploads, finding dropped files on disk, linking footage folders into the library | a new kind of thing creators drop in (add a kind + its follow-up job) |
 | `studio.py` | Studio HTTP API, plan ops, jobs, SSE, chat bridge | new UI actions (add an op or route, document it in `docs/STUDIO.md`) |
-| `agent.py` | Claude Code / Codex CLI bridge | a new AI agent CLI |
+| `agent.py` | Claude Code / Codex CLI bridge; `run_role()` = one headless role run (schema output, wall clock, harness-only refusal/limit detection) | a new AI agent CLI |
+| `factory/` | the factory (docs/FACTORY.md): `bus.py` orders + events, `runner.py` the code loop + actions (submit, verdict, answer), `phases.py` the pipeline, `roles.py` + `prompts/` + `schemas/` the role runs, `mapnotes.py` notes -> segments/words/frames, `lockcheck.py`, `gates.py` machine QA, `lint.py` checks.json, `lessons.py`, `brain.py`, `card.py` | a new phase, gate, check type or role; a lesson that needs measuring becomes a `lint.py` check type or a `qa.py` check |
 | `studio_web/` | the editor UI (no build step) | UI features; keep the plain ES modules and no CDNs |
 
 ## How to add a feature (the recipe)
@@ -77,6 +83,10 @@ Example request: "add a zoom-punch transition".
   measured as physical footprint. A process that exceeds its cap is stopped, not trusted.
 - **Caches are keyed by content.** Never add hand-bumped version salts. Hash the inputs instead.
 - **No bundled copyrighted assets** (fonts, LUTs, music, reference footage). The creator supplies them.
+- **The factory's state is code-owned.** Status lines are written only by `factory/bus.py` with code
+  timestamps; no model writes a heartbeat; integrate is the only writer of factory versions; nothing is
+  published. Roles never run render/transcribe/export (`cli.py` refuses under `CUTROOM_FACTORY_ROLE`).
+- **One AI run at a time** (governor `agent` slot, shared by the factory, the chat and Quick fix).
 - **Taste rules live in `docs/EDITING_RULES.md`**, not in code defaults that silently override what the
   creator said.
 

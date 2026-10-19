@@ -39,7 +39,8 @@ it, point at things and make your own hand edits on the same timeline.
   the frame (arrow, box, circle, pen; keys `A B C P`, ⌘Z undoes a mark). `O` (or **Range**) makes it "from
   here to here" up to the playhead, `I` moves its start. The Comments tab lists them (Open, AI working,
   Done, Needs you) with the frame, the drawing and a thread; pins on the ruler are coloured by status.
-  **Send to AI** works through open comments ONE AT A TIME in timeline order: one AI turn per comment
+  **Send to factory** (primary) gives the open comments to the factory (see **Factory** below): a checked new
+  version with a card. **Quick fix** (the old "Send to AI") works through open comments ONE AT A TIME in timeline order: one AI turn per comment
   (its text, timecode, range, the segment under it and the frame with the drawing composited on it). The
   AI makes that one change, replies on the comment in a sentence with a `[[t:]]` chip, and marks it done,
   or asks "Needs you: ...". Each comment's edit is one undo step. **Stop** finishes the current comment
@@ -137,6 +138,22 @@ All JSON unless noted. Media routes support byte ranges (206).
 | POST | `/api/chat/stop` · GET `/api/chat/history` · POST `/api/chat/new` | |
 | GET | `/api/governor` | live resource state + limits (see `cutroom/governor.py`) |
 | POST | `/api/overnight` | `{action: start/stop/status}` |
+| POST | `/api/factory/orders` | `{kind: revise\|reject\|request\|variants, plan, comment_ids? \| all_open?, text?, attachments?, ref?, variants?}` → `{order, id, folded?, folded_into?, status}` (a revise sent within 90 s of a waiting one is folded into it) |
+| GET | `/api/factory/orders[?plan=&state=]` | `{orders: [{id, kind, plan, state, phase, step, role, line, why, version, cost_usd, open_questions, folded_into, ...}]}` |
+| GET | `/api/factory/orders/<id>` | `{order, status (folded events; questions with answered), events, phases: [{name, step, label, state}], roles: [{role, agent, ok, cost_usd, seconds, error, running, last}], ledger, card, result}` |
+| GET | `/api/factory/orders/<id>/role/<role>/log` | `{lines (stream.jsonl tail; ?all=1 for all), usage, prompt}` |
+| POST | `/api/factory/orders/<id>/stop` · `/retry` | stop now (kills the role's process group) · manual retry, blocked orders only |
+| POST | `/api/factory/answer` | `{order, question, option, text?}` → ruling in decisions.jsonl + the follow-up (budget → continue the same order; login → Resume; taste → a `continue` order) |
+| POST | `/api/factory/verdict` | `{plan, version, disposition: APPROVE\|REJECT\|NOTES, text}`; APPROVE is code-only (+ a full-quality render + QA, never published; "approve but …" also queues that change); REJECT needs a reason |
+| POST | `/api/factory/variants/<order>` | `{items: [{variant, verdict: KEEP\|KILL\|NOTES, note}]}`; KEEP → a revise order that adopts that option |
+| POST | `/api/factory/apply-extension/<order>` | 501: the extender is a stub in this build |
+| GET | `/api/factory/state` · POST `/pause` · `/resume` | the light `{light: idle\|working\|needs_you\|blocked, text, needs, review, blocked, queued, backoff, paused, login, runner_alive, config}`; Resume also clears a login backoff |
+| GET/POST/PATCH | `/api/factory/lessons` | `{lessons, inbox, inbox_count, checks, check_types, lessons_sha}` · add `{rule, symptom?, tags?, check?}` · `{id, status: superseded}` or `{id, check}` |
+| GET | `/api/factory/brain/<slug>` · GET/PUT `/api/factory/brain/<slug>/<file>` | STORY.md, REFERENCE.md, ref_pairs.json, decisions.jsonl, locks.json, notes_ledger.jsonl (validated per file) |
+| GET | `/api/factory/versions?plan=` | Review tab: versions with render, card, theme, verdict, badges + refs, section pairs, orders |
+| GET/POST | `/api/grades` | clip grades `{clip, t0?, t1?, grade: HERO\|BROLL\|NEVER, ident: ME\|NOTME}` (factory lint + the editor read them) |
+| GET | `/api/review` · `/review` | everything waiting on you (newest unjudged version per plan, open questions, option tiles) · the phone page |
+| GET | `/media/factory/<order>/<path>` | files inside an order folder (frames, card, sheets) |
 
 ### Plan ops (`/op`)
 `{op: "move", seg: [si, gi], to: [si, gi]}` · `{op: "trim", seg, edge: "in"/"out", delta}` (source
@@ -212,7 +229,9 @@ history?}` (plans/ polled every 1 s; reload on `source: external`), `job` (a job
 {running}`, `render_done {job, file, url, sidecar, plan_file, preview}`, `qa_done {job, video, qa_json,
 qa_html}`, `governor` (every 3 s), `notes {count}`, `markers {created|updated|deleted|markers}`, `comments
 {type: start/working/chat/result/stopping/end, id?, status?, event?, run}` (the review-comment run), `chat`
-(copies of chat events, for other tabs).
+(copies of chat events, for other tabs), `factory` (one per factory bus line: `{order, plan, kind, state, phase,
+role, text, why, version, cost_total, questions?}`), `factory_state` (the light, on change and every 3 s while
+an order runs).
 
 **Aliases** kept for the frontend: plan payload `can_undo`/`can_redo`; project `root`, `references`,
 render/reference `file`, plan `updated`; job `label`, `eta_s`; `render_done.plan`; `plan_changed.by`
@@ -249,6 +268,21 @@ reference?: {file, t}, note?}`. The server adds `draft_path`. `GET /api/context`
 can be sent; while a turn runs a second POST gets 409). `GET /api/chat/history` →
 `{session_id, running, messages:[{ts, role, text, agent, ...}]}`. Set `CUTROOM_CLAUDE_BIN` /
 `CUTROOM_CODEX_BIN` to use a specific binary.
+
+## Factory
+`docs/FACTORY.md`. The studio starts a factory runner for the project (unless `factory/config.json` says
+`"autostart": false` or another runner holds it). UI: the header **light** (grey idle · blue working "v24 ·
+editing" · amber needs you with a count · red blocked/paused/login, click → Factory tab); **Send to factory** and
+**Quick fix** in the Comments tab, with an "in factory · v24" pill per comment and the order's questions as
+numbered buttons; the **Factory** dock tab (Orders: list + pipeline stepper Intake · Producer · Reference ·
+Extend · Edit · Render · QA · Critic · Fix · Ready, team activity per role with cost and last step, the ledger,
+Stop / Retry / Pause / Resume; Lessons; Brain); the **Review** tab in the Program monitor (the version beside the
+previous one or the reference with lock and reference audio, version dropdown with one-line themes, section
+chips from `ref_pairs.json`, the card, the changed-spots sheet (click a row to seek), frame notes with
+pictures, APPROVE / REJECT / NOTES); `/review` for phones; the clip grader in the Source monitor bar; a **Run in
+factory** chip under chat replies to edit-work requests. Factory renders run as studio jobs (Jobs tab, heavy
+lane). The chat and Quick fix share the governor's `agent` slot with the factory: while one AI run holds it, a
+chat message is refused with "The AI is busy (...)".
 
 ## Reference engine
 "Make it like this video" is measured, not guessed (`cutroom/reference.py`, CLI `cutroom ref`, skill

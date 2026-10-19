@@ -153,9 +153,30 @@ export async function send(text) {
     m.el.classList.remove('live');
     for (const s of m.steps) if (s.status === 'run') s.status = 'ok';
     renderSteps(m);
-    m.textEl.innerHTML = richMd(m.text); hydrate(m.textEl);
+    m.textEl.innerHTML = richMd(m.text.replace(/\[\[factory:\w+\]\]/g, '')); hydrate(m.textEl);
+    const fk = (m.text.match(/\[\[factory:(\w+)\]\]/) || [])[1];
+    if (fk || FACTORY_WORK.test(text)) m.el.appendChild(factoryChip(text, fk));
     scrollDown();
   }
+}
+
+// "make an edit", "fix all my notes", "match this reference": real edit work -> offer the factory
+const FACTORY_WORK = /\b(make (me )?(an?|the) (\d+[- ]?(min|minute|sec|second)s? )?(edit|cut|version|video)|fix (all|every)( of)? (my |the )?(notes|comments|markers)|match (this|the) reference|re-?edit|go through (all )?(my )?notes|new version)\b/i;
+function factoryChip(text, kind) {
+  const b = h('button.btn.fx-chip', { title: 'The factory team builds a checked new version (producer, editor, critic, render, QA) and hands you a card' },
+    h('span', { html: icon('spark', 12) }), 'Run in factory');
+  b.onclick = async () => {
+    if (!S.plan) { toast('Open a plan first', 'warn'); return; }
+    b.disabled = true;
+    try {
+      const fixAll = /notes|comments|markers/i.test(text) && !/make|match/i.test(text);
+      const r = await api.fx.send(fixAll ? { plan: S.plan.slug, kind: 'revise', all_open: true, via: 'chat' }
+        : { plan: S.plan.slug, kind: kind === 'revise' ? 'revise' : 'request', text, via: 'chat' });
+      b.textContent = `In the factory (${r.id.slice(-4)})`;
+      emit('showDock', 'factory');
+    } catch (e) { b.disabled = false; toast(e.message, 'error'); }
+  };
+  return h('div.fx-chiprow', b);
 }
 async function stop() {
   if (abort) abort.abort();

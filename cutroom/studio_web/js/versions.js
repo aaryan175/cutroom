@@ -190,7 +190,7 @@ function fillMenu() {
     const rend = renderOf(r.file);
     menu.appendChild(h('div.vm-row' + (isCur ? '.cur' : ''),
       h('span.vm-v', v !== null && v !== undefined ? `v${v}` : r.file.replace(/\.json$/, '')),
-      h('span.vm-meta', h('span', ago(r.mtime)), r.by ? h('span.vm-by.' + (r.by === 'you' ? 'you' : 'ai'), { title: r.by === 'you' ? 'You saved this version' : 'The AI saved this version' }, r.by === 'you' ? 'you' : 'AI') : null,
+      h('span.vm-meta', h('span', ago(r.mtime)), r.by ? h('span.vm-by.' + (r.by === 'you' ? 'you' : 'ai'), { title: r.by === 'you' ? 'You saved this version' : r.by === 'factory' ? 'The factory built this version (see the Review tab for its card)' : 'The AI saved this version' }, r.by === 'you' ? 'you' : r.by === 'factory' ? 'factory' : 'AI') : null,
         isCur ? h('span.pill.blue', 'same as draft') : null, rend ? h('span.pill', 'rendered') : null),
       h('span.vm-acts',
         h('button.btn.ghost', { title: rend ? 'Play its render in the Program monitor' : 'No render yet: render a preview of it', on: { click: () => { menu.hidden = true; openVersion(r); } } }, 'Open'),

@@ -12,7 +12,8 @@ What it protects against, and how
              When the system's free RAM drops below the emergency floor, the biggest (then newest)
              registered child of ANY cutroom process is stopped, at most one every 5 s.
              New work waits while free RAM is under `min_free_ram_gb`.
-  parallel   heavy work runs in at most `heavy_slots` slots; ASR in exactly one, machine-wide.
+  parallel   heavy work runs in at most `heavy_slots` slots (auto: sized from cores and RAM, see
+             auto_heavy_slots); ASR in exactly one, machine-wide, whatever the machine.
              High load, thermal throttling, an active user (optional) and quiet hours (optional)
              throttle heavy work to one slot. Throttling never stops work completely.
   disk       nothing writes proxies/renders while the work volume has less than `min_free_disk_gb`
@@ -28,6 +29,12 @@ Use:
     gov.status()                                               # dict for UIs
 
 Disable with CUTROOM_GOVERNOR=0 or "governor": false in cutroom.json (the single ASR slot stays).
+
+AI agents (the factory's role runs, the studio chat, the comment runner) take an `agent` slot: one at a
+time machine-wide by default (`agent_slots`, auto 2 with >= 32 GB RAM; CUTROOM_AGENT_SLOTS overrides).
+A headless agent with its tools uses hundreds of MB to over 1 GB, so they are memory-capped
+(`agent_mem_cap_gb`, default 3) and are the first thing stopped in a memory emergency. Like ASR, the
+agent slot stays enforced when the governor is disabled.
 """
 import contextlib
 import ctypes
@@ -45,7 +52,7 @@ import threading
 import time
 from pathlib import Path
 
-KINDS = ("heavy", "asr", "light")
+KINDS = ("heavy", "asr", "light", "agent")
 POLL_S = 2.0
 MONITOR_S = 1.0
 EMERGENCY_RATIO = 0.6          # stop a child when free RAM < this x min_free_ram_gb
@@ -143,6 +150,43 @@ def total_ram() -> int:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (OSError, ValueError):
         return 8 * GB
+
+
+def hardware() -> dict:
+    """What the slot defaults are sized from: logical cores, performance cores (Apple Silicon's
+    hw.perflevel0; None elsewhere), RAM, chip name. Cached for the process."""
+    hit = _slow_cache.get("hw")
+    if hit:
+        return hit[1]
+    out = {"cpus": os.cpu_count() or 2, "perf_cores": None, "ram_gb": round(total_ram() / GB, 1), "chip": "",
+           "apple_silicon": sys.platform == "darwin" and os.uname().machine == "arm64"}
+    if sys.platform == "darwin":
+        def sysctl(k):
+            try:
+                return subprocess.run(["sysctl", "-n", k], capture_output=True, text=True, timeout=5).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                return ""
+        pc = sysctl("hw.perflevel0.physicalcpu")
+        out["perf_cores"] = int(pc) if pc.isdigit() else None
+        out["chip"] = sysctl("machdep.cpu.brand_string")
+    _slow_cache["hw"] = (time.time(), out)
+    return out
+
+
+def auto_heavy_slots(cpus, ram_gb, perf_cores=None, apple_silicon=False, proc_cap_gb=4.0, min_free_gb=2.0,
+                     self_mem_gb=8.0) -> int:
+    """Default concurrent heavy jobs (proxy encodes, sheets, analysis workers) for a machine.
+    Generic machines: cores / 4 (unchanged). Apple Silicon: half the performance cores (the efficiency
+    cores and the media engines take the rest), bounded by RAM: what is left after the free-RAM floor and
+    the in-process ASR budget, divided by the per-child cap. Never more than 8 (one footage drive feeds
+    them all) and never fewer than 1. ASR is not counted here: it always has exactly one slot.
+    Examples: 10-core/16 GB (4 P-cores) -> 2 · 10-core/32 GB (8 P) -> 4 · 20-core/64 GB (16 P) -> 8."""
+    generic = max(1, int(cpus) // 4)
+    if not (apple_silicon and perf_cores):
+        return generic
+    by_cpu = max(1, int(perf_cores) // 2)
+    by_ram = max(1, int((ram_gb - min_free_gb - self_mem_gb) // max(0.5, proc_cap_gb)))
+    return max(1, min(by_cpu, by_ram, 8))
 
 
 _free_cache = [0.0, None]
@@ -269,8 +313,15 @@ class Governor:
         self.self_mem_gb = max(self.max_proc_mem_gb, min(8.0, 0.35 * ram_gb))
         self.min_free_disk_gb = float(getattr(cfg, "min_free_disk_gb", 20.0) if getattr(cfg, "min_free_disk_gb", None)
                                       is not None else 20.0)
-        self.heavy_slots = int(g("heavy_slots") or max(1, ncpu // 4))
+        hw = hardware()
+        self.hardware = hw
+        self.heavy_slots = int(g("heavy_slots") or auto_heavy_slots(
+            ncpu, ram_gb, hw.get("perf_cores"), hw.get("apple_silicon"), self.max_proc_mem_gb,
+            self.min_free_ram_gb, self.self_mem_gb))
         self.asr_slots = 1                                  # never more: parallel ASR has panicked machines
+        self.agent_slots = max(1, int(os.environ.get("CUTROOM_AGENT_SLOTS") or g("agent_slots")
+                                      or (2 if ram_gb >= 32 else 1)))
+        self.agent_mem_cap_gb = float(os.environ.get("CUTROOM_AGENT_MEM_CAP_GB") or g("agent_mem_cap_gb") or 3.0)
         self.nice = int(getattr(cfg, "nice_level", 10) if getattr(cfg, "nice_level", None) is not None else 10)
         self.pause_when_user_active = bool(getattr(cfg, "pause_when_user_active", False))
         self.quiet_hours = str(getattr(cfg, "quiet_hours", "") or "")
@@ -292,6 +343,7 @@ class Governor:
                 "emergency_free_ram_gb": round(self.min_free_ram_gb * EMERGENCY_RATIO, 2),
                 "max_proc_mem_gb": round(self.max_proc_mem_gb, 2), "self_mem_gb": round(self.self_mem_gb, 2),
                 "min_free_disk_gb": self.min_free_disk_gb, "heavy_slots": self.heavy_slots, "asr_slots": 1,
+                "agent_slots": self.agent_slots, "agent_mem_cap_gb": self.agent_mem_cap_gb,
                 "nice": self.nice, "pause_when_user_active": self.pause_when_user_active,
                 "quiet_hours": self.quiet_hours, "enabled": self.enabled}
 
@@ -318,6 +370,8 @@ class Governor:
     def allowed(self, kind) -> int:
         if kind == "asr":
             return 1
+        if kind == "agent":
+            return self.agent_slots
         if kind == "heavy":
             return 1 if self.throttle_reasons() else self.heavy_slots
         return 1 << 30
@@ -334,7 +388,7 @@ class Governor:
     def blockers(self, kind) -> list:
         """Hard conditions that make new work of `kind` wait."""
         out = []
-        if kind in ("heavy", "asr"):
+        if kind in ("heavy", "asr", "agent"):
             fr = free_ram()
             if fr is not None and fr / GB < self.min_free_ram_gb:
                 out.append(f"free RAM {fr / GB:.1f} GB < {self.min_free_ram_gb:.1f} GB")
@@ -410,7 +464,7 @@ class Governor:
 
     def _try_acquire(self, kind) -> int | None:
         """Atomically (gate lock) take one free slot file of `kind` if fewer than allowed are busy."""
-        n_files = self.asr_slots if kind == "asr" else self.heavy_slots
+        n_files = {"asr": self.asr_slots, "agent": self.agent_slots}.get(kind, self.heavy_slots)
         allowed = self.allowed(kind)
         gate = self._try_gate()
         if gate is None:
@@ -468,7 +522,7 @@ class Governor:
             finally:
                 held[kind] -= 1
             return
-        if not self.enabled and kind != "asr":
+        if not self.enabled and kind not in ("asr", "agent"):
             held[kind] = 1
             try:
                 yield
@@ -536,6 +590,86 @@ class Governor:
                 finally:
                     os.close(fd)
 
+    @contextlib.contextmanager
+    def try_slot(self, kind="agent", label=""):
+        """Take one slot of `kind` only if one is free right now; yields True (held) or False (busy).
+        For callers that must answer at once instead of waiting (the studio chat: "the AI is busy")."""
+        held = self._held()
+        if held.get(kind):
+            held[kind] += 1
+            try:
+                yield True
+            finally:
+                held[kind] -= 1
+            return
+        got = self._try_acquire(kind)
+        if got is None:
+            yield False
+            return
+        i, fd = got
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps({"pid": os.getpid(), "kind": kind, "label": label, "index": i,
+                                  "started": time.time()}).encode(), 0)
+        held[kind] = 1
+        try:
+            yield True
+        finally:
+            held[kind] = 0
+            try:
+                os.ftruncate(fd, 0)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def busy_slots(self, kind) -> list:
+        """[{pid, label, started}] of the held slots of `kind` (any process)."""
+        n = {"asr": self.asr_slots, "agent": self.agent_slots}.get(kind, self.heavy_slots)
+        out = []
+        for i in range(n):
+            if self._busy(kind, i):
+                try:
+                    info = json.loads(self._lockfile(kind, i).read_text() or "{}")
+                except (OSError, ValueError):
+                    info = {}
+                out.append({"index": i, "pid": info.get("pid"), "label": info.get("label"), "started": info.get("started")})
+        return out
+
+    @contextlib.contextmanager
+    def watching(self, proc, cmd, cap_gb=None, kind="agent"):
+        """Register a running Popen (its own process group) as a governed child: its footprint is checked
+        every second and over `cap_gb` the whole group is stopped. Yields a dict whose `killed` says why."""
+        cap = float(cap_gb or (self.agent_mem_cap_gb if kind == "agent" else self.max_proc_mem_gb))
+        self._register(proc.pid, cmd, cap, kind=kind)
+        state = {"killed": None, "peak_gb": 0.0}
+        done = threading.Event()
+
+        def monitor():
+            while not done.wait(MONITOR_S):
+                if proc.poll() is not None:
+                    return
+                fp = footprint(proc.pid)
+                if fp is not None:
+                    state["peak_gb"] = max(state["peak_gb"], round(fp / GB, 3))
+                    if self.enabled and fp / GB > cap:
+                        state["killed"] = f"memory footprint {fp / GB:.2f} GB > cap {cap:.2f} GB"
+                        _log(f"stopping pid {proc.pid}: {state['killed']}")
+                        _kill_group(proc.pid)
+                        return
+                if self.enabled:
+                    self.emergency_check()
+        th = threading.Thread(target=monitor, daemon=True)
+        th.start()
+        try:
+            yield state
+        finally:
+            done.set()
+            th.join(timeout=3)
+            self._unregister(proc.pid)
+            km = self._p("killed", f"{proc.pid}.txt")
+            if km.exists():
+                state["killed"] = state["killed"] or km.read_text()
+                km.unlink(missing_ok=True)
+
     def wait_resources(self, kind="heavy"):
         """Block while hard limits (RAM floor, disk floor) forbid new `kind` work; no slot is taken."""
         if not self.enabled:
@@ -568,10 +702,10 @@ class Governor:
         return lambda: self.check_self(cap_gb)
 
     # -- children ------------------------------------------------------------------------------------
-    def _register(self, pid, cmd, cap):
+    def _register(self, pid, cmd, cap, kind=None):
         self._p("children", f"{pid}.json").write_text(json.dumps(
             {"pid": pid, "parent": os.getpid(), "cmd": " ".join(map(str, cmd))[:300], "cap_gb": cap,
-             "started": time.time()}))
+             "started": time.time(), "kind": kind}))
 
     def _unregister(self, pid):
         self._p("children", f"{pid}.json").unlink(missing_ok=True)
@@ -630,13 +764,17 @@ class Governor:
             kids = self.children()
             if not kids:
                 return None
-            victim = max(kids, key=lambda d: (d["footprint_gb"], d["started"]))
+            # agents go first (a stopped role run is cheap to redo; a half-encoded render is not)
+            victim = max(kids, key=lambda d: (d.get("kind") == "agent", d["footprint_gb"], d["started"]))
             reason = (f"system free RAM {fr / GB:.2f} GB < emergency floor {floor:.2f} GB; stopped the biggest "
                       f"child ({victim['footprint_gb']:.2f} GB)")
             self._p("killed", f"{victim['pid']}.txt").write_text(reason)
             last.write_text(str(victim["pid"]))
             _log(f"{reason}: pid {victim['pid']} {victim['cmd'][:120]}")
-            threading.Thread(target=self._terminate, args=(int(victim["pid"]),), daemon=True).start()
+            if victim.get("kind") == "agent":
+                threading.Thread(target=_kill_group, args=(int(victim["pid"]),), daemon=True).start()
+            else:
+                threading.Thread(target=self._terminate, args=(int(victim["pid"]),), daemon=True).start()
             return reason
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -723,7 +861,7 @@ class Governor:
             load = None
         fr = free_ram()
         slots = []
-        for kind, n in (("heavy", self.heavy_slots), ("asr", 1)):
+        for kind, n in (("heavy", self.heavy_slots), ("asr", 1), ("agent", self.agent_slots)):
             for i in range(n):
                 path = self._lockfile(kind, i)
                 busy = self._busy(kind, i)
@@ -752,13 +890,47 @@ class Governor:
         except OSError:
             disk = None
         return {"time": time.time(), "enabled": self.enabled, "load": load, "cpus": os.cpu_count(),
+                "perf_cores": self.hardware.get("perf_cores"), "chip": self.hardware.get("chip"),
                 "ram_total_gb": round(self.ram_total / GB, 2),
                 "ram_free_gb": None if fr is None else round(fr / GB, 2),
                 "disk_free_gb": disk, "work": str(self.work),
                 "thermal_cpu_limit": cpu_speed_limit(), "user_idle_s": user_idle_s(),
-                "limits": self.limits(), "allowed": {"heavy": self.allowed("heavy"), "asr": 1},
+                "limits": self.limits(), "allowed": {"heavy": self.allowed("heavy"), "asr": 1, "agent": self.agent_slots},
                 "throttled": self.throttle_reasons(), "blocked": self.blockers("heavy"),
                 "slots": slots, "waiting": waiting, "children": self.children()}
+
+
+def _kill_group(pid, grace=KILL_GRACE_S):
+    """TERM the process group led by `pid` (an agent and the tools it started), KILL after `grace`."""
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        pgid = None
+    sig = (lambda s: os.killpg(pgid, s)) if pgid and pgid != os.getpgid(0) else (lambda s: os.kill(pid, s))
+    try:
+        sig(signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    end = time.time() + grace
+    while time.time() < end:
+        if not pid_alive(pid) or _zombie(pid):
+            return
+        time.sleep(0.1)
+    try:
+        sig(signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+kill_group = _kill_group
+
+
+def _zombie(pid) -> bool:
+    try:
+        r = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=3)
+        return r.stdout.strip().startswith("Z")
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 # ==================================================================================================

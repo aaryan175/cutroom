@@ -83,8 +83,15 @@ For any edit with talking, write a plan-level `cold_open` instead of hand-cuttin
   repeats). Pass a list of approved picks when the creator named them (rule 47).
 - **music** defaults to the first section's song, playing *under* the voice and never ducked. Point
   `music.offset` at the part of the song you want.
-- A flash goes into the second block and out of the cold open. Set `"end_flash": false` to drop the
-  last one.
+- **Reference intros: `"style": "reference"`.** With `from_reference` set, the cold open is rebuilt element by
+  element from the reference's measured devices (`cutroom ref show <id>`, analysis `devices`): the card
+  ("COMING UP", `card: {"text"}`), the inset strobe (3-frame shots on black), the lines in the reference's
+  frame (window-box gate) **on the face for the whole line** (`face_s` null), the blocks between them in the
+  reference's shot lengths and frames, a two-frame burn wherever the reference burns, the gate dropping on
+  the biggest hit, and an `end_shot` (`{clip, in, dur: 2.7}`, the creator alone) with the typed `title`
+  (`{"text": "DAY THREE"}`, no place names in repo files). The cold open has its own loudness target
+  (`loudness.I`, −12) and the music lifts between lines (`music.lift_db`, +8 in reference style).
+- `end_flash` is off by default. A white flash is only right when the reference has white flashes (rule 123).
 
 ## 7. Craft fields
 The defaults already do these. Change them only for a reason:
@@ -96,7 +103,14 @@ The defaults already do these. Change them only for a reason:
 - **Transitions**: put `"transition": {"kind": "flash"}` on the first segment of a section where the
   *location or time* changes. That's at most one per ~20 s of body, never inside a talk segment, and
   devices stay ≤ 25 % of runtime (rule 44). Use `dip` for a time jump and `whip` between two moving
-  shots. Never use overlay assets.
+  shots. Use `burn` (`{"kind": "burn"}`, 2 frames, the cut between them) when the reference burns; it is
+  generated from the reference's measured shape and colours. Rule 38: only devices the reference has.
+- **Grade**: leave `style.grade` alone. The house grade is the LUT only (rule 120); `normalize_exposure`,
+  `finish`, `saturation` and `look` are opt-ins for when the creator asks. Never a night look on daylight.
+- **Film / lens** (`style.film`: grain, soften, vignette, halation, bloom, ca, rolloff, black): off by
+  default. Fill it only from a measurement (`cutroom.film.match(ref, ours)`), never by taste.
+- **Frames**: `"frame": {"kind": "gate"}` / `{"kind": "inset", "scale": 0.62}` / `{"kind": "letterbox",
+  "aspect": 2.46}` on a section, segment or montage shot. Only when the reference has them.
 - **Music**: songs start and stop on the section cut. Montage and b-roll get +7 dB over talk. A flash
   gets a 0.3 s music break before it. For a drop on the first montage cut, set `offset` from
   `cutroom beats`.

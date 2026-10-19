@@ -20,6 +20,8 @@ only reads it.
 - `docs/WORKFLOW.md`: the full loop with exact commands and time estimates for big libraries.
 - Skills in `.claude/skills/`: load the one matching the step you are on.
 - A reference video to match? `cutroom ref add <file|url>`, then the `reference-matching` skill.
+- A recap of a live event (stage speaker, crowd, music)? `cutroom detect events`, `cutroom recap`, then the
+  `event-recap` skill.
 - Platform files, captions, chapters, thumbnails, cutdowns, or a multi-TB library? The
   `deliverables-and-scale` skill (`cutroom export`, `cutroom cutdown`, `cutroom estimate`).
 
@@ -73,6 +75,18 @@ cutroom export renders/<slug>_vN.mp4 --preset all --thumbs   # approved: every p
 - Renders use the original masters. Previews use proxies. Segment renders are cached, so re-renders
   after small plan changes are fast.
 
+## Factory roles
+The studio's **factory** (`docs/FACTORY.md`, `cutroom/factory/`) turns a batch of review comments into the next
+version with a fixed pipeline: code maps every note to segments, words and frames; then short role runs, each
+one job with its own prompt: **producer** (each note -> one explicit change; sizes the job; numbered
+questions), **editor** (applies exactly those changes to `candidate.json`, one ledger row per note),
+**critic** (blind: sees the render, the sheets and the notes, never the editor's reasoning), **fix** (one round,
+a proof per fix), **lesson-keeper** (inbox -> lessons and machine checks). Code renders, runs QA, the lock check
+and the gates, and publishes the version and its card. When you run as one of these roles (`CUTROOM_FACTORY_ROLE`
+is set): do only that job, return the JSON your prompt asks for, never write `plans/*_v*.json` or the draft, and
+never run `cutroom render|transcribe|export` (they refuse). The project brain (`factory/brain/<slug>/`: STORY,
+REFERENCE, rulings, locks, the notes ledger) is the memory every role reads; the newest ruling wins.
+
 ## Studio mode
 The creator may be editing in Cutroom Studio (`cutroom studio`, see `docs/STUDIO.md`), with you as the
 chat panel. Then:
@@ -96,7 +110,8 @@ chat panel. Then:
 
 ### Review comments: one at a time
 The creator reviews like on a review site: they pause, press M, type a note and often draw on the frame
-(arrow, box, circle, pen). "Send to AI" runs ONE turn per comment, in timeline order. In such a turn:
+(arrow, box, circle, pen). **Send to factory** hands all of them to the factory (above). **Quick fix** runs ONE
+turn per comment, in timeline order. In such a turn:
 - **One change per comment.** Change exactly what that comment asks, nothing else. Open its frame first:
   the attached image has their drawing on it, so "this" means what they circled or pointed at. A
   comment with `t_end` covers that range ("from here to here").

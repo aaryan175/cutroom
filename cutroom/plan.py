@@ -11,8 +11,9 @@ referenced by id, absolute path, relative path or a unique filename fragment (se
     "captions": {"enabled": true, "font": "", "size": 54, "position": "bottom",   # bottom|lower|top
                  "max_words": 5, "max_chars": 30, "case": "sentence",             # sentence|lower|upper
                  "fixes": [["teh", "the"]]},                                       # regex replacements per cue
-    "grade": {"lut": "", "normalize_exposure": true, "saturation": 1.0,
-              "look": {"name": "warm_film", "intensity": 0.8}},           # optional; see cutroom/looks.py
+    "grade": {"lut": "", "normalize_exposure": false, "saturation": 1.0,     # house default = the LUT only
+              "look": null},                                               # opt-in; see cutroom/looks.py
+    "film": null,                                                  # opt-in film/lens character (cutroom/film.py)
     "voice": {"clean": true, "atten_lim_db": 20},                # DeepFilterNet ceiling; null = off
     "music_under_speech": "mute"                                   # mute (default: no music under talking) | duck | full
   },
@@ -37,10 +38,22 @@ Segment types (field "type"):
   title    {"text", "sub": "", "dur": 2.0, "bg": "black"|"blur:<clip>@<t>"}
   black    {"dur": 1.0}
   still    {"clip", "t", "dur", "zoom": 1.08}                                   # freeze-frame with slow push
+  card     {"text": "COMING UP", "dur": 0.84, "color": "#FBFF09", "size": 0.142, "font": "",  # boiling grunge card,
+            "scale_from": 0.873, "scale_frames": 10, "boil": 2.5, "sfx": "riser"|null}  # text scales in (cards.py)
 
-Overlay (on talk/broll/montage segments): {"kind": "callout"|"lower_third"|"title"|"label",
+Overlay (on talk/broll/montage segments): {"kind": "callout"|"lower_third"|"title"|"label"|"typed_title",
    "text", "sub"?, "at": 0.3, "dur": 2.5, "position": "top-left"|"top-right"|"bottom-left"|"bottom-right"|"center"}
 Callouts default to the corner AWAY from detected faces when "position" is "auto".
+typed_title: {"kind": "typed_title", "text", "at": 1.12, "dur", "start": 0.0 (typing starts this long after "at"),
+   "char_s": 0.07, "color": "#FFCD00", "size": 0.092, "font": "" (condensed caps; Bebas-like if installed), "y": 0.505,
+   "sfx": "hiss"|null}   one character every char_s, holds, leaves on the segment's cut / burn
+
+Frames (the reference's "resolution change"): "frame" on a section, a segment or a montage shot (shot wins, then
+segment, then section; "full" turns it off):
+  {"kind": "gate", "w": 0.973, "h": 0.906, "radius": 9, "color": "#0F0100", "inner": {"w", "h"} | {"aspect": 2.46}}
+  {"kind": "inset", "scale": 0.62 | "w"+"h", "radius": 5, "bg": "#000000"}
+  {"kind": "letterbox", "aspect": 2.46}
+All hard snaps (no animation). The picture is cropped to the window, never squeezed.
 
 Common optional segment fields: "speed", "zoom", "crop": "center"|"face"|[x, y, w, h] (fractions),
 "look": {"name", "intensity"} (overrides style.grade.look for this segment; "natural" = no look),
@@ -59,37 +72,50 @@ Craft fields (docs/PLAN_FORMAT.md "Craft"; defaults measured from a reference vl
                           "mode": "under" (+ "under_db": -5, never ducked), "breaks": [{"at": seg-rel s | "before": "cut:<seg>", "dur": 0.3}]
   section.transition     transition into the section's first segment (same shape as segment.transition)
   section.pace           {"asl": 0.6, "max_hold": 6.0, "alternate": true}
-  segment.transition     {"kind": "flash"|"dip"|"dip_white"|"whip"|"cut", "frames": 4, "sfx": "hit"|"whoosh"|null,
+  segment.transition     {"kind": "flash"|"dip"|"dip_white"|"whip"|"burn"|"cut", "frames": 4, "sfx": "hit"|"whoosh"|null,
                           "gain_db": -6, "break": 0.3}         on the cut INTO this segment
+                          burn (film burn measured on the reference): frames 2 (1 out + 1 in, the cut between),
+                          "palette": "warm"|"red"|"gold", "side": "right"|"left", "strength": 1.0, "seed", sfx "burn"
   talk                   + "lead_in": s (J-cut: voice starts under the previous shot), "tail": s (L-cut),
                           "room_tone": true
   broll                  "audio" default "natural" (ambience under the music; "music" = none)
   any clip segment/shot  + "push": {"to": 1.06, "ease": "inout"|"linear", "x": 0.5, "y": 0.5},
                           "ramp": {"to": 2.0, "over": 0.4} (broll/montage), "conform", "exposure_stops"
   montage shot           + "dur": planned length when not beat-synced
-  plan.cold_open         {"style": "teaser", "dur": 10, "lines": [{"clip", "in", "out"} | {"from": "<section>/<seg>"}],
+  plan.cold_open         {"style": "teaser"|"reference", "dur": 10, "lines": [{"clip", "in", "out"} | {"from": "<section>/<seg>"}],
                           "shots": "auto" | [{"clip", "in"}], "from_reference": "<ref id>", "asl": 0.45,
-                          "music": {"song", "offset", "under_db": -5}, "face_s": 0.8, "end_flash": true}
+                          "music": {"song", "offset", "under_db": -5, "lift_db": 0}, "face_s": null (= whole line),
+                          "end_flash": false, "card": {"text": "COMING UP", ...} | null, "inset": {frame} | null,
+                          "gate": {frame} | null, "burns": true, "end_shot": {"clip", "in", "dur": 2.7},
+                          "title": {"text", "start": 1.12, ...} | null, "loudness": {"I": -12}}
+  style.film             {"grain", "grain_size", "soften", "vignette", "halation", "bloom", "ca", "rolloff", "black"}
+                          every key off by default; only what a reference measurably has (cutroom/film.py)
+  style.loudness         {"I": -14, "TP": -1.5, "anchor": "dialogue"|"programme"}
 """
 import copy
 import json
 from pathlib import Path
 
-SEG_TYPES = {"talk", "broll", "montage", "matchcut", "title", "black", "still"}
-OVERLAY_KINDS = {"callout", "lower_third", "title", "label"}
+SEG_TYPES = {"talk", "broll", "montage", "matchcut", "title", "black", "still", "card"}
+OVERLAY_KINDS = {"callout", "lower_third", "title", "label", "typed_title"}
+FRAME_KINDS = {"gate", "inset", "letterbox", "full", "none"}
 POSITIONS = {"top-left", "top-right", "bottom-left", "bottom-right", "center", "auto"}
 
-TRANSITION_KINDS = {"flash", "dip", "dip_black", "dip_white", "whip", "cut"}
+TRANSITION_KINDS = {"flash", "dip", "dip_black", "dip_white", "whip", "burn", "cut"}
+BURN_PALETTES = {"warm", "red", "gold"}
 CONFORM_MODES = {"auto", "speed", "blend", "dup"}
 CAPTION_SIZE_1080 = 43           # font px at 1080; the reference vlog's text measures ~3 % of frame height; scaled with output height
 
 DEFAULT_STYLE = {
     "captions": {"enabled": True, "font": "", "size": CAPTION_SIZE_1080, "position": "bottom", "max_words": 5,
                  "max_chars": 30, "case": "sentence", "fixes": []},
-    "grade": {"lut": "", "normalize_exposure": True, "saturation": 1.0, "look": None,
+    # house grade = the LUT and nothing else (the creator's approved look). Exposure normalisation, the
+    # finishing curve and looks stay available, opt-in per plan (docs/PLAN_FORMAT.md "Grade").
+    "grade": {"lut": "", "normalize_exposure": False, "saturation": 1.0, "look": None,
               "exposure": {"strength": 0.5, "max_stops": 1.0, "deadband_stops": 0.33, "target_luma": 118.0,
                            "night_luma": 60.0, "night_target": 70.0},
-              "finish": {"enabled": True, "black": 0.028, "shoulder": 0.96, "vibrance": 0.18}},
+              "finish": {"enabled": False, "black": 0.028, "shoulder": 0.96, "vibrance": 0.0}},
+    "film": None,
     "voice": {"clean": True, "atten_lim_db": 20},
     "audio": {"join_xfade_s": 0.02, "room_tone": True, "room_tone_under_voice_db": -32.0, "bed_fade_s": 0.3,
               "jl_duck_db": -12.0, "auto_lead_in": 0.3, "auto_tail": 0.0},
@@ -104,7 +130,10 @@ TRANSITION_DEFAULTS = {"flash": {"frames": 4, "sfx": "hit", "gain_db": -6.0, "br
                        "dip": {"frames": 4, "sfx": None, "gain_db": -6.0, "break": 0.0},
                        "dip_black": {"frames": 4, "sfx": None, "gain_db": -6.0, "break": 0.0},
                        "dip_white": {"frames": 4, "sfx": None, "gain_db": -6.0, "break": 0.0},
+                       "burn": {"frames": 2, "sfx": "burn", "gain_db": -4.0, "break": 0.0, "strength": 1.0,
+                                "palette": "warm", "side": "right"},
                        "cut": {"frames": 0, "sfx": None, "gain_db": -6.0, "break": 0.0}}
+BURN_KEYS = ("palette", "side", "strength", "seed", "opacity")
 
 
 def transition_spec(tr):
@@ -122,8 +151,11 @@ def transition_spec(tr):
     fi = d.get("frames_in")
     fo = int(fo) if fo is not None else fr // 2
     fi = int(fi) if fi is not None else fr - fr // 2
-    return {"kind": kind, "frames_out": max(0, fo), "frames_in": max(0, fi), "sfx": d.get("sfx"),
-            "gain_db": float(d.get("gain_db", -6.0)), "break": float(d.get("break") or 0.0)}
+    out = {"kind": kind, "frames_out": max(0, fo), "frames_in": max(0, fi), "sfx": d.get("sfx"),
+           "gain_db": float(d.get("gain_db", -6.0)), "break": float(d.get("break") or 0.0)}
+    if kind == "burn":
+        out.update({k: d[k] for k in BURN_KEYS if d.get(k) is not None})
+    return out
 
 
 class PlanError(ValueError):
@@ -170,6 +202,8 @@ def normalize(plan: dict, cfg=None) -> dict:
                 s.setdefault("sub", ""); s.setdefault("dur", 2.0); s.setdefault("bg", "black")
             elif t == "still":
                 s.setdefault("dur", 2.0); s.setdefault("zoom", 1.08)
+            elif t == "card":
+                s.setdefault("text", "COMING UP"); s.setdefault("dur", 0.84)
     return p
 
 
@@ -232,6 +266,8 @@ def validate(plan: dict, con=None) -> list:
                         errs.append(f"{w}: matchcut needs {side}.clip and {side}.t")
                     else:
                         chk_clip(f"{w} {side}", s[side].get("clip"), s[side]["t"])
+            elif t == "card":
+                errs += _validate_card(w, s)
             elif t in ("title", "black", "still"):
                 if t != "black" and t == "title" and not s.get("text"):
                     errs.append(f"{w}: title needs text")
@@ -240,11 +276,16 @@ def validate(plan: dict, con=None) -> list:
             if s.get("look") is not None:
                 errs += validate_look(s["look"], f"{w} look")
             errs += _validate_craft(w, t, s)
+            errs += validate_frame(f"{w} frame", s.get("frame"))
+            for k, sh in enumerate(s.get("shots", []) or []) if t == "montage" else []:
+                errs += validate_frame(f"{w} shot {k} frame", sh.get("frame"))
             for k, o in enumerate(s.get("overlays", []) or []):
                 if o.get("kind") not in OVERLAY_KINDS:
                     errs.append(f"{w} overlay {k}: kind must be one of {sorted(OVERLAY_KINDS)}")
                 if o.get("position", "auto") not in POSITIONS:
                     errs.append(f"{w} overlay {k}: position must be one of {sorted(POSITIONS)}")
+                if o.get("kind") == "typed_title":
+                    errs += _validate_typed(f"{w} overlay {k}", o)
     return errs
 
 
@@ -274,6 +315,13 @@ def _validate_transition(where, tr):
         errs.append(f"{where}: a {sp['kind']} needs frames >= 2")
     if tr.get("sfx") not in (None, "", False) and not isinstance(tr.get("sfx"), str):
         errs.append(f"{where}: transition sfx must be a sound name or null")
+    if tr.get("kind") == "burn":
+        if tr.get("palette") is not None and tr["palette"] not in BURN_PALETTES:
+            errs.append(f"{where}: burn palette must be one of {sorted(BURN_PALETTES)}")
+        if tr.get("side") is not None and tr["side"] not in ("left", "right"):
+            errs.append(f"{where}: burn side must be left|right (where the incoming light enters)")
+        if tr.get("strength") is not None and not 0.1 <= _num(tr["strength"], 0) <= 1.5:
+            errs.append(f"{where}: burn strength must be 0.1-1.5")
     return errs
 
 
@@ -313,8 +361,76 @@ def _validate_craft(w, t, s):
     return errs
 
 
+def _color_ok(v):
+    from .cards import valid_color
+    return v is None or valid_color(v)
+
+
+def validate_frame(w, fr):
+    """A section / segment / shot `frame` value."""
+    if fr in (None, "full", "none"):
+        return []
+    if isinstance(fr, str):
+        fr = {"kind": fr}
+    if not isinstance(fr, dict) or fr.get("kind") not in FRAME_KINDS:
+        return [f"{w}: kind must be one of {sorted(FRAME_KINDS)}"]
+    errs = []
+    for k in ("w", "h", "scale", "x", "y"):
+        if fr.get(k) is not None and not 0.05 <= _num(fr[k], -1) <= 1.0:
+            errs.append(f"{w}: {k} must be 0.05-1 (fraction of the frame)")
+    if fr.get("radius") is not None and not 0 <= _num(fr["radius"], -1) <= 120:
+        errs.append(f"{w}: radius must be 0-120 px (at 1080)")
+    if fr.get("aspect") is not None and not 1.0 <= _num(fr["aspect"], 0) <= 4.0:
+        errs.append(f"{w}: aspect must be 1-4 (2.46 = scope letterbox)")
+    for k in ("color", "bg"):
+        if not _color_ok(fr.get(k)):
+            errs.append(f"{w}: {k} must be a #RRGGBB colour")
+    inn = fr.get("inner")
+    if inn is not None:
+        if not isinstance(inn, dict):
+            errs.append(f"{w}: inner must be {{w, h}} or {{aspect}}")
+        else:
+            for k in ("w", "h"):
+                if inn.get(k) is not None and not 0.05 <= _num(inn[k], -1) <= 1.0:
+                    errs.append(f"{w}: inner.{k} must be 0.05-1")
+            if inn.get("aspect") is not None and not 1.0 <= _num(inn["aspect"], 0) <= 4.0:
+                errs.append(f"{w}: inner.aspect must be 1-4")
+    return errs
+
+
+def _validate_card(w, s):
+    errs = []
+    if not str(s.get("text", "COMING UP")).strip():
+        errs.append(f"{w}: card needs text")
+    if not 0.2 <= _num(s.get("dur", 0.84), 0) <= 10:
+        errs.append(f"{w}: card dur must be 0.2-10 s")
+    if s.get("size") is not None and not 0.03 <= _num(s["size"], 0) <= 0.4:
+        errs.append(f"{w}: card size must be 0.03-0.4 (cap height / frame height; reference 0.142)")
+    if s.get("scale_from") is not None and not 0.5 <= _num(s["scale_from"], 0) <= 1.0:
+        errs.append(f"{w}: card scale_from must be 0.5-1")
+    if s.get("boil") is not None and not 1 <= _num(s["boil"], 0) <= 25:
+        errs.append(f"{w}: card boil must be 1-25 frames")
+    if not _color_ok(s.get("color")):
+        errs.append(f"{w}: card color must be #RRGGBB")
+    return errs
+
+
+def _validate_typed(w, o):
+    errs = []
+    if not str(o.get("text", "")).strip():
+        errs.append(f"{w}: typed_title needs text")
+    if o.get("char_s") is not None and not 0.005 <= _num(o["char_s"], 0) <= 1.0:
+        errs.append(f"{w}: char_s must be 0.005-1 s per character")
+    if o.get("size") is not None and not 0.02 <= _num(o["size"], 0) <= 0.3:
+        errs.append(f"{w}: size must be 0.02-0.3 (text height / frame height; reference 0.092)")
+    if not _color_ok(o.get("color")):
+        errs.append(f"{w}: color must be #RRGGBB")
+    return errs
+
+
 def _validate_section(w, sec):
     errs = _validate_transition(w, sec.get("transition"))
+    errs += validate_frame(f"{w} frame", sec.get("frame"))
     m = sec.get("music") or {}
     if m:
         for k in ("start", "end"):
@@ -359,6 +475,11 @@ def _validate_style(st):
     cs = st.get("captions") or {}
     if cs.get("size") is not None and not 12 <= _num(cs["size"], 0) <= 120:
         errs.append("style.captions.size must be 12-120 (px at 1080; reference 32)")
+    from .film import validate as _vf
+    errs += _vf(st.get("film"))
+    ld = st.get("loudness") or {}
+    if ld.get("anchor") not in (None, "dialogue", "programme"):
+        errs.append("style.loudness.anchor must be dialogue|programme")
     return errs
 
 
@@ -366,8 +487,31 @@ def _validate_cold_open(co, plan, chk_clip):
     errs = []
     if not isinstance(co, dict):
         return ["cold_open must be an object"]
-    if co.get("style", "teaser") != "teaser":
-        errs.append("cold_open.style must be \"teaser\"")
+    if co.get("style", "teaser") not in ("teaser", "reference"):
+        errs.append("cold_open.style must be \"teaser\" or \"reference\"")
+    if co.get("style") == "reference" and not co.get("from_reference"):
+        errs.append("cold_open.style \"reference\" needs from_reference (the measured reference id)")
+    if co.get("card"):
+        errs += _validate_card("cold_open.card", co["card"] if isinstance(co["card"], dict) else {})
+    for k in ("inset", "gate"):
+        if co.get(k):
+            fr = co[k] if isinstance(co[k], dict) else {"kind": k}
+            errs += validate_frame(f"cold_open.{k}", {**fr, "kind": fr.get("kind", k)})
+    if co.get("face_s") is not None and not 0 <= _num(co["face_s"], -1) <= 30:
+        errs.append("cold_open.face_s must be 0-30 s (null = the whole line on the face)")
+    es = co.get("end_shot")
+    if es:
+        if not isinstance(es, dict) or es.get("clip") is None:
+            errs.append("cold_open.end_shot needs {clip, in, dur}")
+        else:
+            chk_clip("cold_open end_shot", es.get("clip"), es.get("in"))
+            if not 0.5 <= _num(es.get("dur", 2.7), 0) <= 8:
+                errs.append("cold_open.end_shot.dur must be 0.5-8 s")
+    if co.get("title"):
+        errs += _validate_typed("cold_open.title", co["title"] if isinstance(co["title"], dict) else {"text": co["title"]})
+    cl = co.get("loudness") or {}
+    if cl.get("I") is not None and not -24 <= _num(cl["I"], 0) <= -8:
+        errs.append("cold_open.loudness.I must be -24..-8 LUFS")
     if not 2.0 <= _num(co.get("dur", 10), 0) <= 30:
         errs.append("cold_open.dur must be 2-30 s")
     lines = co.get("lines") or []

@@ -89,7 +89,7 @@ All the limits live in `cutroom.json`. A value of `0` or `""` means automatic.
 | `min_free_ram_gb` | max(2, 15 % of RAM) | new heavy and ASR work waits below this. Below 60 % of it, the biggest running child is stopped |
 | `max_proc_mem_gb` | min(4, 25 % of RAM) | cap per child process (ffmpeg, analysis worker). In-process work (ASR model, match-cut matrices) may use up to min(8, 35 % of RAM) |
 | `min_free_disk_gb` | 20 | free-space floor on the project volume |
-| `heavy_slots` | cores ÷ 4 (at least 1) | concurrent encodes and analysis across all cutroom processes |
+| `heavy_slots` | Apple Silicon: half the performance cores, bounded by RAM (16 GB → 2, 32–64 GB M1 Max → 4, M1 Ultra → 8; at most 8). Other machines: cores ÷ 4. At least 1 | concurrent encodes and analysis across all cutroom processes. ASR always has exactly 1 slot |
 | `nice_level` | 10 | priority of child processes, so the desktop stays responsive |
 | `pause_when_user_active` | false | macOS: drop to 1 heavy slot while the keyboard or mouse has been used in the last 2 min |
 | `quiet_hours` | "" | for example `"09:00-18:00"`: 1 heavy slot inside this window |
@@ -101,7 +101,8 @@ All the limits live in `cutroom.json`. A value of `0` or `""` means automatic.
 | `codex_model` | "" | Codex only: model for tagging. `""` uses the Codex default |
 | `proxy_height` | 540 | proxy height; 360 halves the disk and is enough for tagging and sheets (preview renders then look softer) |
 | `proxy_bitrate` | "" | hardware-encoder proxy bitrate; `""` = 1200k at 540p, 600k at 360p |
-| `asr_device` | "" | `cpu`, `cuda`, or `""` (CUDA when present) |
+| `asr_backend` | "auto" | `auto` (MLX on the Apple Silicon GPU for `medium` and larger when `mlx_whisper` is installed, else faster-whisper), `faster-whisper` or `mlx` (any model). `cutroom doctor` shows the active one |
+| `asr_device` | "" | faster-whisper only: `cpu`, `cuda`, or `""` (CUDA when present) |
 | `asr_remote` | "" | run ASR elsewhere: a command template with `{audio}` `{out}` `{model}` `{language}`, e.g. `ssh gpu-box /opt/cutroom/.venv/bin/python -m cutroom.asr {audio} {out} --model {model}`. Paths must be on a shared mount. The local ASR slot is still held, so it is still one transcription at a time |
 | `asr_fast_model` | "" | two passes: everything with this model first (e.g. `small`), the `upgrade` stage redoes clips with speech with `asr_model` |
 | `tag_gate` | true | skip AI tagging for clips that can't be useful (they stay searchable; set false to tag them later) |
@@ -121,8 +122,9 @@ These are rough figures for a 2 TB library of 4K camera footage, about 40–60 h
 - **Scan and probe:** minutes.
 - **Proxies:** 1–3 h with the hardware encoder.
 - **Sheets and analysis:** 1–2 h.
-- **Transcription:** the slow part. Roughly 1–4× realtime on CPU with `medium`, about twice as fast with
-  `small`. Only clips with speech are transcribed.
+- **Transcription:** the slow part on CPU. Roughly 1–4× realtime with `medium`, about twice as fast with
+  `small`. On Apple Silicon with the `mlx` extra it runs on the GPU, measured at about 5× realtime with
+  `medium` (see "Mac Studio" below). Only clips with speech are transcribed.
 - **Tagging:** about 20–90 s per Claude call of 8 clips, plus `tag_sleep_s`. That is about 300–600 clips
   an hour, subject to your plan's usage limits. When the agent reports a usage limit, tagging stops
   cleanly. The next run picks up the rest. (Codex timings are not measured yet.)
@@ -174,6 +176,48 @@ How to run a big library:
 - **Not done (yet):** people clustering (face embeddings) and CLIP-style semantic embeddings. Both need
   a model download and a GPU to be worth it at 4 TB; the perceptual hashes cover duplicates and
   look-alikes without one.
+
+## Mac Studio, 500–600 GB
+
+For an M1 Max or M1 Ultra Mac Studio with 32–64 GB, installed with the `mlx` extra
+(`pip install -e '.[asr,mlx,voice]'`). Nothing needs setting: `asr_backend: "auto"` transcribes on
+the GPU, `heavy_slots` comes out at 4 (M1 Max) or 8 (M1 Ultra), proxies encode with VideoToolbox, and ASR
+stays at one slot.
+
+**What was measured** (one 38 s talk clip, a 10-core-GPU M4 with 16 GB, shared and heavily loaded, model
+already in memory):
+
+| model | faster-whisper (CPU, beam 5) | MLX (GPU, greedy) | agreement |
+|---|---|---|---|
+| `small` | 0.74× realtime | 8.5× realtime | 83 % of words (WER 0.20) |
+| `medium` (default) | 0.59× realtime | 5.2× realtime | 94 % of words (WER 0.09); word starts within 20 ms (median), 140 ms (p90) |
+
+MLX `medium` was about 9× faster than faster-whisper `medium` on this machine. The CPU figures are depressed
+by the load; MLX barely uses the CPU. MLX Whisper has no beam search, so `small` on MLX makes noticeably more
+mistakes than `small` on faster-whisper. That is why `auto` puts only `medium` (the default) and larger on
+MLX; `tiny`, `base` and `small` (and `asr_fast_model: "small"`) stay on faster-whisper unless
+`asr_backend` is `"mlx"`. The first run of a model
+downloads its weights (`medium` ≈ 1.5 GB) and is slow. Peak footprint: MLX `medium` 3.1 GB, faster-whisper
+`medium` 1.7 GB.
+
+**Estimate for 500–600 GB.** Everything except the ASR speed is an *estimate*, not a measurement on a Studio:
+
+| | 4K camera footage, ~40 GB/h | phone HEVC, ~20 GB/h |
+|---|---|---|
+| footage | 12.5–15 h, ~1,600–1,900 clips | 25–30 h, ~3,200–3,800 clips |
+| proxies (4 slots, 3–8× realtime, *estimate*) | 1.6–4.7 h | 3.1–9.4 h |
+| sheets, analysis, speech check, dedupe (*estimate*) | ~1.3 h | ~2.5 h |
+| transcription, ~35 % speech, MLX `medium` at the *measured* 5.2× | ~1 h | ~2 h |
+| (same with faster-whisper on the CPU, *estimate* 0.6–1.8×) | (2.5–9 h) | (5–18 h) |
+| machine time, without tagging | **~3.5–7 h** | **~7–14 h** |
+| AI tagging, overlaps the above (8 clips per call, gate and duplicates applied) | 160–190 calls, 2–6 h | 310–380 calls, 3.5–11.5 h |
+
+So camera footage at this size should fit in **one night** on these estimates. Phone footage might not: it
+holds twice the hours per GB, and proxies become the long stage. Tagging can also run into the plan's usage
+limits. The next night picks up where this one stopped. An M1 Max GPU has more cores and memory bandwidth than
+the M4 measured here, so transcription should not be slower, but that is not measured. Before promising a
+morning, run `cutroom index --skip-proxies --skip-analysis` and `cutroom estimate --bench` on the Studio:
+the real GB per hour and proxy speed replace the estimates above.
 
 ## Checking and stopping
 

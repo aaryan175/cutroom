@@ -63,8 +63,20 @@ For each reference shot (one-to-one) or section (feel):
   offset** (rule 73). Never put copyrighted audio into a delivery unless the creator chose to. Otherwise
   pick a song from their music folder with the same tempo (the reference's `tempo`) and land its drop
   where the reference's `drops` are.
-- **Colour and brightness**: compare `colour.by_section`. If the reference is brighter, warmer or more
-  saturated, adjust the grade (`style.grade`) rather than picking different shots.
+- **Devices (the reference wins, rule 38)**: the analysis has `devices` (card, burns, frames, titles) and
+  every cut-map row lists the devices on its shot. Rebuild each one the reference has, with its measured
+  numbers: `cold_open.style: "reference"` does it for intros; elsewhere use `transition.kind: "burn"`,
+  `frame` (gate / inset / letterbox), `card` segments and `typed_title` overlays. Don't add any device the
+  reference lacks; QA `devices_vs_reference` fails it. Older analyses get devices with
+  `reference.ensure_devices(cfg, id)` (no re-analysis).
+- **Colour and brightness**: compare `colour.by_section`, but start from the LUT-only house grade (rule 120).
+  Never pick a night look for daylight footage; `looks.match` refuses one and caps intensity so the black
+  point stays ≥ 15 and saturation within +15 %. If the reference still differs, say so rather than
+  stacking curves.
+- **Film / lens**: measure it (`cutroom.film.measure_frames` on the reference and on your LUT-only frames),
+  then `film.match(ref, ours)` gives a `style.film` with only the traits the reference measurably has more
+  of. Compare on full-resolution frames: proxies (540p) are softer and blotchier than the masters, so judge
+  the look on a final render.
 - Where the creator's footage has nothing that fits, say which reference shot is missing and offer the
   nearest real beat (rule 116). Never fake it.
 
@@ -76,7 +88,8 @@ cutroom qa renders/<slug>_v1_preview.mp4
 cutroom ref compare <id> renders/<slug>_v1_preview.mp4      # rows + aligned sections + gaps in plain words
 ```
 The compare measures your render exactly like the reference (cuts, pace, beats, captions, loudness,
-brightness) and lists the gaps, biggest first, each with a time in your video. Fix the big ones, bump the
+brightness, and the devices: card, burns, inset / gate time, typed title) and lists the gaps, biggest
+first, each with a time in your video. Fix the big ones, bump the
 version and render again. **Stop when only small gaps are left**, or when the remaining gaps are choices
 the creator made (a shorter runtime, no copyrighted song). In the studio, `GET
 /api/ref/<id>/compare?plan=<slug>` gives the same against the latest render, or a pacing-only check of the

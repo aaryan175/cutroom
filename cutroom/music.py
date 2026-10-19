@@ -324,6 +324,12 @@ def music_bed(cfg, con, sections_timeline, out_wav):
             lv = k_weighted_lufs(a)
             if lv is not None:
                 g_db = float(s.get("voice_lufs", -16.0)) + float(s.get("under_db", -5.0)) - lv
+            # never ducked, but it may rise where nobody talks (a teaser's strobes: ~+10 dB in the
+            # reference teaser, measured 0.70 vs 0.22 of full level)
+            ul = float(s.get("lift_db", 0.0) or 0.0)
+            if ul > 0:
+                talk = _span_env(n, rel, float(s.get("lift_ramp", 0.06)), centred=True) if rel else np.zeros(n, np.float32)
+                env *= (10 ** (ul / 20)) ** (1.0 - talk)
         else:
             if mode in ("duck", "mute") and rel:
                 floor = 0.0 if mode == "mute" else 10 ** (float(s.get("duck_db", -18)) / 20)
@@ -388,6 +394,15 @@ SFX = {
     "tick": ("aevalsrc='0.8*sin(2*PI*2200*t)*exp(-250*t)':d=0.02:s=48000", "anull"),
     "riser": ("anoisesrc=d=1.5:c=white:r=48000:a=0.4",
               "highpass=f=600,lowpass=f=9000,afade=t=in:d=1.45:curve=exp,afade=t=out:st=1.45:d=0.05"),
+    # film-burn sound (reference: a whoosh into an impact on every burn, the transient on the cut):
+    # a rising noise sweep for 0.35 s, then a low thump + crack at 0.35 s (its peak = the cut)
+    "burn": ("aevalsrc='0.32*(2*random(0)-1)*pow(min(t/0.35,1),3)*if(lt(t,0.35),1,exp(-(t-0.35)*16))"
+             "+if(gte(t,0.35),0.95*sin(2*PI*(52*(t-0.35)+(110/22)*(1-exp(-22*(t-0.35)))))*exp(-7*(t-0.35))"
+             "+0.45*(2*random(1)-1)*exp(-60*(t-0.35)),0)':d=0.95:s=48000",
+             "highpass=f=35,lowpass=f=9000,afade=t=out:st=0.85:d=0.1"),
+    # broadband hiss under a type-on title (reference: >4 kHz band flat ~37 dB for 0.5 s)
+    "hiss": ("anoisesrc=d=0.55:c=white:r=48000:a=0.25",
+             "highpass=f=3500,afade=t=in:d=0.03,afade=t=out:st=0.45:d=0.1"),
 }
 
 
@@ -417,7 +432,7 @@ def sfx_peak(path) -> float:
 
 
 def sfx(name, cfg=None) -> str:
-    """Path to a generated sound effect (whoosh | hit | tick | riser), 48 kHz stereo WAV, cached
+    """Path to a generated sound effect (whoosh | hit | tick | riser | burn | hiss), 48 kHz stereo WAV, cached
     under <work>/cache/sfx/ (or a temp dir when no project is given)."""
     import subprocess
     if name not in SFX:

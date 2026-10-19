@@ -1628,7 +1628,17 @@ class ChatBridge:
                 raise ApiError(409, f"{ag.label} is already working on a message; stop it first")
             self.busy, self.stopped, self.proc, self.agent = True, False, None, ag
         try:
-            self._turn(message, attachments, context, send, ag, display)
+            g = _gov_for(self.s.cfg)
+            slot = (g.try_slot("agent", label="studio chat") if g is not None and hasattr(g, "try_slot")
+                    else contextlib.nullcontext(True))
+            with slot as free:
+                if not free:
+                    busy = g.busy_slots("agent") if hasattr(g, "busy_slots") else []
+                    who = (busy[0].get("label") if busy else None) or "another AI run"
+                    send({"type": "error", "error": f"The AI is busy ({who}). Your message can go as soon as it "
+                          "finishes, or press Send to factory to queue the work.", "busy": True})
+                    return
+                self._turn(message, attachments, context, send, ag, display)
         finally:
             with self.lock:
                 self.busy, self.proc = False, None
@@ -1994,6 +2004,8 @@ class Studio:
         self.jobs = Jobs(self)
         self.chat = ChatBridge(self)
         self.comments = CommentRunner(self)
+        self.link_base = None
+        self._factory_init()
         self._klocks = {}
         self._klock = threading.Lock()
         ensure_project_claude(cfg)
@@ -2005,7 +2017,8 @@ class Studio:
             except Exception as e:  # noqa: BLE001
                 print(f"studio: clip stats refresh failed: {e}", file=sys.stderr)
         self._threads = [threading.Thread(target=self._watch, daemon=True, name="studio-watch"),
-                         threading.Thread(target=self._gov_loop, daemon=True, name="studio-governor")]
+                         threading.Thread(target=self._gov_loop, daemon=True, name="studio-governor"),
+                         threading.Thread(target=self._factory_loop, daemon=True, name="studio-factory")]
         for t in self._threads:
             t.start()
 
@@ -2026,10 +2039,110 @@ class Studio:
 
     def close(self):
         self.stopping.set()
+        try:
+            from .factory import runner as FR
+            if self._factory_event in FR.LISTENERS:
+                FR.LISTENERS.remove(self._factory_event)
+            if self.factory is not None:
+                self.factory.shutdown(wait=5)
+        except Exception as e:  # noqa: BLE001
+            print(f"studio: factory shutdown: {e}", file=sys.stderr)
         self.comments.stop()
         self.chat.stop()
         self.jobs.stop_all()
         self.pool.close()
+
+    # -- factory (cutroom/factory, docs/FACTORY.md) ------------------------------------------------
+    def _factory_init(self):
+        """A FactoryRunner thread for this project (one per project: flock). Its renders go through the Jobs
+        heavy lane so they show in the Jobs tab and never overlap a hand render."""
+        self.factory, self.factory_note = None, None
+        try:
+            from .factory import fconfig
+            from .factory import runner as FR
+        except Exception as e:  # noqa: BLE001
+            self.factory_note = f"factory unavailable: {e}"
+            return
+        FR.LISTENERS.append(self._factory_event)
+        self.factory = FR.FactoryRunner(self.cfg, render_fn=self._factory_render)
+        fc = fconfig.load(self.cfg)
+        if not (fc.get("enabled", True) and fc.get("autostart", True)) or os.environ.get("CUTROOM_FACTORY_AUTOSTART") == "0":
+            self.factory_note = "the factory runner is not started (factory.autostart false)"
+        elif not self.factory.start():
+            self.factory_note = "another factory runner holds this project (`cutroom factory run`?)"
+
+    def _factory_event(self, kind, data):
+        if kind == "markers":
+            self.bus.publish("markers", {"markers": markers_load(self.cfg)})
+        else:
+            self.bus.publish(kind, data)
+
+    def factory_light(self):
+        from .factory import runner as FR
+        lt = FR.light(self.cfg)
+        lt["owner"] = bool(self.factory and self.factory.owner)
+        lt["note"] = self.factory_note
+        return lt
+
+    def _factory_render(self, ctx, plan_path, out, preview, log, on_line):
+        """Factory render as a studio job (heavy lane) -> (rc, tail, why)."""
+        cmd = _cli_cmd("render", plan_path, "--out", out, *(["--preview"] if preview else []))
+        env = {"CUTROOM_PROGRESS": "1", "CUTROOM_MAX_JOBS": os.environ.get("CUTROOM_MAX_JOBS", "2")}
+
+        def parse(job, line):
+            _parse_render(job, line)
+            try:
+                on_line(line)
+            except Exception:  # noqa: BLE001
+                pass
+        job = self.jobs.submit("render", cmd, title=f"factory: {Path(out).name}", parse=parse, lane="heavy",
+                               meta={"factory": ctx.oid, "plan_file": str(plan_path), "preview": preview}, env=env)
+        wall = ctx.wall("render")
+        t0, why = time.time(), None
+        pidf = Path(log).with_suffix(".pid")
+        while job.status in ("queued", "running"):
+            if job.proc is not None and not pidf.exists():
+                try:
+                    pidf.write_text(str(job.proc.pid))
+                except OSError:
+                    pass
+            if ctx.stop_check():
+                why = "stopped"
+                self.jobs.stop(job.id)
+            elif time.time() - t0 > wall:
+                why = "timeout"
+                self.jobs.stop(job.id)
+            time.sleep(0.5)
+        pidf.unlink(missing_ok=True)
+        try:
+            Path(log).write_text("\n".join(job.log) + "\n")
+        except OSError:
+            pass
+        if job.status == "done" and job.result:
+            rel = Path(job.result)
+            try:
+                f = rel.resolve().relative_to((self.work / "renders").resolve()).as_posix()
+                self.bus.publish("render_done", {"job": job.id, "file": f, "url": f"/media/render/{quote(f)}",
+                                                 "plan_file": str(plan_path), "plan": Path(plan_path).name, "preview": preview,
+                                                 "factory": ctx.oid})
+            except ValueError:
+                pass
+        return (0 if job.status == "done" else (job.rc if job.rc is not None else 1)), list(job.log)[-40:], why
+
+    def _factory_loop(self):
+        last = None
+        while not self.stopping.wait(3.0):
+            if not self.bus.n:
+                continue
+            try:
+                lt = self.factory_light()
+                sig = json.dumps({k: lt.get(k) for k in ("light", "text", "needs", "blocked", "queued", "runner_alive")},
+                                 sort_keys=True, default=str)
+                if sig != last or lt["light"] == "working":
+                    last = sig
+                    self.bus.publish("factory_state", lt)
+            except Exception:  # noqa: BLE001
+                pass
 
     # -- helpers ---------------------------------------------------------------------------------
     def keylock(self, key):
@@ -3526,6 +3639,289 @@ class Handler(BaseHTTPRequestHandler):
         job = self._index_job(plan["files"], f"import {n} clip{'s' if n != 1 else ''}")
         self._json({"job": job.id, "files": n, "roots_added": len(plan["roots_new"]), "skipped": plan["skipped"]})
 
+    # -- factory (docs/FACTORY.md; cutroom/factory) --------------------------------------------------------------
+    def _fr(self):
+        from .factory import runner as FR
+        return FR
+
+    def _fcall(self, fn, *a, **kw):
+        try:
+            return fn(*a, **kw)
+        except KeyError as e:
+            raise ApiError(404, str(e).strip("'\"")) from None
+        except ValueError as e:
+            raise ApiError(400, str(e)) from None
+
+    def _oid(self, oid):
+        from .factory import bus
+        if not bus.ID_RE.match(oid or "") or not (bus.orders_dir(self.studio.cfg) / oid).is_dir():
+            raise ApiError(404, f"no order {oid}")
+        return oid
+
+    def api_factory_orders_post(self):
+        st = self.studio
+        body = self._body() or {}
+        kind = body.get("kind") or "revise"
+        plan = body.get("plan")
+        if not plan or not SLUG_RE.match(str(plan)):
+            raise ApiError(400, "plan is required")
+        if kind not in ("revise", "reject", "request", "variants"):
+            raise ApiError(400, "kind must be revise, reject, request or variants")
+        extra = {}
+        if body.get("ref"):
+            extra["ref"] = str(body["ref"])[:80]
+        res = self._fcall(self._fr().submit, st.cfg, kind, plan, comment_ids=body.get("comment_ids") or body.get("ids"),
+                          all_open=bool(body.get("all_open")), text=str(body.get("text") or ""),
+                          attachments=body.get("attachments") or [], by={"user": "you", "via": body.get("via") or "studio"},
+                          **({"variants": int(body["variants"])} if kind == "variants" and body.get("variants") else {}),
+                          **({"ref": extra["ref"]} if extra.get("ref") else {}))
+        if st.factory:
+            st.factory.wake()
+        o = res["order"]
+        self._json({"order": o, "id": o["id"], "folded": res.get("folded"), "folded_into": res.get("folded_into"),
+                    "status": self._fr().bus.status(st.cfg, o["id"])})
+
+    def api_factory_orders(self):
+        self._json({"orders": self._fr().list_view(self.studio.cfg, plan=self.q.get("plan") or None,
+                                                   state=self.q.get("state") or None)})
+
+    def api_factory_order(self, oid):
+        self._json(self._fr().order_detail(self.studio.cfg, self._oid(oid)))
+
+    def api_factory_role_log(self, oid, role):
+        from .factory import bus
+        d = bus.order_dir(self.studio.cfg, self._oid(oid)) / "roles"
+        p = _within(d, role)
+        if not p or not p.is_dir():
+            raise ApiError(404, f"no role run {role}")
+        lines = []
+        try:
+            with open(p / "stream.jsonl", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            pass
+        if not self.q.get("all"):
+            lines = lines[-200:]
+        self._json({"role": role, "lines": lines, "usage": _read_json(p / "usage.json"),
+                    "prompt": (p / "prompt.md").read_text()[:20000] if (p / "prompt.md").exists() else None})
+
+    def api_factory_stop(self, oid):
+        st = self.studio
+        self._json(self._fcall(self._fr().stop, st.cfg, self._oid(oid), runner=st.factory))
+
+    def api_factory_retry(self, oid):
+        st = self.studio
+        out = self._fcall(self._fr().retry, st.cfg, self._oid(oid))
+        if st.factory:
+            st.factory.wake()
+        self._json(out)
+
+    def api_factory_answer(self):
+        st = self.studio
+        b = self._body() or {}
+        self._json(self._fcall(self._fr().answer, st.cfg, self._oid(b.get("order")), str(b.get("question") or ""),
+                               b.get("option"), text=str(b.get("text") or ""), runner=st.factory))
+
+    def api_factory_verdict(self):
+        st = self.studio
+        b = self._body() or {}
+        if not SLUG_RE.match(str(b.get("plan") or "")):
+            raise ApiError(400, "plan is required")
+        try:
+            v = int(b.get("version"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "version must be a number") from None
+        self._json(self._fcall(self._fr().verdict, st.cfg, b["plan"], v, b.get("disposition"), text=b.get("text") or "",
+                               runner=st.factory))
+
+    def api_factory_variants(self, oid):
+        st = self.studio
+        b = self._body() or {}
+        self._json({"results": self._fcall(self._fr().variant_verdict, st.cfg, self._oid(oid), b.get("items") or [],
+                                           runner=st.factory)})
+
+    def api_factory_apply_extension(self, oid):
+        self._oid(oid)
+        raise ApiError(501, "the extender is a stub in this build: features are not built or applied automatically yet",
+                       stub=True)
+
+    def api_factory_state(self):
+        from .factory import fconfig
+        st = self.studio
+        self._json({**st.factory_light(), "config": fconfig.load(st.cfg)})
+
+    def api_factory_pause(self):
+        self._fr().pause(self.studio.cfg)
+        self._json(self.studio.factory_light())
+
+    def api_factory_resume(self):
+        st = self.studio
+        n = self._fr().resume(st.cfg)
+        if st.factory:
+            st.factory._login = (0.0, None)
+            st.factory.wake()
+        self._json({**st.factory_light(), "requeued": n})
+
+    def api_factory_lessons(self):
+        from .factory import lessons, lint
+        cfg = self.studio.cfg
+        d = lessons.load(cfg, "project")
+        g = lessons.load(cfg, "global")
+        tag = self.q.get("tag")
+        rows = [x for x in d["lessons"] + g["lessons"] if (not tag or tag in (x.get("tags") or []))
+                and (self.q.get("scope") in (None, "", x.get("scope")))]
+        self._json({"lessons": rows, "inbox": [r for r in d["inbox"] if r.get("status") == "open"],
+                    "inbox_count": len([r for r in d["inbox"] if r.get("status") == "open"]),
+                    "checks": lint.load_checks(cfg), "check_types": list(lint.TYPES), "lessons_sha": lessons.lessons_sha(cfg)})
+
+    def api_factory_lessons_post(self):
+        from .factory import lessons
+        b = self._body() or {}
+        if not str(b.get("rule") or "").strip():
+            raise ApiError(400, "rule is required")
+        les = self._fcall(lessons.add_lesson, self.studio.cfg, str(b["rule"]).strip()[:600], symptom=str(b.get("symptom") or ""),
+                          tags=b.get("tags") or [], check=b.get("check"), source="studio")
+        self._json(les)
+
+    def api_factory_lessons_patch(self):
+        from .factory import lessons, lint
+        b = self._body() or {}
+        cfg = self.studio.cfg
+        lid = b.get("id")
+        if b.get("status") == "superseded":
+            return self._json(self._fcall(lessons.supersede, cfg, lid, by=b.get("by"), scope=b.get("scope") or "project"))
+        if b.get("check"):
+            rec = self._fcall(lint.add_check, cfg, {**b["check"], "lesson": lid}, scope=b.get("scope") or "project")
+            with lessons._lock(cfg, "project"):
+                d = lessons.load(cfg, "project")
+                for x in d["lessons"]:
+                    if x["id"] == lid:
+                        x["check"] = rec["id"]
+                lessons._save(cfg, "project", d)
+            return self._json(rec)
+        raise ApiError(400, "send {id, status: superseded} or {id, check: {type, params}}")
+
+    def api_factory_brain(self, slug):
+        from .factory import brain
+        PlanStore.check_slug(slug)
+        cfg = self.studio.cfg
+        self._json({**brain.summary(cfg, slug), "files": {n: brain.read_file(cfg, slug, n) for n in brain.FILES},
+                    "grades": brain.grades(cfg)})
+
+    def api_factory_brain_file(self, slug, name):
+        from .factory import brain
+        PlanStore.check_slug(slug)
+        if name not in brain.FILES:
+            raise ApiError(404, f"no brain file {name}")
+        self._json({"name": name, "value": brain.read_file(self.studio.cfg, slug, name)})
+
+    def api_factory_brain_put(self, slug, name):
+        from .factory import brain
+        PlanStore.check_slug(slug)
+        if name not in brain.FILES:
+            raise ApiError(404, f"no brain file {name}")
+        b = self._body()
+        val = b.get("value") if isinstance(b, dict) and "value" in b else b
+        self._json({"name": name, "value": self._fcall(brain.write_file, self.studio.cfg, slug, name, val)})
+
+    def api_grades(self):
+        from .factory import brain
+        self._json({"grades": brain.grades(self.studio.cfg)})
+
+    def api_grades_post(self):
+        from .factory import brain
+        b = self._body() or {}
+        rec = self._fcall(brain.add_grade, self.studio.cfg, b.get("clip"), b.get("t0"), b.get("t1"),
+                          grade=b.get("grade") or None, ident=b.get("ident") or None)
+        self._json(rec)
+
+    def api_factory_versions(self):
+        """Versions of a plan for the Review tab: file, render, card, theme, verdict, badges."""
+        from .factory import bus, phases
+        st = self.studio
+        slug = self.q.get("plan")
+        PlanStore.check_slug(slug or "")
+        vi = phases.versions_index(st.cfg)
+        meta = _read_json(st.plans.hist_dir(slug) / "versions.json", {}) or {}
+        out = []
+        for v in st.plans.version_files(slug):
+            if v["kind"] != "version":
+                continue
+            key = f"{slug}_v{v['version']}"
+            fx = vi.get(key) or {}
+            cardp = Path(fx["card"]) if fx.get("card") else None
+            cd = _read_json(cardp, None) if cardp else None
+            plan_path = st.plans.dir / v["file"]
+            rr = fx.get("render")
+            if not rr:
+                from .factory.phases import find_render
+                r0 = find_render(st.cfg, plan_path)
+                rr = r0.resolve().relative_to((st.work / "renders").resolve()).as_posix() if r0 else None
+            out.append({"file": v["file"], "version": v["version"], "mtime": v["mtime"], "by": v.get("by"),
+                        "theme": fx.get("theme") or (meta.get(v["file"]) or {}).get("theme"),
+                        "render": rr, "render_url": f"/media/render/{quote(rr)}" if rr else None,
+                        "final_render": fx.get("final_render"), "order": fx.get("order"), "passed": fx.get("passed"),
+                        "not_passed": fx.get("not_passed"), "verdict": fx.get("verdict"), "approved": fx.get("approved"),
+                        "conditional": fx.get("conditional"), "card": cd,
+                        "sheet_url": f"/media/render/{quote(cd['changed_sheet'])}" if cd and cd.get("changed_sheet") else None})
+        out.sort(key=lambda x: x["version"] if isinstance(x["version"], (int, float)) else -1, reverse=True)
+        refs = []
+        try:
+            from . import reference as R
+            refs = [{"id": m["id"], "title": m.get("title"), "proxy_url": f"/media/refproxy/{quote(m['id'])}"}
+                    for m in R.list_refs(st.cfg)] if hasattr(R, "list_refs") else []
+        except Exception:  # noqa: BLE001
+            refs = []
+        from .factory import brain
+        orders = [o for o in self._fr().list_view(st.cfg, plan=slug)[:30]]
+        self._json({"plan": slug, "versions": out, "refs": refs, "pairs": brain.read_file(st.cfg, slug, "ref_pairs.json"),
+                    "orders": orders, "variants": [o for o in orders if o["kind"] == "variants" and o["state"] == "ready"]})
+
+    def api_review(self):
+        """Everything waiting on you (the phone page): newest unjudged version per plan, open questions, options."""
+        from .factory import bus, phases
+        st = self.studio
+        vi = phases.versions_index(st.cfg)
+        newest = {}
+        for k, v in vi.items():
+            if v.get("plan") and (v.get("version") or 0) >= (newest.get(v["plan"], {}).get("version") or 0):
+                newest[v["plan"]] = {**v, "key": k}
+        items = []
+        for plan, v in newest.items():
+            cd = _read_json(v.get("card"), None) if v.get("card") else None
+            items.append({"type": "version", "plan": plan, "version": v.get("version"), "theme": v.get("theme"),
+                          "verdict": v.get("verdict"), "passed": v.get("passed"), "not_passed": v.get("not_passed"),
+                          "render_url": f"/media/render/{quote(v['render'])}" if v.get("render") else None,
+                          "final_render": v.get("final_render"), "card": cd,
+                          "sheet_url": f"/media/render/{quote(cd['changed_sheet'])}" if cd and cd.get("changed_sheet") else None})
+        qs = []
+        for o in self._fr().list_view(st.cfg)[:200]:
+            if not o["open_questions"]:
+                continue
+            d = self._fr().order_detail(st.cfg, o["id"])
+            for q in d["status"].get("questions") or []:
+                if not q.get("answered"):
+                    qs.append({"order": o["id"], "plan": o["plan"], "kind": o["kind"], "version": o.get("version"), **q})
+        var = []
+        for o in self._fr().list_view(st.cfg)[:100]:
+            if o["kind"] == "variants" and o["state"] == "ready":
+                cd = _read_json(bus.order_dir(st.cfg, o["id"]) / "card.json", {}) or {}
+                vv = _read_json(bus.order_dir(st.cfg, o["id"]) / "variant_verdicts.json", {}) or {}
+                if len(vv) >= len(cd.get("variants") or []):
+                    continue
+                var.append({"order": o["id"], "plan": o["plan"], "notes": cd.get("notes"), "theme": cd.get("theme"),
+                            "variants": [{**x, "url": f"/media/render/{quote(x['render'])}" if x.get("render") else None,
+                                          "verdict": (vv.get(str(x["k"])) or {}).get("verdict")} for x in cd.get("variants") or []]})
+        items.sort(key=lambda x: (x["verdict"] is not None, -(x["version"] or 0)))
+        self._json({"items": items, "questions": qs, "variants": var, "light": st.factory_light()})
+
+    def media_factory(self, rel):
+        from .factory import bus
+        self._file(_within(bus.orders_dir(self.studio.cfg), rel))
+
+    def page_review(self):
+        self._file(WEB / "review.html", cache="no-cache")
+
     def api_plan_version(self, slug, name):
         """A saved version's plan JSON (for Restore / Compare with draft)."""
         st = self.studio
@@ -3616,6 +4012,31 @@ ROUTES = [
     _r("POST", r"/api/import/locate", Handler.api_import_locate),
     _r("POST", r"/api/import/footage", Handler.api_import_footage),
     _r("GET", rf"/api/plan/{ID}/version/{ID}", Handler.api_plan_version),
+    _r("POST", r"/api/factory/orders", Handler.api_factory_orders_post),
+    _r("GET", r"/api/factory/orders", Handler.api_factory_orders),
+    _r("GET", rf"/api/factory/orders/{ID}", Handler.api_factory_order),
+    _r("GET", rf"/api/factory/orders/{ID}/role/{ID}/log", Handler.api_factory_role_log),
+    _r("POST", rf"/api/factory/orders/{ID}/stop", Handler.api_factory_stop),
+    _r("POST", rf"/api/factory/orders/{ID}/retry", Handler.api_factory_retry),
+    _r("POST", r"/api/factory/answer", Handler.api_factory_answer),
+    _r("POST", r"/api/factory/verdict", Handler.api_factory_verdict),
+    _r("POST", rf"/api/factory/variants/{ID}", Handler.api_factory_variants),
+    _r("POST", rf"/api/factory/apply-extension/{ID}", Handler.api_factory_apply_extension),
+    _r("GET", r"/api/factory/state", Handler.api_factory_state),
+    _r("POST", r"/api/factory/pause", Handler.api_factory_pause),
+    _r("POST", r"/api/factory/resume", Handler.api_factory_resume),
+    _r("GET", r"/api/factory/lessons", Handler.api_factory_lessons),
+    _r("POST", r"/api/factory/lessons", Handler.api_factory_lessons_post),
+    _r("PATCH", r"/api/factory/lessons", Handler.api_factory_lessons_patch),
+    _r("GET", rf"/api/factory/brain/{ID}", Handler.api_factory_brain),
+    _r("GET", rf"/api/factory/brain/{ID}/{ID}", Handler.api_factory_brain_file),
+    _r("PUT", rf"/api/factory/brain/{ID}/{ID}", Handler.api_factory_brain_put),
+    _r("GET", r"/api/factory/versions", Handler.api_factory_versions),
+    _r("GET", r"/api/grades", Handler.api_grades),
+    _r("POST", r"/api/grades", Handler.api_grades_post),
+    _r("GET", r"/api/review", Handler.api_review),
+    _r("GET", rf"/media/factory/{REST}", Handler.media_factory),
+    _r("GET", r"/review/?", Handler.page_review),
 ]
 
 
@@ -3661,8 +4082,16 @@ def make_server(cfg, port=8600, host="127.0.0.1"):
     """(server, studio). port 0 = any free port. Call studio.close() + server.server_close() to stop."""
     studio = Studio(cfg)
     handler = type("StudioHandler", (Handler,), {"studio": studio})
-    srv = StudioServer((host, port), handler)
+    try:
+        srv = StudioServer((host, port), handler)
+    except Exception:
+        studio.close()
+        raise
     srv.studio = studio
+    p_ = srv.server_address[1]
+    studio.link_base = f"http://127.0.0.1:{p_}"
+    if studio.factory is not None:
+        studio.factory.link_base = studio.link_base
     return srv, studio
 
 

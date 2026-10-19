@@ -309,6 +309,7 @@ export function initProgram(body, tools) {
   document.body.appendChild(music);
 
   document.querySelectorAll('#p-program .ptab[data-ptab]').forEach((b) => b.addEventListener('click', () => {
+    emit('toggleReview', b.dataset.ptab === 'review' ? undefined : false);
     emit('toggleReference', b.dataset.ptab === 'reference' ? undefined : false);
   }));
   void tools;

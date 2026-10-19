@@ -27,16 +27,24 @@ description: Use after a plan passes `cutroom plan check`, to render a preview o
    - **room_tone_steps** (the floor jumps at talk joins). Check `style.audio.room_tone` is on and the
      segment hasn't set `"room_tone": false`. Lower `voice.atten_lim_db` (12–15) if the cleaned
      dialogue is gated.
-   - **black_level** (milky blacks). Don't add brightness. Exposure lives before the LUT
-     (`style.grade.exposure`). A shot that is over-exposed in camera needs `"exposure_stops": -1.5` or
-     another pick.
+   - **black_level** (median p1 must sit between 8 and 35). Milky: don't add brightness; exposure lives
+     before the LUT. Crushed: remove what the plan stacks after the LUT (finish curve, vibrance, saturation,
+     a look); the house grade is the LUT only (rule 120).
+   - **grade_bounds.** A clip shot drifted from its LUT-only probe (luma ±15, black point −12, saturation
+     +15 %). Remove the opt-in that did it, or ask the creator.
+   - **devices_vs_reference** (rule 38). A burn, card, frame, typed title or film setting the reference
+     doesn't have. Remove it, or point `cold_open.from_reference` at the reference that has it.
+   - **burn_timing.** The glow must be on the frame before the cut and the disc on the cut frame. A burn
+     on a 1-frame neighbour can't show; give the shots ≥ 3 frames.
+   - **card_present.** The reference opens on a card and this render doesn't: add `cold_open.card`.
    - **duplicate_frames.** The piece is set to `conform: "dup"`, or the source rate is far from the
      output rate. Use `"auto"`.
    - **flash_sfx_alignment.** The flash must peak on the cut frame and the hit within 5 ms. If a sound
      is bound to a transition that no longer exists, remove it (rule 39).
    - **caption_size.** Go back to the default `size` (43 at 1080) unless the creator chose a size.
 5. When the preview is clean, run `cutroom render plans/<slug>_vN.json` (full quality from masters),
-   then `cutroom qa` on the final once more.
+   then `cutroom qa` on the final once more. Judge the look (sharpness, grain, colour) on the final only:
+   previews come from 540p proxies, which are visibly softer and blotchier than the masters.
 6. Run `cutroom board` and send the creator the link. **Open the link first and confirm the video plays
    and scrubs.**
 7. Add a one-line explanation for each remaining **warn** in your message to the creator, plus a short

@@ -7,6 +7,7 @@ import { api } from './api.js';
 import { h, icon, tc, toast, ago, clamp, LS } from './util.js';
 import { programCtl } from './program.js';
 import { richMd, hydrate, wireChips } from './rich.js';
+import { sendToFactory, questionEl } from './factory.js';
 
 // ---------------------------------------------------------------- tiny local helpers
 const SVG = {
@@ -373,7 +374,7 @@ function explainer(compact) {
   return h('div.cm-explain' + (compact ? '.compact' : ''),
     step(1, 'Pause and press M', 'Or click the comment button under the Program monitor. The comment pins to that exact frame. Press O for a range ("from here to here").', 'comment'),
     step(2, 'Say it, draw it', 'Type what should change. Circle, box, arrow or scribble on the frame: the AI sees exactly what you marked.', 'draw'),
-    step(3, 'Send to AI, one by one', 'Like a real review: it takes each comment in order, makes that one change, and replies on the comment. Undo works per comment.', 'spark'));
+    step(3, 'Send to factory', 'The team builds the next version from all your notes, checks it and hands you a card on the Review tab. Quick fix does one AI turn per comment instead.', 'spark'));
 }
 
 function runBar() {
@@ -391,9 +392,10 @@ function runBar() {
       h('button.btn', { disabled: !!run.stop_requested, title: 'Finish the current comment, leave the rest open', on: { click: stopRun } }, I('stop', 11), 'Stop'));
   } else {
     bar.append(
-      h('button.btn' + (open.length ? '.primary' : ''), { disabled: !open.length, title: 'The AI takes them one at a time, in timeline order', on: { click: () => sendToAI(null) } }, I('spark', 13),
-        open.length ? `Send ${open.length} open to AI` : 'Nothing open to send'),
-      h('span.cm-runhint', 'One at a time, in order'));
+      h('button.btn' + (open.length ? '.primary' : '') + '.cm-factory-btn', { disabled: !open.length, title: 'The factory team (producer, editor, critic) builds the next version from all open notes, renders it, checks it and gives you a card. Notes sent within 90 s go into the same order.', on: { click: () => sendToFactory(null).then(() => draw()) } }, I('spark', 13),
+        open.length ? `Send ${open.length} to factory` : 'Nothing open to send'),
+      h('button.btn.cm-quick-btn', { disabled: !open.length, title: 'Quick fix: one AI turn per comment, in order, editing the draft (no render, no checks)', on: { click: () => sendToAI(null) } }, 'Quick fix'),
+      h('span.cm-runhint', 'Factory = a checked new version · Quick fix = one turn each'));
   }
   return bar;
 }
@@ -408,12 +410,29 @@ function card(m) {
   },
   h('div.cm-thumb', m.frame_url ? h('img', { src: m.frame_url, alt: '', loading: 'lazy' }) : h('div.cm-c-spin'), h('span.cm-num', `${numberOf(m)}`)),
   h('div.cm-cbody',
-    h('div.cm-row1', h('span.cm-chip.tc', tc(m.t, fps())), m.t_end != null ? h('span.cm-chip.range', I('range', 11), tc(m.t_end, fps())) : null, h('span.grow'), pill(st)),
+    h('div.cm-row1', h('span.cm-chip.tc', tc(m.t, fps())), m.t_end != null ? h('span.cm-chip.range', I('range', 11), tc(m.t_end, fps())) : null, h('span.grow'), fxPill(m), pill(st)),
     h('div.cm-text', m.text || (m.drawing && m.drawing.length ? h('i', 'Drawing only') : h('i', 'No note yet'))),
     h('div.cm-meta', authorEl(m.author || 'you'),
       replies ? h('span', `· ${replies} repl${replies > 1 ? 'ies' : 'y'}`) : null,
       last && last.author === 'ai' ? h('span.cm-last', `· ${plain(last.text).slice(0, 90)}`) : null)));
   return c;
+}
+
+/** "in factory · v24" while an order holds this comment */
+function fxPill(m) {
+  const f = m.factory;
+  if (!f || f.done || m.status === 'done') return f && f.done && f.version ? h('span.cm-fx.done', { title: `Handled by factory order ${f.order}` }, `v${f.version}`) : null;
+  return h('span.cm-fx', { title: `Factory order ${f.order}` }, f.version ? `in factory · v${f.version}` : 'in factory · queued');
+}
+
+/** Questions of the factory order that answered this comment, as numbered buttons. */
+function fxQuestions(m, box) {
+  const f = m.factory;
+  if (!f || !f.order || m.status !== 'needs_you') return;
+  api.fx.order(f.order).then((d) => {
+    const qs = (d.status.questions || []).filter((q) => !q.answered);
+    if (qs.length) box.replaceChildren(...qs.map((q) => questionEl(f.order, q, { compact: true })));
+  }).catch(() => {});
 }
 
 /** a reply as one plain line: [[t:12.4]] -> 0:12.4, other tokens dropped */
@@ -447,7 +466,8 @@ function detail(m) {
     h('span.cm-when', m.created ? ago(m.created) : ''),
     h('span.grow'),
     h('button.btn.ghost', { title: 'Edit the note, drawing or range', on: { click: () => startComposer(m) } }, I('draw', 12), 'Edit'),
-    h('button.btn', { disabled: run.running || done || st === 'working', title: 'The AI makes this one change and replies here', on: { click: () => sendToAI([m.id]) } }, I('spark', 12), st === 'needs_you' ? 'Send answer to AI' : 'Send to AI'),
+    h('button.btn.primary', { disabled: done || st === 'working', title: 'Send this note to the factory (a checked new version)', on: { click: () => sendToFactory([m.id]).then(() => draw()) } }, I('spark', 12), 'Send to factory'),
+    h('button.btn', { disabled: run.running || done || st === 'working', title: 'Quick fix: one AI turn for this note, editing the draft', on: { click: () => sendToAI([m.id]) } }, st === 'needs_you' ? 'Quick fix (answer)' : 'Quick fix'),
     h('button.btn.ghost', { on: { click: () => patch(m.id, { status: done ? 'open' : 'done' }) } }, I('check', 12), done ? 'Reopen' : 'Resolve'),
     h('button.ib.sm', { title: 'Delete comment', html: ico('trash', 13), on: { click: async () => { try { await api.delMarker(m.id); if (sel === m.id) sel = null; await loadMarkers(); } catch (e) { toast(e.message, 'error'); } } } }));
   const fr = h('div.cm-d-frame', m.frame_url ? h('img', { src: m.frame_url, alt: '', title: 'Click to enlarge', on: { click: () => lightbox(m.frame_url) } }) : h('div.cm-c-spin'),
@@ -472,7 +492,9 @@ function detail(m) {
   const replyRow = h('div.cm-reply', reply,
     h('button.btn', { on: { click: () => sendReply(false) } }, I('reply', 12), 'Reply'),
     st === 'needs_you' ? h('button.btn.primary', { title: 'Reply and let the AI try again', on: { click: () => sendReply(true) } }, I('spark', 12), 'Reply & send') : null);
-  d.append(head, h('div.cm-d-body', fr, h('div.cm-d-conv', thread, replyRow)));
+  const fxq = h('div.cm-fxq');
+  fxQuestions(m, fxq);
+  d.append(head, h('div.cm-d-body', fr, h('div.cm-d-conv', thread, fxq, replyRow)));
   wireChips(thread);
   requestAnimationFrame(() => { thread.scrollTop = thread.scrollHeight; });
   return d;

@@ -40,10 +40,13 @@ class Config:
                                                            # (360: 600k, 540: 1200k, 720: 2000k)
     sheet_every_s: float = 2.0                             # one contact-sheet tile per N seconds (capped)
     sheet_max_tiles: int = 24
-    asr_model: str = "medium"                              # faster-whisper model name
+    asr_model: str = "medium"                              # Whisper model: tiny/base/small/medium/large-v3/turbo
+    asr_backend: str = "auto"                              # "auto" (mlx on Apple Silicon when installed, else
+                                                           # faster-whisper) | "faster-whisper" | "mlx"
     asr_language: str = ""                                 # "" = auto-detect
     ref_asr_model: str = "small"                           # model for reference videos (reference.py); "" = asr_model
-    asr_device: str = ""                                   # "" = auto (cuda when present, else cpu) | "cpu" | "cuda"
+    asr_device: str = ""                                   # faster-whisper only: "" = auto (cuda when present, else
+                                                           # cpu) | "cpu" | "cuda"
     asr_remote: str = ""                                   # run ASR elsewhere: a command template with {audio} {out} {model}
                                                            # {language}, e.g. "ssh gpu-box /opt/cutroom/.venv/bin/python -m
                                                            # cutroom.asr {audio} {out} --model {model}" (paths must be shared)
@@ -67,7 +70,8 @@ class Config:
     min_free_ram_gb: float = 0.0                           # new work waits below this (auto max(2, 15% of RAM))
     max_proc_mem_gb: float = 0.0                           # per child process footprint cap (auto min(4, 25% of RAM))
     min_free_disk_gb: float = 20.0                         # writes pause below this much free space on the work volume
-    heavy_slots: int = 0                                   # concurrent encodes/analysis machine-wide (auto cpus//4, >= 1)
+    heavy_slots: int = 0                                   # concurrent encodes/analysis machine-wide (auto: by cores
+                                                           # and RAM, see governor.auto_heavy_slots)
     nice_level: int = 10                                   # scheduling priority of child processes
     pause_when_user_active: bool = False                   # macOS: 1 heavy slot while keyboard/mouse used in last 2 min
     quiet_hours: str = ""                                  # e.g. "09:00-18:00": 1 heavy slot inside this window

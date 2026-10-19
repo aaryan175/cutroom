@@ -38,3 +38,13 @@ before", "the music under me talking". Every note is a specific instruction.
      the music.
 8. Render, QA, then deliver the version with a short list: what changed, at which timestamps.
    Anything you couldn't place goes in one short question with options.
+
+## When the factory does the round (Studio "Send to factory")
+The same loop is automated in `cutroom/factory/` (docs/FACTORY.md): intake maps each comment to segments,
+words and frames (step 2), the producer writes the change list (step 3), the editor changes only what was
+named, code renders and runs QA, the lock check proves nothing else moved, a blind critic audits, one fix
+round closes HARD findings with proof, and the card is the reply. If you are running as one of those roles
+(`CUTROOM_FACTORY_ROLE` is set), do only your role's job and return its JSON. If you are the chat and the
+creator asks for a full round ("fix all my notes", "make a 2 min edit"), suggest **Run in factory** (or end
+your reply with `[[factory:revise]]` / `[[factory:request]]`), and answer factory questions from the Factory
+tab rather than redoing the work in chat. `cutroom factory status` / `orders` / `order <id>` show what it did.

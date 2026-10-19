@@ -1109,10 +1109,8 @@ def asr_stage(cfg, y, audio_facts, label="asr"):
     from . import asr as A
     if not audio_facts.get("has_audio") or audio_facts.get("speech_s", 0) < A.MIN_SPEECH_S:
         return {"skipped": "no speech"}
-    try:
-        import faster_whisper  # noqa: F401
-    except ImportError:
-        return {"skipped": "faster-whisper is not installed (pip install -e '.[asr]')"}
+    if not A.any_backend_available():
+        return {"skipped": "no ASR backend is installed (pip install -e '.[asr]', or '.[mlx]' on Apple Silicon)"}
     model = asr_model_name(cfg)
     with np.errstate(all="ignore"):                    # silent padding makes the mel filter warn; harmless
         lang, segs = A.transcribe_audio(cfg, y, model, label=f"ref {label}")
@@ -1558,6 +1556,15 @@ def measure(cfg, d, picture, audio_src, fps, title, prog, asr=True, sidecar=None
         frames = frames_stage(cfg, picture, arr, shots, fps, d, prog, label=f"frames {ref_label}")
         _jsave(fj, frames)
     prog.end()
+    # devices (burns, frames, cards, typed titles) in the opening
+    dj = wd / "devices.json"
+    dev = _jload(dj)
+    if not dev or dev.get("version") != DEV_VERSION:
+        try:
+            dev = devices_for(cfg, picture, fps, [int(s["f0"]) for s in shots[1:]], DEV_WINDOW_S, work=wd,
+                              label=f"devices {ref_label}")
+        except Exception as e:  # noqa: BLE001 - devices are additive; never fail a measurement on them
+            dev = {"version": DEV_VERSION, "error": f"{type(e).__name__}: {e}"}
     # audio
     prog.begin("audio")
     aj = wd / "audio.json"
@@ -1596,6 +1603,8 @@ def measure(cfg, d, picture, audio_src, fps, title, prog, asr=True, sidecar=None
                          "asr_model": (transcript or {}).get("model"),
                          "detectors": ["ContentDetector", "AdaptiveDetector", "frame-difference spikes", "black/flash runs"]},
                "detector_counts": {"content": int(len(arr["content_cuts"])), "adaptive": int(len(arr["adaptive_cuts"]))}})
+    an["devices"] = dev
+    _tag_shots(an)
     an["sheets"] = _sheets(d, an["shots"], fps, title or d.name, n)
     an["summary"] = summary_lines(an)
     an["seconds"] = round(time.time() - t0, 1)
@@ -1735,7 +1744,7 @@ def cutmap_rows(an) -> list:
                      "kind": s["kind"] + ("/montage" if s.get("montage") else ""), "beat": s.get("beat"),
                      "text": (t.get("words") or ("(text)" if t.get("present") else "")) if t else "",
                      "luma": s["luma"], "faces": s["faces"], "section": secs.get(s.get("section"), ""),
-                     "thumb": s.get("thumb")})
+                     "devices": s.get("devices") or [], "thumb": s.get("thumb")})
     return rows
 
 
@@ -1779,6 +1788,11 @@ def measure_render(cfg, video, echo=print) -> dict:
     out = d / "analysis.json"
     an = _jload(out)
     if an and an.get("version") == VERSION:
+        if (an.get("devices") or {}).get("version") != DEV_VERSION:
+            an["devices"] = devices_for(cfg, video, float(an["source"]["fps"]), [int(s["f0"]) for s in an["shots"][1:]],
+                                        DEV_WINDOW_S, work=d / "work", label=f"devices {video.stem}")
+            _tag_shots(an)
+            _jsave(out, an)
         return an
     d.mkdir(parents=True, exist_ok=True)
     fields = _probe_fields(cfg, video)
@@ -1922,6 +1936,42 @@ def compare(cfg, rid, target, echo=print, style=None, out_h=None) -> dict:
     return compare_analyses(ref, yours, mode=mode, label=label)
 
 
+def _compare_devices(ref, yours, row, gap, window_s=15.0):
+    """Rows + gaps for the reference's devices (card, burns, frames, typed title) in the opening."""
+    rd, yd = ref.get("devices"), yours.get("devices")
+    if not rd:
+        return
+    yd = yd or {}
+    rc, yc = rd.get("card"), yd.get("card")
+    row("card", "Title card at the start", f"{rc['t1']:.2f}s" if rc else "none", f"{yc['t1']:.2f}s" if yc else "none")
+    if rc and not yc:
+        gap("card", "big", f"the reference opens on a {rc['t1']:.2f}s title card"
+                           f"{(' (' + rc['text'] + ')') if rc.get('text') else ''}; yours has none", 0.0)
+    elif rc and yc and abs(rc["t1"] - yc["t1"]) > 0.2:
+        gap("card", "small", f"your card lasts {yc['t1']:.2f}s vs {rc['t1']:.2f}s", 0.0)
+    rb = [b for b in rd.get("burns") or [] if b["t"] <= window_s]
+    yb = [b for b in yd.get("burns") or [] if b["t"] <= window_s]
+    row("burns", f"Film burns in the first {window_s:.0f} s", len(rb), len(yb))
+    row("burn_times", "Burn times", ", ".join(f"{b['t']:.2f}" for b in rb) or "none",
+        ", ".join(f"{b['t']:.2f}" for b in yb) or "none")
+    if rb and len(yb) < len(rb):
+        gap("burns", "big" if not yb else "small",
+            f"the reference has {len(rb)} two-frame film burns in its first {window_s:.0f} s ("
+            + ", ".join(f"{b['t']:.2f}s" for b in rb) + f"); yours has {len(yb)}")
+    for kind in ("inset", "gate"):
+        rr = sum(r["t1"] - r["t0"] for r in rd.get("frames") or [] if r["kind"] == kind and r["t0"] < window_s)
+        yy = sum(r["t1"] - r["t0"] for r in yd.get("frames") or [] if r["kind"] == kind and r["t0"] < window_s)
+        row(f"frame_{kind}", f"{kind.capitalize()} frame time (first {window_s:.0f} s)", round(rr, 2), round(yy, 2), "s")
+        if rr >= 0.3 and yy < 0.5 * rr:
+            gap(f"frame_{kind}", "big" if yy == 0 else "small",
+                f"the reference spends {rr:.1f}s in a{'n' if kind == 'inset' else ''} {kind} frame in its opening; yours {yy:.1f}s")
+    rt = [t for t in rd.get("titles") or [] if t.get("type_on") and t["t0"] < window_s]
+    yt = [t for t in yd.get("titles") or [] if t.get("type_on") and t["t0"] < window_s]
+    row("typed_title", "Typed title", f"{rt[0]['t0']:.2f}s" if rt else "none", f"{yt[0]['t0']:.2f}s" if yt else "none")
+    if rt and not yt:
+        gap("typed_title", "big", f"the reference types a title on at {rt[0]['t0']:.2f}s; yours has none", rt[0]["t0"])
+
+
 def compare_analyses(ref, yours, mode="render", label="") -> dict:
     rd, yd = float(ref["source"]["duration"]), float(yours["source"]["duration"] or 0)
     rows, gaps = [], []
@@ -2021,6 +2071,7 @@ def compare_analyses(ref, yours, mode="render", label="") -> dict:
                                          f": {ycap['size_pct']:.1f}% of the frame height vs {rcap['size_pct']:.1f}%")
         if rcap.get("outline") is False and ycap.get("outline"):
             gap("caption_outline", "small", "your captions have a dark outline/shadow; the reference's don't (rule 53)")
+    _compare_devices(ref, yours, row, gap)
     rco, yco = (ref.get("colour") or {}).get("overall") or {}, (yours.get("colour") or {}).get("overall") or {}
     for k, title, thr in (("luma", "Brightness (mean luma)", 12), ("sat", "Saturation", None), ("contrast", "Contrast", 10)):
         row(k, title, rco.get(k), yco.get(k))
@@ -2039,3 +2090,351 @@ def compare_analyses(ref, yours, mode="render", label="") -> dict:
             "n_big": sum(1 for g in gaps if g["severity"] == "big"),
             "verdict": "close" if not any(g["severity"] in ("big", "small") for g in gaps) else
             ("far" if any(g["severity"] == "big" for g in gaps) else "near")}
+
+
+# ==================================================================================================
+# devices: film burns, frame changes (inset / window-box gate / letterbox), title cards, type-on titles
+# ==================================================================================================
+DEV_VERSION = 1
+DEV_W, DEV_H = 320, 180
+DEV_WINDOW_S = 60.0              # devices are measured in the opening minute (where intros live)
+
+
+def _box_from(mask, thr=0.25):
+    """(x0, y0, x1, y1) fractions of the region whose rows/columns are at least `thr` content."""
+    h, w = mask.shape
+    cols = mask.mean(axis=0)
+    rows = mask.mean(axis=1)
+    xs = np.where(cols > thr)[0]
+    ys = np.where(rows > thr)[0]
+    if not len(xs) or not len(ys):
+        return None
+    return (xs[0] / w, ys[0] / h, (xs[-1] + 1) / w, (ys[-1] + 1) / h)
+
+
+def device_features(rgb):
+    """Per-frame numbers the device detectors run on (rgb uint8, any size; ~320x180 is plenty)."""
+    a = rgb.astype(np.int16)
+    R, G, B = a[..., 0], a[..., 1], a[..., 2]
+    h, w = R.shape
+    luma = 0.2126 * R + 0.7152 * G + 0.0722 * B
+    out = {"luma": float(luma.mean())}
+    # frame box: content = differs from the flat outer ring
+    ring = np.concatenate([a[:2].reshape(-1, 3), a[-2:].reshape(-1, 3), a[:, :2].reshape(-1, 3), a[:, -2:].reshape(-1, 3)])
+    rc = np.median(ring, axis=0)
+    out["ring"] = [float(x) for x in rc]
+    out["ring_std"] = float(np.abs(ring - rc).max(axis=1).mean())
+    content = np.abs(a - rc).max(axis=2) > 20
+    box = _box_from(content) or (0.0, 0.0, 1.0, 1.0)
+    out["box"] = [round(float(x), 4) for x in box]
+    # an inner matte: inside the box, a second flat dark ring
+    x0, y0, x1, y1 = (int(round(box[0] * w)), int(round(box[1] * h)), int(round(box[2] * w)), int(round(box[3] * h)))
+    out["inner"] = None
+    if x1 - x0 > 20 and y1 - y0 > 20:
+        sub = a[y0 + 1:y1 - 1, x0 + 1:x1 - 1]
+        sr = np.concatenate([sub[:2].reshape(-1, 3), sub[-2:].reshape(-1, 3), sub[:, :2].reshape(-1, 3), sub[:, -2:].reshape(-1, 3)])
+        sc = np.median(sr, axis=0)
+        if sc.max() < 30 and np.abs(sr - sc).max(axis=1).mean() < 8 and np.abs(sc - rc).max() > 4:
+            ib = _box_from(np.abs(sub - sc).max(axis=2) > 20)
+            if ib and (ib[2] - ib[0] < 0.97 or ib[3] - ib[1] < 0.97):
+                bw, bh = (x1 - x0 - 2) / w, (y1 - y0 - 2) / h
+                out["inner"] = [round(float((x0 + 1) / w + ib[0] * bw), 4), round(float((y0 + 1) / h + ib[1] * bh), 4),
+                                round(float((x0 + 1) / w + ib[2] * bw), 4), round(float((y0 + 1) / h + ib[3] * bh), 4)]
+    # burn light
+    yy, xx = np.mgrid[0:h, 0:w]
+    red = (R > 170) & (G < 95) & (B < 95) & (R - G > 95)
+    org = (R > 200) & (G > 70) & (G < 240) & (B < 120) & (R - B > 110)
+    for k, m in (("red", red), ("orange", org)):
+        out[f"{k}_pct"] = float(m.mean())
+        out[f"{k}_c"] = [float(xx[m].mean() / w), float(yy[m].mean() / h)] if m.any() else None
+    # saturated "ink" (graphic text): high saturation, high value, yellow-ish hue
+    mx = a.max(axis=2)
+    mn = a.min(axis=2)
+    sat = (mx - mn) / np.maximum(mx, 1)
+    ink = (sat > 0.6) & (mx > 170) & (R > 150) & (G > 120) & (B < 110) & (np.abs(R - G) < 90)
+    out["ink_pct"] = float(ink.mean())
+    if ink.sum() > 6:
+        ys, xs = np.where(ink)
+        out["ink_box"] = [float(np.percentile(xs, 1) / w), float(np.percentile(ys, 1) / h),
+                          float((np.percentile(xs, 99) + 1) / w), float((np.percentile(ys, 99) + 1) / h)]
+        px = a[ink]
+        top = px[px.max(axis=1) >= np.percentile(px.max(axis=1), 50)]      # the solid fill, not the edges
+        out["ink_rgb"] = [float(x) for x in np.median(top, axis=0)]
+        out["bg_luma"] = float(luma[~ink].mean())
+    else:
+        out["ink_box"], out["ink_rgb"], out["bg_luma"] = None, None, out["luma"]
+    return out
+
+
+def _hex(rgb):
+    return "#" + "".join(f"{int(round(max(0, min(255, v)))):02X}" for v in rgb)
+
+
+def _frame_kind(f):
+    """full | inset | gate | letterbox for one frame's features."""
+    x0, y0, x1, y1 = f["box"]
+    w, h = x1 - x0, y1 - y0
+    flat = f["ring_std"] < 7 and max(f["ring"]) < 50
+    if not flat or (w > 0.985 and h > 0.985):
+        return "full"
+    if w > 0.985 and h < 0.95:
+        return "letterbox"
+    if w > 0.9 and h > 0.82 and x0 > 0.003 and y0 > 0.01:
+        return "gate"
+    tinted = f["ring"][0] - f["ring"][2] >= 6          # the gate's maroon-black, not a pure black surround
+    if tinted and (w < 0.985 or h < 0.985):
+        return "gate_inner"                              # a matte / letterbox nested inside the gate
+    if w < 0.92 and h < 0.92 and 0.04 < x0 and 0.04 < y0:
+        return "inset"
+    return "full"
+
+
+def detect_devices(feats, fps, cuts=None):
+    """Device events from per-frame features: {"version", "card", "burns", "frames", "titles"}."""
+    n = len(feats)
+    out = {"version": DEV_VERSION, "fps": fps, "frames_scanned": n, "card": None, "burns": [], "frames": [], "titles": []}
+    if not n:
+        return out
+    # ---- title card at the very start: dark textured background, one centred saturated text block
+    k = 0
+    while k < n:
+        f = feats[k]
+        ib = f.get("ink_box")
+        if not (ib and 0.004 < f["ink_pct"] < 0.25 and f["bg_luma"] < 35 and abs((ib[0] + ib[2]) / 2 - 0.5) < 0.1
+                and abs((ib[1] + ib[3]) / 2 - 0.5) < 0.15):
+            break
+        k += 1
+    if k >= 8:
+        widths = [feats[i]["ink_box"][2] - feats[i]["ink_box"][0] for i in range(k)]
+        wf = float(np.median(widths[-max(3, k // 3):]))
+        settle = next((i for i, w_ in enumerate(widths) if w_ >= 0.99 * wf), 0)
+        box = [float(np.median([feats[i]["ink_box"][j] for i in range(k - max(3, k // 3), k)])) for j in range(4)]
+        out["card"] = {"f0": 0, "f1": k, "t0": 0.0, "t1": round(k / fps, 4), "box": [round(v, 4) for v in box],
+                       "size": round(box[3] - box[1], 4), "width": round(box[2] - box[0], 4),
+                       "color": _hex(np.median([feats[i]["ink_rgb"] for i in range(k)], axis=0)),
+                       "scale_from": round(widths[0] / wf, 3) if wf else 1.0, "scale_frames": int(settle),
+                       "bg_luma": round(float(np.median([feats[i]["bg_luma"] for i in range(k)])), 1), "text": None}
+    card_end = out["card"]["f1"] if out["card"] else 0
+    if out["card"] and card_end < n - 1:
+        # the card leaves on a soft burn: its last frame warms and brightens (a dim red glow lower left)
+        cl = float(np.median([feats[i]["luma"] for i in range(max(0, card_end - 6), card_end - 1)]))
+        last = feats[card_end - 1]
+        if last["luma"] > cl + 6:
+            out["burns"].append({"frame": card_end, "t": round(card_end / fps, 4), "frames": 2, "side": "right",
+                                 "soft": True, "out": {"red_pct": round(last["red_pct"], 3), "centroid": None},
+                                 "in": {"orange_pct": round(feats[card_end]["orange_pct"], 3), "centroid": None},
+                                 "peak_luma": round(last["luma"], 1), "base_luma": round(cl, 1),
+                                 "luma_jump": round(last["luma"] - cl, 1)})
+    # ---- burns: a red glow on the last outgoing frame and/or an orange disc on the first incoming frame
+    red = np.array([f["red_pct"] for f in feats])
+    org = np.array([f["orange_pct"] for f in feats])
+    lum = np.array([f["luma"] for f in feats])
+    cutset = set(int(c) for c in (cuts or []))
+    i = max(2, card_end - 2)
+    while i < n - 2:
+        a_ok = red[i - 1] > 0.035 and red[i - 1] > 3 * max(red[i - 2], 0.004)
+        b_ok = org[i] > 0.10 and org[i] > 3 * max(org[i + 1], 0.01) and org[i] > 3 * max(org[i - 2], 0.01)
+        ca = feats[i - 1].get("red_c")
+        cb = feats[i].get("orange_c")
+        if (a_ok and b_ok) or (b_ok and (i in cutset or i - 1 in cutset)) or (a_ok and org[i] > 0.05):
+            base = float(np.mean([lum[max(0, i - 3)], lum[min(n - 1, i + 2)]]))
+            out["burns"].append({"frame": i, "t": round(i / fps, 4), "frames": 2,
+                                 "side": "right" if (cb or [0.8])[0] >= 0.5 else "left",
+                                 "out": {"red_pct": round(float(red[i - 1]), 3), "centroid": [round(v, 3) for v in ca] if ca else None},
+                                 "in": {"orange_pct": round(float(org[i]), 3), "centroid": [round(v, 3) for v in cb] if cb else None},
+                                 "peak_luma": round(float(max(lum[i - 1], lum[i])), 1), "base_luma": round(base, 1),
+                                 "luma_jump": round(float(max(lum[i - 1], lum[i]) - base), 1)})
+            i += 3
+            continue
+        i += 1
+    burn_frames = {b["frame"] + d for b in out["burns"] for d in (-1, 0)}
+    # ---- frame runs (inset / gate / letterbox)
+    kinds = [("card" if i < card_end else ("burn" if i in burn_frames else _frame_kind(f))) for i, f in enumerate(feats)]
+    runs, s = [], 0
+    for i in range(1, n + 1):
+        if i == n or kinds[i] != kinds[s]:
+            runs.append((s, i, kinds[s]))
+            s = i
+    last_gate = None
+    for f0, f1, kd in runs:
+        if kd == "gate":
+            last_gate = [float(v) for v in np.median(np.array([feats[i]["box"] for i in range(f0, f1)]), axis=0)]
+        if kd in ("full", "card", "burn") or f1 - f0 < 2:
+            continue
+        if kd == "gate_inner":
+            boxes = np.array([feats[i]["box"] for i in range(f0, f1)])
+            r = {"f0": f0, "f1": f1, "t0": round(f0 / fps, 4), "t1": round(f1 / fps, 4), "kind": "gate",
+                 "box": [round(v, 4) for v in (last_gate or [0.013, 0.042, 0.986, 0.948])],
+                 "color": _hex(np.median([feats[i]["ring"] for i in range(f0, f1)], axis=0)),
+                 "inner": {"box": [round(float(v), 4) for v in np.median(boxes, axis=0)], "color": "#000000"}}
+            out["frames"].append(r)
+            continue
+        boxes = np.array([feats[i]["box"] for i in range(f0, f1)])
+        inners = [feats[i]["inner"] for i in range(f0, f1) if feats[i].get("inner")]
+        r = {"f0": f0, "f1": f1, "t0": round(f0 / fps, 4), "t1": round(f1 / fps, 4), "kind": kd,
+             "box": [round(float(v), 4) for v in np.median(boxes, axis=0)],
+             "color": _hex(np.median([feats[i]["ring"] for i in range(f0, f1)], axis=0))}
+        if len(inners) > (f1 - f0) / 2:
+            r["inner"] = {"box": [round(float(v), 4) for v in np.median(np.array(inners), axis=0)], "color": "#000000"}
+        prev = out["frames"][-1] if out["frames"] else None
+        if prev and prev["kind"] == kd and f0 - prev["f1"] <= 3 and np.abs(np.array(prev["box"]) - np.array(r["box"])).max() < 0.02:
+            prev["f1"], prev["t1"] = f1, r["t1"]          # a burn or a 1-frame blip inside one framed run
+        else:
+            out["frames"].append(r)
+    # ---- type-on titles: a centred saturated text block whose right edge grows frame by frame
+    i = card_end
+    while i < n:
+        f = feats[i]
+        ib = f.get("ink_box")
+        if not (ib and f["ink_pct"] > 0.0006 and 0.02 < ib[3] - ib[1] < 0.2 and kinds[i] != "burn"):
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and feats[j + 1].get("ink_box") and feats[j + 1]["ink_pct"] > 0.0005 and kinds[j + 1] != "burn":
+            j += 1
+        if j - i + 1 >= 8:
+            rights = [feats[x]["ink_box"][2] for x in range(i, j + 1)]
+            lefts = [feats[x]["ink_box"][0] for x in range(i, j + 1)]
+            final = float(np.median(rights[-5:]))
+            settle = next((x for x, r_ in enumerate(rights) if r_ >= final - 0.01), 0)
+            box = [float(np.median([feats[x]["ink_box"][q] for x in range(j - 4, j + 1)])) for q in range(4)]
+            cx = (box[0] + box[2]) / 2
+            grew = settle >= 2 and rights[0] < final - 0.05 and np.ptp(lefts[:settle + 5]) < 0.03
+            if abs(cx - 0.5) < 0.15:
+                shot0 = max([c for c in (cuts or []) if c <= i] or [0])
+                hgt = box[3] - box[1]
+                est_chars = max(1, int(round((box[2] - box[0]) * 16 / 9 / max(1e-3, hgt * 0.42))))
+                t = {"f0": i, "f1": j + 1, "t0": round(i / fps, 4), "t1": round((j + 1) / fps, 4),
+                     "box": [round(v, 4) for v in box], "size": round(hgt * 1.25, 4),
+                     "color": _hex(np.median([feats[x]["ink_rgb"] for x in range(i, j + 1)], axis=0)), "text": None,
+                     "est_chars": est_chars}
+                if grew:
+                    t["type_on"] = {"f0": i, "f1": i + settle + 1, "dur_s": round((settle + 1) / fps, 3),
+                                    "start_s": round((i - shot0) / fps, 3),
+                                    "char_s": round((settle + 1) / fps / est_chars, 4)}
+                out["titles"].append(t)
+        i = j + 1
+    return out
+
+
+def scan_devices(cfg, video, fps, window_s=None, prog=None, label="devices"):
+    """Decode `video` at 320x180 and compute device features for every frame (first `window_s` s only)."""
+    gov = governor.for_cfg(cfg)
+    cmd = _nice_prefix(gov) + [cfg.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error"]
+    if window_s:
+        cmd += ["-t", f"{float(window_s):.3f}"]
+    cmd += ["-i", str(video), "-map", "0:v:0", "-an", "-vf", f"scale={DEV_W}:{DEV_H}:flags=area", "-fps_mode",
+            "passthrough", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+    fs = DEV_W * DEV_H * 3
+    feats = []
+    with gov.slot("heavy", label=f"ref {label}"):
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=fs * 4)
+        try:
+            while True:
+                buf = proc.stdout.read(fs)
+                if len(buf) < fs:
+                    break
+                feats.append(device_features(np.frombuffer(buf, np.uint8).reshape(DEV_H, DEV_W, 3)))
+                if prog and len(feats) % 500 == 0:
+                    prog(min(0.99, len(feats) / max(1.0, (window_s or 600) * fps)), f"{len(feats)} frames")
+        finally:
+            proc.stdout.close()
+            proc.wait()
+    return feats
+
+
+def _ocr_card(cfg, video, t, box):
+    """Read a card's / title's text with tesseract when it is installed (None otherwise)."""
+    exe = shutil.which("tesseract")
+    if not exe:
+        return None
+    import cv2
+    with tempfile.TemporaryDirectory(prefix="cutroom-ocr-") as td:
+        p = Path(td) / "f.png"
+        try:
+            media.ffmpeg(cfg, ["-ss", f"{max(0.0, t):.3f}", "-i", str(video), "-frames:v", "1", str(p)])
+            img = cv2.imread(str(p))
+            h, w = img.shape[:2]
+            x0, y0, x1, y1 = box
+            crop = img[max(0, int((y0 - 0.03) * h)):int((y1 + 0.03) * h), max(0, int((x0 - 0.03) * w)):int((x1 + 0.03) * w)]
+            g = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)[..., 1]
+            _, bw = cv2.threshold(g, 120, 255, cv2.THRESH_BINARY_INV)
+            cv2.imwrite(str(p), bw)
+            r = subprocess.run([exe, str(p), "-", "--psm", "7"], capture_output=True, text=True, timeout=30)
+            txt = re.sub(r"[^A-Za-z0-9 ,.'!?&-]", "", r.stdout or "").strip()
+            return txt or None
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def devices_for(cfg, video, fps, cuts=None, window_s=None, work=None, label="devices"):
+    """Detect the devices of `video` (cached in work/devices.json when `work` is given)."""
+    if work:
+        cached = _jload(Path(work) / "devices.json")
+        if cached and cached.get("version") == DEV_VERSION and cached.get("window_s") == window_s:
+            return cached
+    feats = scan_devices(cfg, video, fps, window_s, label=label)
+    dev = detect_devices(feats, fps, cuts)
+    dev["window_s"] = window_s
+    if dev.get("card"):
+        dev["card"]["text"] = _ocr_card(cfg, video, max(0.0, dev["card"]["t1"] - 0.1), dev["card"]["box"])
+    for t in dev.get("titles") or []:
+        t["text"] = _ocr_card(cfg, video, t["t1"] - 0.1, t["box"])
+        if t["text"] and t.get("type_on"):
+            nch = max(1, len(t["text"].replace(" ", "")))
+            t["type_on"]["char_s"] = round(t["type_on"]["dur_s"] / nch, 4)
+    if work:
+        _jsave(Path(work) / "devices.json", dev)
+    return dev
+
+
+def ensure_devices(cfg, rid, window_s=DEV_WINDOW_S):
+    """Add device detection to an analysed reference (no re-analysis): writes analysis["devices"] and
+    tags every cut-map shot with the devices on it. Returns the updated analysis."""
+    rid = resolve_id(cfg, rid)
+    d = ref_dir(cfg, rid)
+    an = load_analysis(cfg, rid)
+    if (an.get("devices") or {}).get("version") == DEV_VERSION:
+        return an
+    video = d / "proxy.mp4"
+    if not video.exists():
+        video = source_path(cfg, rid)
+    fps = float(an["source"]["fps"])
+    cuts = [int(s["f0"]) for s in an["shots"][1:]]
+    dev = devices_for(cfg, video, fps, cuts, window_s, work=d / "work", label=f"devices {rid}")
+    an["devices"] = dev
+    _tag_shots(an)
+    _jsave(d / "analysis.json", an)
+    return an
+
+
+def _tag_shots(an):
+    dev = an.get("devices") or {}
+    for s in an.get("shots", []):
+        tags = []
+        c = dev.get("card")
+        if c and s["f0"] < c["f1"] and s["f1"] > c["f0"]:
+            tags.append("card")
+        for b in dev.get("burns") or []:
+            if s["f0"] - 1 <= b["frame"] <= s["f1"]:
+                tags.append("burn")
+        for r in dev.get("frames") or []:
+            if min(s["f1"], r["f1"]) - max(s["f0"], r["f0"]) > (s["f1"] - s["f0"]) / 2:
+                tags.append(r["kind"])
+        for t in dev.get("titles") or []:
+            if s["f0"] < t["f1"] and s["f1"] > t["f0"]:
+                tags.append("typed_title" if t.get("type_on") else "title")
+        s["devices"] = sorted(set(tags))
+
+
+def device_kinds(an):
+    """The device kinds a reference measurably uses (rule 38: only these may be rebuilt)."""
+    dev = an.get("devices") or {}
+    k = []
+    if dev.get("card"):
+        k.append("card")
+    if dev.get("burns"):
+        k.append("burn")
+    k += [r["kind"] for r in dev.get("frames") or []]
+    k += ["typed_title" if t.get("type_on") else "title" for t in dev.get("titles") or []]
+    return sorted(set(k))

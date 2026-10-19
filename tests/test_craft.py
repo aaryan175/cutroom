@@ -80,7 +80,8 @@ def craft_plan(lib):
     return {
         "title": "Craft", "version": 1,
         "style": {"captions": {"position": "bottom"}, "voice": {"clean": False}, "loudness": {"I": -14, "TP": -1.5}},
-        "cold_open": {"dur": 5.0, "lines": [{"from": "talk/1"}], "shots": "auto", "asl": 0.45},
+        "cold_open": {"dur": 5.0, "lines": [{"from": "talk/1"}], "shots": "auto", "asl": 0.45, "face_s": 0.8,
+                      "end_flash": True},       # the classic teaser (lines cut away; white flash out), opted in
         "sections": [
             {"name": "open", "music": {"song": str(lib["song"]), "offset": 2.0, "gain_db": -12},
              "segments": [
@@ -311,7 +312,8 @@ def test_cold_open_from_reference(cproj):
         "shots": [{"i": i, "start": t, "dur": 0.2} for i, t in enumerate(starts)],
         "structure": {"time_to_first_word_s": 1.43}}))
     plan = json.loads(cproj["plan"].read_text())
-    plan["cold_open"] = {"from_reference": "refteaser", "lines": [{"from": "talk/1"}], "shots": "auto"}
+    plan["cold_open"] = {"from_reference": "refteaser", "lines": [{"from": "talk/1"}], "shots": "auto",
+                         "face_s": 0.8}         # cut away under the line, so every reference cut has a picture change
     res = render.resolve_timeline(cfg, cproj["con"], plan)
     gen = sorted({p["start"] for p in res["pieces"] if p.get("generated") == "cold_open" and p["track"] in ("V1", "V2")})
     end = max(p["end"] for p in res["pieces"] if p.get("generated") == "cold_open")
@@ -515,7 +517,8 @@ def test_pacing(cproj):
 
 def test_plan_validation_of_craft_fields():
     from cutroom import plan as P
-    bad = {"sections": [{"name": "a", "transition": {"kind": "burn"}, "music": {"song": "x", "start": "slow"},
+    # "burn" is the reference's device and valid; a home-made "leak" is not a kind
+    bad = {"sections": [{"name": "a", "transition": {"kind": "leak"}, "music": {"song": "x", "start": "slow"},
                          "pace": {"asl": 0.01},
                          "segments": [{"type": "talk", "clip": "c", "in": 0, "out": 2, "lead_in": 5, "ramp": {"to": 2}},
                                       {"type": "broll", "clip": "c", "in": 0, "out": 2, "push": {"to": 1.5}, "conform": "x"}]}],

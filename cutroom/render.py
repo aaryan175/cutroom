@@ -52,6 +52,7 @@ import numpy as np
 
 from . import captions as CAP
 from . import db
+from . import governor
 from . import media
 from . import overlays as OV
 from . import plan as P
@@ -155,6 +156,9 @@ class Ctx:
         return str(link)
 
     # -- sources ---------------------------------------------------------------------------
+    def song(self, ref):
+        return song(self, ref)
+
     def clip(self, ref):
         r = db.get_clip(self.con, ref)
         return dict(r)
@@ -469,7 +473,7 @@ def expand(ctx, sections):
     for si, sec in sections:
         s_start = tl.t
         mus = sec.get("music") or {}
-        sng = song(ctx, mus["song"]) if mus.get("song") else None
+        sng = ctx.song(mus["song"]) if mus.get("song") else None
         off = float(mus.get("offset", 0.0) or 0.0)
         beats = np.asarray(sng["beats"], float) if sng else np.asarray([])
 
@@ -1001,6 +1005,19 @@ def _atom_err(at, e):
                         f"{' ' + at['clip']['rel'] if at.get('clip') else ''} @ {at['a']:.2f}) failed:\n{e}")
 
 
+def _encode_atom(ctx, at, args, script, enc, tmp, budget):
+    # stall guard: generous per-second budget, one retry (ffmpeg's scheduler can wedge on rare graphs)
+    for attempt in (1, 2):
+        try:
+            media.ffmpeg(ctx.cfg, args + ["-filter_complex_script", script, "-map", "[v]", *enc, "-f", "mov", tmp],
+                         timeout=budget)
+            return
+        except subprocess.TimeoutExpired:
+            if attempt == 2:
+                raise _atom_err(at, f"ffmpeg stalled twice (> {budget:.0f}s)") from None
+            ctx.warn(f"atom {at['i']}: ffmpeg stalled after {budget:.0f}s; retrying once")
+
+
 def render_atom(ctx, at, gfx):
     """Render (or reuse) an atom's picture (.mov, video only) and audio (.wav). Returns (mov, wav|None)."""
     segdir = ctx.cache / "segs"
@@ -1016,18 +1033,12 @@ def render_atom(ctx, at, gfx):
         tmp = segdir / f".{key}.tmp.mov"
         script = segdir / f".{key}.fc"
         script.write_text(";\n".join(fc))
-        # stall guard: generous per-second budget, one retry (ffmpeg's scheduler can wedge on rare graphs)
         budget = max(180.0, at["n"] / ctx.fps * (25 if ctx.preview else 90))
+        gov = governor.for_cfg(ctx.cfg)
         try:
-            for attempt in (1, 2):
-                try:
-                    media.ffmpeg(ctx.cfg, args + ["-filter_complex_script", script, "-map", "[v]", *enc, "-f", "mov", tmp],
-                                 timeout=budget)
-                    break
-                except subprocess.TimeoutExpired:
-                    if attempt == 2:
-                        raise _atom_err(at, f"ffmpeg stalled twice (> {budget:.0f}s)") from None
-                    ctx.warn(f"atom {at['i']}: ffmpeg stalled after {budget:.0f}s; retrying once")
+            with gov.slot("heavy", label=f"render atom {at['i']}"):
+                gov.wait_for_disk(segdir)
+                _encode_atom(ctx, at, args, script, enc, tmp, budget)
         except media.FFError as e:
             raise _atom_err(at, e) from None
         finally:
@@ -1247,8 +1258,11 @@ def render_plan(cfg, con, plan_path, preview=False, out=None, only=None):
         t_r = time.time()
         futs = [pool.submit(render_atom, ctx, at, gfx) for at in tl.atoms]
         parts = []
+        progress = bool(os.environ.get("CUTROOM_PROGRESS"))      # machine-readable lines for the studio
         for at, f in zip(tl.atoms, futs):
             parts.append(f.result())
+            if progress:
+                print(f"  progress {len(parts)}/{len(futs)}", flush=True)
         hits = sum(1 for at in tl.atoms if at.get("cached"))
         print(f"  segments: {len(parts)} ({hits} cached) in {time.time() - t_r:.1f}s", flush=True)
 
@@ -1300,10 +1314,14 @@ def render_plan(cfg, con, plan_path, preview=False, out=None, only=None):
     venc = (["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"] if preview else
             ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-profile:v", "high"])
     tmp_out = out.with_name(f".{out.stem}.tmp.mp4")
-    media.ffmpeg(cfg, ["-f", "concat", "-safe", "0", "-i", lst, "-i", norm_wav, "-map", "0:v", "-map", "1:a",
-                       *venc, "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709",
-                       "-colorspace", "bt709", "-color_range", "tv", "-r", f"{ctx.fps:g}",
-                       "-c:a", "aac", "-b:a", "192k", "-ar", str(SR), "-movflags", "+faststart", tmp_out], timeout=7200)
+    gov = governor.for_cfg(cfg)
+    with gov.slot("heavy", label=f"render final {name}"):
+        gov.wait_for_disk(out.parent)
+        media.ffmpeg(cfg, ["-f", "concat", "-safe", "0", "-i", lst, "-i", norm_wav, "-map", "0:v", "-map", "1:a",
+                           *venc, "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709",
+                           "-colorspace", "bt709", "-color_range", "tv", "-r", f"{ctx.fps:g}",
+                           "-c:a", "aac", "-b:a", "192k", "-ar", str(SR), "-movflags", "+faststart", tmp_out],
+                     timeout=7200)
     loud = _ebur128(cfg, tmp_out)
     if loud["TP"] is not None and loud["TP"] > target["TP"]:
         fix = target["TP"] - loud["TP"] - 0.1
@@ -1362,3 +1380,333 @@ def sidecar(ctx, plan, plan_path, tl, segs, secs, specs, gfx, sfx, total_f, loud
             "segments": rows, "sfx": sfx,
             "loudness": {"target": target, "measured_before": measured, "final": loud},
             "warnings": ctx.warnings}
+
+
+# ============================================================================== resolve (no encoding)
+# The studio's timeline view. Same expansion as render_plan (Ctx -> expand -> apply_layers), so piece
+# times are exactly what a render produces, but nothing is encoded or probed: tightening uses the
+# transcripts, beats come from the song index, clip lookups are cached.
+_RESOLVE_CACHE = {}
+_RESOLVE_LOCK = threading.Lock()
+_RESOLVE_MAX = 48
+_CLIP_CACHE = {}                         # (db path, ref) -> (time, row dict); 30 s TTL
+_CLIP_TTL = 30.0
+
+
+def _cached_clip(cfg, con, ref):
+    key = (str(cfg.db_path), str(ref))
+    hit = _CLIP_CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[0] < _CLIP_TTL:
+        return dict(hit[1])
+    row = dict(db.get_clip(con, ref))
+    if len(_CLIP_CACHE) > 20000:
+        _CLIP_CACHE.clear()
+    _CLIP_CACHE[key] = (now, row)
+    return dict(row)
+
+
+class _ResolveCtx(Ctx):
+    """A Ctx that never touches ffmpeg: no LUT copy, no font search, no probes, quiet warnings."""
+
+    def __init__(self, cfg, con, plan, preview):           # noqa: super().__init__ deliberately skipped
+        self.cfg, self.con, self.plan, self.preview = cfg, con, plan, preview
+        o = plan["output"]
+        self.fps = float(o["fps"])
+        if preview:
+            self.H = int(cfg.preview_height)
+            self.W = int(round(o["width"] * self.H / o["height"] / 2)) * 2
+        else:
+            self.W, self.H = int(o["width"]), int(o["height"])
+        self.s = self.H / 1080.0
+        self.style = plan["style"]
+        self.cache = cfg.p("cache", "render")
+        self.warnings, self._warned = [], set()
+        self.lock = threading.Lock()
+        self._info, self._pregraded = {}, {}
+        self.font_pi, self.lut = (None, None), ""
+        self.deps = {}                                   # files whose change invalidates the result
+        self._songs = {}
+
+    def warn(self, msg, once_key=None):
+        k = once_key or msg
+        if k not in self._warned:
+            self._warned.add(k)
+            self.warnings.append(msg)
+
+    def clip(self, ref):
+        row = _cached_clip(self.cfg, self.con, ref)
+        tp = self.cfg.p("transcripts", f"{row['id']}.json")
+        self.deps[str(tp)] = _mtime(tp)
+        return row
+
+    def source(self, row):
+        if self.preview and row.get("proxy"):
+            return row["proxy"]
+        return row["path"]
+
+    def song(self, ref):
+        if ref in self._songs:
+            return self._songs[ref]
+        from . import music
+        try:
+            d = music.song_info(self.cfg, self.con, ref)
+        except KeyError:
+            p = Path(os.path.expanduser(str(ref)))
+            if not p.is_absolute():
+                p = Path(self.cfg.work) / p
+            if not p.exists():
+                raise
+            jp = self.cfg.p("cache", "beats", f"{_sha(_file_id(p))}.json")
+            self.deps[str(jp)] = _mtime(jp)
+            if jp.exists():
+                d = {"path": str(p), "title": p.stem, **json.loads(jp.read_text())}
+            else:                       # never run beat analysis here: that is seconds of librosa
+                self.warn(f"song {ref} is not indexed (cutroom songs index); beats unknown until a render")
+                d = {"path": str(p), "title": p.stem, "beats": [], "downbeats": [], "drops": [], "tempo": 0}
+        self._songs[ref] = d
+        return d
+
+
+def _mtime(p):
+    try:
+        return os.stat(p).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _seg_label(seg):
+    t = seg.get("type")
+    if t == "title":
+        return seg.get("text", "title")
+    if t == "black":
+        return "black"
+    ref = seg.get("clip") or (seg.get("a") or {}).get("clip") or ""
+    return f"{t} {Path(str(ref)).stem}".strip()
+
+
+def _invalid_placeholder(seg, err):
+    est = P.estimate_duration({"sections": [{"segments": [seg]}]}) if seg.get("type") in P.SEG_TYPES else 1.0
+    try:
+        est = float(est)
+    except Exception:  # noqa: BLE001
+        est = 1.0
+    return {"type": "black", "dur": max(0.04, min(est if est > 0 else 1.0, 600.0)), "_invalid": str(err)}
+
+
+def _expand_safe(ctx, plan):
+    """expand + apply_layers; segments that cannot be expanded (missing clip, bad times) become
+    placeholders of their estimated length so the rest of the timeline still resolves."""
+    sections = list(enumerate(plan["sections"]))
+    try:
+        tl, segs, secs = expand(ctx, sections)
+        specs, sfx = apply_layers(ctx, tl, segs)
+        return tl, segs, secs, specs, sfx
+    except Exception:  # noqa: BLE001  - find the culprits one segment at a time
+        pass
+    fixed = json.loads(json.dumps(plan))
+    for si, sec in enumerate(fixed["sections"]):
+        mus = sec.get("music") or {}
+        if mus.get("song"):
+            try:
+                ctx.song(mus["song"])
+            except Exception as e:  # noqa: BLE001
+                ctx.warn(f"section {si} music: {e}")
+                sec["music"] = None
+        for gi, seg in enumerate(sec.get("segments", [])):
+            probe = {**sec, "music": sec.get("music"), "segments": [seg]}
+            try:
+                t2, s2, _ = expand(ctx, [(si, probe)])
+                apply_layers(ctx, t2, s2)
+            except Exception as e:  # noqa: BLE001
+                ctx.warn(f"section {si} segment {gi}: {type(e).__name__}: {e}")
+                sec["segments"][gi] = _invalid_placeholder(seg, e)
+    sections = list(enumerate(fixed["sections"]))
+    tl, segs, secs = expand(ctx, sections)
+    specs, sfx = apply_layers(ctx, tl, segs)
+    return tl, segs, secs, specs, sfx
+
+
+def resolve_timeline(cfg, con, plan_dict, preview=True):
+    """Resolve a plan into timeline pieces without encoding anything.
+
+    Returns {pieces, segments, sections, beats, duration, fps, warnings}. Pieces:
+      {id, sec, seg, sub, type, kind, track, start, end, clip, clip_rel, in, out, speed, label,
+       captions:[{t0, t1, text}], overlays:[{kind, text, t0, t1, position}]}   (times are timeline seconds,
+    in/out are source seconds). Tracks: V1 main picture, V2 cutaways, V3 overlays, A1 dialogue/natural,
+    A2 music. `segments` has one row per plan segment with its timeline span (and src_map for talk).
+    Results are cached by plan hash + the transcripts/beat files they used; treat them as read-only."""
+    plan = P.normalize(plan_dict, cfg)
+    key = _sha([plan, bool(preview), str(cfg.work)], 24)
+    with _RESOLVE_LOCK:
+        hit = _RESOLVE_CACHE.get(key)
+    if hit and all(_mtime(p) == m for p, m in hit["deps"].items()):
+        return hit["res"]
+    ctx = _ResolveCtx(cfg, con, plan, preview)
+    fps = ctx.fps
+    tl, segs, secs, specs, sfx = _expand_safe(ctx, plan)
+    from . import asr
+    cs = ctx.style["captions"]
+    fixes = [tuple(f) for f in cs.get("fixes", []) or []]
+    pieces = []
+    sub_of = {}
+    by_seg = {(r["sec"], r["seg"]): r for r in segs}
+    # piece ids hash the segment's content (+ occurrence), so a selection survives moves and edits elsewhere
+    seg_key, seen_keys = {}, {}
+    for r in segs:
+        h = _sha({k: v for k, v in r["spec"].items() if k != "_invalid"}, 8)
+        n = seen_keys.get(h, 0)
+        seen_keys[h] = n + 1
+        seg_key[(r["sec"], r["seg"])] = h if n == 0 else f"{h}-{n}"
+    for at in tl.atoms:
+        t0, t1 = at["f0"] / fps, at["f1"] / fps
+        k = (at["sec"], at["seg"])
+        sub = sub_of.get(k, 0)
+        sub_of[k] = sub + 1
+        spec = by_seg[k]["spec"]
+        row = at.get("clip")
+        p = {"id": f"V1:{seg_key[k]}.{sub}", "sec": at["sec"], "seg": at["seg"], "sub": sub,
+             "type": at["type"], "kind": at["kind"], "track": "V1", "start": round(t0, 4), "end": round(t1, 4),
+             "clip": row["id"] if row else None, "clip_rel": row["rel"] if row else None,
+             "in": round(at["a"], 4) if row else None,
+             "out": round(at["a"] + at["n"] / fps * at["speed"], 4) if row else None,
+             "speed": round(float(at["speed"] or 1.0), 4), "label": _seg_label(spec), "captions": [], "overlays": []}
+        if spec.get("_invalid"):
+            p.update(kind="invalid", label=f"invalid: {spec['_invalid']}"[:160])
+        if at["kind"] == "title":
+            p["label"] = at["title"]["text"]
+            p["title"] = at["title"]
+        if at["kind"] == "still":
+            p["out"] = p["in"]
+        if at.get("cue_src") and cs.get("enabled", True):
+            cid, a, b = at["cue_src"]
+            dur = at["n"] / fps
+            for c0, c1, text in asr.cues(asr.words(cfg, cid), a, b, max_words=int(cs.get("max_words", 5)),
+                                         max_chars=int(cs.get("max_chars", 30)), fixes=fixes):
+                c1 = min(c1, dur)
+                if c1 - c0 >= 0.1:
+                    p["captions"].append({"t0": round(t0 + c0, 3), "t1": round(t0 + c1, 3), "text": text})
+        for o in at["overlays"]:
+            sp = specs[o["spec"]]
+            p["overlays"].append({"kind": sp["kind"], "text": sp["text"], "sub": sp.get("sub", ""),
+                                  "position": sp["position"], "t0": round(t0 + o["t0"], 3), "t1": round(t0 + o["t1"], 3)})
+        pieces.append(p)
+        # A1: the sound that plays under this atom (dialogue, natural or mixed camera audio)
+        au = at["audio"]
+        arow = au.get("clip")
+        if au["mode"] != "none" and arow and arow.get("has_audio"):
+            asp = float(au.get("speed", 1.0) or 1.0)
+            pieces.append({"id": f"A1:{seg_key[k]}.{sub}", "sec": at["sec"], "seg": at["seg"], "sub": sub,
+                           "type": at["type"], "kind": au["mode"], "track": "A1", "start": round(t0, 4),
+                           "end": round(t1, 4), "clip": arow["id"], "clip_rel": arow["rel"], "in": round(au["a"], 4),
+                           "out": round(au["a"] + at["n"] / fps * asp, 4), "speed": round(asp, 4),
+                           "label": Path(arow["rel"] or "").stem, "captions": [], "overlays": []})
+    # V2: cutaways, merged back into one piece per cutaway where the atoms split it
+    v2 = []
+    for at in tl.atoms:
+        T = at["f0"] / fps
+        for c in at["cutaways"]:
+            s0, s1 = T + c["t0"], T + c["t1"]
+            last = v2[-1] if v2 else None
+            if (last and last["clip"] == c["clip"]["id"] and abs(last["end"] - s0) < 1.5 / fps
+                    and abs(last["out"] - c["a"]) < 1.5 / fps and last["seg"] == at["seg"] and last["sec"] == at["sec"]):
+                last["end"] = round(s1, 4)
+                last["out"] = round(c["a"] + (c["t1"] - c["t0"]), 4)
+                continue
+            v2.append({"id": "", "sec": at["sec"], "seg": at["seg"], "sub": 0, "type": "cutaway",
+                       "kind": "auto_cover" if c["auto"] else "cutaway", "track": "V2", "start": round(s0, 4),
+                       "end": round(s1, 4), "clip": c["clip"]["id"], "clip_rel": c["clip"]["rel"],
+                       "in": round(c["a"], 4), "out": round(c["a"] + (c["t1"] - c["t0"]), 4), "speed": 1.0,
+                       "label": Path(c["clip"]["rel"] or "").stem, "captions": [], "overlays": [], "auto": c["auto"]})
+    count = {}
+    for p in v2:
+        k = (p["sec"], p["seg"])
+        p["sub"] = count.get(k, 0)
+        count[k] = p["sub"] + 1
+        p["id"] = f"V2:{seg_key[k]}.{p['sub']}"
+    pieces += v2
+    # V3: one piece per overlay graphic (title cards stay on V1 as kind "title")
+    count = {}
+    for sp in specs:
+        at = tl.atoms[sp["first_atom"]]
+        k = (at["sec"], at["seg"])
+        n = count.get(k, 0)
+        count[k] = n + 1
+        pieces.append({"id": f"V3:{seg_key[k]}.{n}", "sec": k[0], "seg": k[1], "sub": n, "type": "overlay",
+                       "kind": sp["kind"], "track": "V3", "start": round(sp["t0"], 4), "end": round(sp["t1"], 4),
+                       "clip": None, "clip_rel": None, "in": None, "out": None, "speed": 1.0,
+                       "label": sp["text"], "text": sp["text"], "sub_text": sp.get("sub", ""),
+                       "position": sp["position"], "captions": [], "overlays": []})
+    # A2 + section bands
+    sections, beats_all = [], []
+    for s in secs:
+        m = s["music"]
+        band = {"i": s["index"], "index": s["index"], "name": s["name"], "start": round(s["start"], 4),
+                "end": round(s["end"], 4), "music": None, "beats": []}
+        if m:
+            bs = [round(b, 4) for b in s["beats_tl"] if s["start"] - 1e-6 <= b <= s["end"] + 1e-6]
+            sng = ctx._songs.get((plan["sections"][s["index"]].get("music") or {}).get("song"), {})
+            band["music"] = {"song": sng.get("id") or m["song"], "path": m["song"], "title": m.get("title"),
+                             "offset": m["offset"], "gain_db": m["gain_db"], "mode": m["mode"],
+                             "beats_in_section": bs}
+            band["beats"] = bs
+            beats_all += bs
+            if s["end"] > s["start"]:
+                pieces.append({"id": f"A2:{s['index']}", "sec": s["index"], "seg": None, "sub": 0, "type": "music",
+                               "kind": "music", "track": "A2", "start": round(s["start"], 4), "end": round(s["end"], 4),
+                               "clip": None, "clip_rel": None, "song": band["music"]["song"],
+                               "in": round(m["offset"], 4), "out": round(m["offset"] + s["end"] - s["start"], 4),
+                               "speed": 1.0, "label": m.get("title") or Path(m["song"]).stem, "captions": [],
+                               "overlays": []})
+        sections.append(band)
+    segrows = []
+    for r in segs:
+        spec = r["spec"]
+        row = {"sec": r["sec"], "seg": r["seg"], "type": r["type"], "start": round(r["t0"], 4),
+               "end": round(r["t1"], 4), "label": _seg_label(spec), "invalid": spec.get("_invalid"),
+               "clip": spec.get("clip"), "key": seg_key[(r["sec"], r["seg"])],
+               "pieces": [f"V1:{seg_key[(r['sec'], r['seg'])]}.{k}" for k in range(len(r["atoms"]))]}
+        if r["src_map"]:
+            row["src_map"] = [[round(a, 4), round(b, 4), round(T, 4)] for a, b, T in r["src_map"]]
+        if r.get("match_t") is not None:
+            row["match_t"] = r["match_t"]
+        segrows.append(row)
+    res = {"pieces": pieces, "segments": segrows, "sections": sections, "beats": beats_all,
+           "duration": round(tl.F / fps, 4), "frames": tl.F, "fps": fps, "width": ctx.W, "height": ctx.H,
+           "sfx": [{"name": e["name"], "t": round(e["t"], 3), "gain_db": e["gain_db"]} for e in sfx],
+           "warnings": ctx.warnings, "hash": key}
+    with _RESOLVE_LOCK:
+        if len(_RESOLVE_CACHE) >= _RESOLVE_MAX:
+            _RESOLVE_CACHE.pop(next(iter(_RESOLVE_CACHE)))
+        _RESOLVE_CACHE[key] = {"res": res, "deps": dict(ctx.deps)}
+    return res
+
+
+def locate(resolved, t, track="V1"):
+    """Timeline time -> what plays there: {piece, sec, seg, seg_start, seg_end, src_t, clip} or None.
+    src_t is the SOURCE time (tightened gaps and speed included) for clip pieces, None otherwise.
+    A time exactly on a cut belongs to the piece that starts there; t past the end -> last piece."""
+    ps = [p for p in resolved["pieces"] if p["track"] == track]
+    if not ps:
+        return None
+    hit = next((p for p in ps if p["start"] - 1e-6 <= t < p["end"] - 1e-6), None)
+    if hit is None:
+        hit = ps[-1] if t >= ps[-1]["end"] - 1e-6 else ps[0]
+    seg = next((s for s in resolved["segments"] if s["sec"] == hit["sec"] and s["seg"] == hit["seg"]), None)
+    src = None
+    if hit.get("clip") and hit.get("in") is not None:
+        tt = min(max(t, hit["start"]), hit["end"])
+        src = hit["in"] if hit["kind"] == "still" else round(hit["in"] + (tt - hit["start"]) * float(hit.get("speed") or 1.0), 4)
+    return {"piece": hit, "sec": hit["sec"], "seg": hit["seg"], "seg_start": seg["start"] if seg else hit["start"],
+            "seg_end": seg["end"] if seg else hit["end"], "src_t": src, "clip": hit.get("clip")}
+
+
+def segment_src_to_timeline(resolved, sec, seg, s):
+    """Inverse of locate for a talk segment: source time -> timeline time (a time in a removed pause
+    maps to the start of the next piece)."""
+    row = next((x for x in resolved["segments"] if x["sec"] == sec and x["seg"] == seg), None)
+    if not row:
+        return None
+    if row.get("src_map"):
+        return src_to_out({"src_map": row["src_map"]}, s)
+    return None

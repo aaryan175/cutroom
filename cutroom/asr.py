@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import db
+from . import db, governor
 
 SR = 16000
 MIN_SPEECH_S = 1.5
@@ -131,7 +131,28 @@ def _source(c):
 
 
 def transcribe_clip(cfg, con, c, model_name, audio=None, speech_s=None):
-    """Transcribe one clip row and store JSON + `transcripts` row. Returns the row dict."""
+    """Transcribe one clip row and store JSON + `transcripts` row. Returns the row dict.
+    Holds the machine-wide ASR slot (one transcription at a time across every cutroom process)."""
+    gov = governor.for_cfg(cfg)
+    with gov.slot("asr", label=f"transcribe {c['id']}"):
+        row = _transcribe_clip(cfg, con, c, model_name, audio, speech_s)
+    release_if_bloated(gov)
+    return row
+
+
+def release_if_bloated(gov):
+    """After a clip: if this process grew past the governor's in-process cap, drop the cached model
+    (it reloads on the next clip). Raises MemoryGuardError if that still is not enough."""
+    try:
+        gov.check_self(what="transcription process")
+    except MemoryError:
+        import gc
+        _MODEL.clear()
+        gc.collect()
+        gov.check_self(what="transcription process (model released)")
+
+
+def _transcribe_clip(cfg, con, c, model_name, audio=None, speech_s=None):
     if audio is None:
         audio = load_audio(cfg, _source(c))
     model = get_model(model_name)

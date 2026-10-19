@@ -7,15 +7,17 @@ One ffmpeg decode pass per clip (rawvideo pipe, 12.5 fps, 480 px wide) feeds:
   exposure   mean luma, contrast = luma std, sharpness = variance of Laplacian
   faces      max Haar-cascade frontal faces, sampled every ~0.5 s
 """
+import multiprocessing
 import os
 import statistics
 import subprocess
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 
-from . import db
+from . import db, governor
 
 FPS = 12.5
 WIDTH = 480
@@ -116,6 +118,13 @@ def analyze_proxy(ffmpeg_bin: str, proxy: str, duration: float, ffprobe_bin: str
         buf = proc.stdout.read(fsize)
         if len(buf) < fsize:
             break
+        if i % 250 == 0:
+            try:
+                governor.worker_check("analysis worker")     # no-op outside a governed pool
+            except MemoryError:
+                proc.kill()
+                proc.wait()
+                raise
         frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
         t = i / FPS
         k = int(t // WINDOW)
@@ -200,18 +209,23 @@ def analyze_all(cfg, con, limit=None, max_jobs=None):
         return
     if _face_cascade() is None:
         print("  ! no Haar face cascade in this OpenCV build (install opencv-python-headless<5); faces = 0", flush=True)
+    gov = governor.for_cfg(cfg)
     n = max(1, min(cfg.n_workers(), max_jobs) if max_jobs else cfg.n_workers())
+    n = min(n, gov.heavy_slots)
     t = time.time()
     total = sum(r["duration"] or 0 for r in rows)
     ok = err = 0
-    with ProcessPoolExecutor(n) as ex:
-        futs = {ex.submit(analyze_proxy, cfg.ffmpeg, r["proxy"], r["duration"] or 0, cfg.ffprobe): r for r in rows}
+    with make_pool(cfg, n) as ex, ThreadPoolExecutor(n) as tex:
+        futs = {tex.submit(analyze_one, cfg, ex, r): r for r in rows}
         for i, f in enumerate(as_completed(futs), 1):
             r = futs[f]
             try:
                 res = f.result()
                 _store(con, r["id"], res, r)
                 ok += 1
+            except BrokenProcessPool as e:            # a worker died (e.g. killed): retry next run
+                print(f"  ! {r['rel']}: analysis worker died ({e}); left for the next run", flush=True)
+                err += 1
             except Exception as e:  # noqa: BLE001
                 con.execute("UPDATE clips SET status='error', error=?, updated=? WHERE id=?",
                             (f"analyze: {str(e)[-300:]}", time.time(), r["id"]))
@@ -222,6 +236,22 @@ def analyze_all(cfg, con, limit=None, max_jobs=None):
     dt = time.time() - t
     print(f"analyze: {ok} ok · {err} errors · {dt:.1f}s for {total / 60:.1f} min of footage "
           f"({total / max(dt, 1e-6):.0f}x realtime with {n} workers)", flush=True)
+
+
+def make_pool(cfg, n):
+    """Process pool for analyze_proxy: spawned (never forked, so no slot lock is inherited), niced,
+    with the governor's per-process memory cap checked inside each worker."""
+    gov = governor.for_cfg(cfg)
+    return ProcessPoolExecutor(max(1, n), mp_context=multiprocessing.get_context("spawn"),
+                               initializer=governor.worker_init,
+                               initargs=(gov.nice if gov.enabled else 0, gov.max_proc_mem_gb if gov.enabled else None))
+
+
+def analyze_one(cfg, ex, row) -> dict:
+    """Analyze one clip in pool `ex` while holding a heavy governor slot. Returns analyze_proxy's dict."""
+    gov = governor.for_cfg(cfg)
+    with gov.slot("heavy", label=f"analyze {row['id']}"):
+        return ex.submit(analyze_proxy, cfg.ffmpeg, row["proxy"], row["duration"] or 0, cfg.ffprobe).result()
 
 
 # -- queries other modules use ---------------------------------------------------------------

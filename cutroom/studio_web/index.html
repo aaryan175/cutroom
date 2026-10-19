@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cutroom Studio</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%231d1d20'/%3E%3Cpath d='M4 4h3v8H4zM9 4h3v3H9zM9 9h3v3H9z' fill='%234c8dff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div id="app">
+  <header id="hdr">
+    <div class="hdr-l">
+      <span class="brand" title="Cutroom Studio"><svg viewBox="0 0 16 16" width="16" height="16"><path d="M2.5 3.5h4v9h-4zM9.5 3.5h4v4h-4zM9.5 9h4v3.5h-4z" fill="currentColor"/></svg></span>
+      <span id="proj-name" class="proj-name">Cutroom</span>
+      <span class="hdr-sep"></span>
+      <div class="plan-pick">
+        <button id="plan-btn" class="tb-btn plan-btn" title="Open plan"><span id="plan-name">No plan</span><i data-icon="chev"></i></button>
+        <div id="plan-menu" class="menu" hidden></div>
+      </div>
+      <span id="draft-state" class="draft-state"></span>
+    </div>
+    <div class="hdr-c">
+      <button id="btn-undo" class="tb-icon" title="Undo (⌘Z)" disabled><i data-icon="undo"></i></button>
+      <button id="btn-redo" class="tb-icon" title="Redo (⇧⌘Z)" disabled><i data-icon="redo"></i></button>
+      <span class="hdr-sep"></span>
+      <button id="btn-commit" class="tb-btn" title="Commit version (⌘S)" disabled><i data-icon="commit"></i>Commit version</button>
+      <div class="split-btn">
+        <button id="btn-render" class="tb-btn primary" title="Render a preview of the latest version" disabled><i data-icon="render"></i>Render preview</button>
+        <button id="btn-render-more" class="tb-btn primary caret" title="Render options" disabled><i data-icon="chev"></i></button>
+        <div id="render-menu" class="menu right" hidden>
+          <button data-render="preview">Render preview <span class="k">720p, proxies</span></button>
+          <button data-render="final">Render final <span class="k">full quality, masters</span></button>
+        </div>
+      </div>
+    </div>
+    <div class="hdr-r">
+      <div id="lib-status" class="lib-status"></div>
+      <button id="gov-pill" class="gov-pill" title="Machine health"><span class="dot"></span><span class="txt">—</span></button>
+      <span id="conn" class="conn" title="Live connection"></span>
+      <button id="btn-help" class="tb-icon" title="Keyboard shortcuts (?)"><i data-icon="help"></i></button>
+    </div>
+  </header>
+
+  <main id="main">
+    <div id="col-left">
+      <div id="row-top">
+        <!-- PROJECT -->
+        <section id="p-project" class="panel">
+          <div class="ptabs" data-tabs="project">
+            <button class="ptab on" data-tab="clips">Clips</button>
+            <button class="ptab" data-tab="picks" title="Bins Claude made for you">Picks<span class="badge" id="badge-picks"></span></button>
+            <button class="ptab" data-tab="songs">Songs</button>
+            <button class="ptab" data-tab="plans">Plans</button>
+            <button class="ptab" data-tab="renders">Renders</button>
+          </div>
+          <div class="pbody" id="project-body"></div>
+        </section>
+        <div class="splitter v" data-split="projW"></div>
+        <!-- SOURCE -->
+        <section id="p-source" class="panel monitor" data-monitor="source">
+          <div class="ptabs">
+            <button class="ptab on static">Source<span id="src-title" class="ptab-sub"></span></button>
+          </div>
+          <div class="pbody" id="source-body"></div>
+        </section>
+        <div class="splitter v" data-split="srcFrac"></div>
+        <!-- PROGRAM -->
+        <section id="p-program" class="panel monitor" data-monitor="program">
+          <div class="ptabs">
+            <button class="ptab on" data-ptab="program">Program</button>
+            <button class="ptab" data-ptab="reference">Reference</button>
+            <div class="ptab-tools" id="program-tools"></div>
+          </div>
+          <div class="pbody" id="program-body"></div>
+        </section>
+      </div>
+      <div class="splitter h" data-split="topH"></div>
+      <section id="p-timeline" class="panel">
+        <div class="ptabs">
+          <button class="ptab on static">Timeline<span id="tl-title" class="ptab-sub"></span></button>
+          <div class="ptab-tools" id="timeline-tools"></div>
+        </div>
+        <div class="pbody" id="timeline-body"></div>
+      </section>
+    </div>
+    <div class="splitter v" data-split="claudeW"></div>
+    <!-- CLAUDE -->
+    <aside id="p-claude" class="panel">
+      <div class="ptabs">
+        <button class="ptab on static">Claude</button>
+        <div class="ptab-tools" id="claude-tools"></div>
+      </div>
+      <div class="pbody" id="claude-body"></div>
+    </aside>
+  </main>
+  <div class="splitter h" data-split="dockH"></div>
+  <section id="p-dock" class="panel">
+    <div class="ptabs" data-tabs="dock">
+      <button class="ptab on" data-tab="inspector">Inspector</button>
+      <button class="ptab" data-tab="story" title="The edit as a beat sheet">Story</button>
+      <button class="ptab" data-tab="markers">Markers<span class="badge" id="badge-markers"></span></button>
+      <button class="ptab" data-tab="qa">QA<span class="badge" id="badge-qa"></span></button>
+      <button class="ptab" data-tab="jobs">Jobs<span class="badge" id="badge-jobs"></span></button>
+      <button class="ptab" data-tab="overnight">Overnight</button>
+    </div>
+    <div class="pbody" id="dock-body"></div>
+  </section>
+</div>
+<div id="toasts"></div>
+<div id="help" class="overlay" hidden></div>
+<div id="lightbox" class="overlay" hidden></div>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

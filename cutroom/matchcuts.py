@@ -32,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import db
+from . import db, governor
 
 FEAT_VERSION = 2
 SAMPLE_FPS = 4.0          # decode rate for sampling (motion uses the previous decoded frame)
@@ -191,7 +191,8 @@ def clip_features(cfg, row, shots=()) -> dict:
     times = sample_times(row["duration"], shots)
     if not times:
         return None
-    got = _decode_samples(cfg, src, times)
+    with governor.for_cfg(cfg).slot("heavy", label=f"matchcut features {row['id']}"):
+        got = _decode_samples(cfg, src, times)
     feats = []
     for t in times:
         if t in got:
@@ -226,9 +227,24 @@ def _descriptors(E, L):
     return np.concatenate([np.sqrt(W_EDGE) * E, np.sqrt(W_LAYOUT) * L], axis=1).astype(np.float32)
 
 
-def search_pairs(D, clip_idx, ok, k=TOPK, floor=0.5, chunk=CHUNK):
+def _search_guarded(D, ci, ok, floor, check_mem, quiet=False):
+    """search_pairs under the governor's memory cap: on MemoryGuardError retry with half the chunk."""
+    chunk = CHUNK
+    while True:
+        try:
+            return search_pairs(D, ci, ok, floor=floor, chunk=chunk, check_mem=check_mem)
+        except MemoryError:
+            if chunk <= 16:
+                raise
+            chunk //= 2
+            if not quiet:
+                print(f"  matchcuts: memory cap reached; retrying search with chunk {chunk}", flush=True)
+
+
+def search_pairs(D, clip_idx, ok, k=TOPK, floor=0.5, chunk=CHUNK, check_mem=None):
     """Top-k partners per row from other clips, by dot product of unit descriptors, in row chunks so
-    memory stays at chunk x N floats. Returns {(i, j): score} with i < j."""
+    memory stays at chunk x N floats. Returns {(i, j): score} with i < j. `check_mem()` (optional) is
+    called after each chunk's matrix exists and may raise MemoryGuardError."""
     n = len(D)
     out = {}
     cols_ok = ok.copy()
@@ -239,6 +255,8 @@ def search_pairs(D, clip_idx, ok, k=TOPK, floor=0.5, chunk=CHUNK):
             continue
         with np.errstate(all="ignore"):              # Accelerate BLAS raises spurious FP flags
             S = D[rows] @ D.T                            # chunk x N float32
+        if check_mem is not None:
+            check_mem()
         S[clip_idx[rows][:, None] == clip_idx[None, :]] = -9
         S[:, ~cols_ok] = -9
         kk = min(k, n - 1)
@@ -417,6 +435,9 @@ def mine(cfg, con, limit=None, min_score=0.75, top=25, align_top=ALIGN_TOP, quie
 
     feats = {}
 
+    gov = governor.for_cfg(cfg)
+    check_mem = gov.watch_self()
+
     def work(r):
         try:
             return r["id"], clip_features(cfg, r, shots.get(r["id"], ()))
@@ -430,6 +451,8 @@ def mine(cfg, con, limit=None, min_score=0.75, top=25, align_top=ALIGN_TOP, quie
                     print(f"  ! {cid}: {f}", flush=True)
             elif f is not None:
                 feats[cid] = f
+            if k % 25 == 0:
+                check_mem()                    # MemoryGuardError: the library is too big for this cap
             if not quiet and k % 100 == 0:
                 print(f"  features {k}/{len(rows)}", flush=True)
     by_id = {r["id"]: r for r in rows}
@@ -476,7 +499,7 @@ def mine(cfg, con, limit=None, min_score=0.75, top=25, align_top=ALIGN_TOP, quie
         ci_o, ok_o = CI[idx], ok_all[idx]
         med, spread = _null_stats(D, ci_o, ok_o)
         null[("landscape" if land else "portrait")] = {"median": round(med, 3), "spread": round(spread, 3)}
-        pairs = search_pairs(D, ci_o, ok_o, floor=min(min_score, 0.9) - 0.05)
+        pairs = _search_guarded(D, ci_o, ok_o, min(min_score, 0.9) - 0.05, check_mem, quiet)
         for (i, j), s in pairs.items():
             if s < min_score:
                 continue

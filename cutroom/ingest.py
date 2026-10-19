@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import db, media
+from . import db, governor, media
 from .config import VIDEO_EXTS
 
 MIN_SIZE = 100 * 1024          # smaller files are thumbnails / junk
@@ -237,11 +237,21 @@ def _make_proxy(cfg, row, enc) -> str:
     out = cfg.p("proxies", f"{row['id']}.mp4")
     if out.exists() and out.stat().st_size > 0:
         return str(out)
+    gov = governor.for_cfg(cfg)
+    with gov.slot("heavy", label=f"proxy {row['id']}"):
+        gov.wait_for_disk(out.parent)
+        return _encode_proxy(cfg, row, enc, out)
+
+
+def _encode_proxy(cfg, row, enc, out) -> str:
     tmp = out.with_suffix(".tmp.mp4")
     timeout = max(600, (row["duration"] or 0) * 10)
     log = cfg.p("proxies", "ffmpeg.log")
     try:
         media.ffmpeg(cfg, _proxy_args(cfg, row, row["path"], tmp, enc), log=log, timeout=timeout)
+    except media.GovernorKilled:
+        tmp.unlink(missing_ok=True)
+        raise
     except Exception:
         if "libx264" in enc:
             raise
@@ -276,6 +286,9 @@ def make_proxies(cfg, con, limit=None, max_jobs=None):
                 con.execute("UPDATE clips SET proxy=?, status='proxied', error=NULL, updated=? WHERE id=?",
                             (p, time.time(), r["id"]))
                 ok += 1
+            except media.GovernorKilled as e:          # not the clip's fault: retried next run
+                _log(f"  ! {r['rel']}: {e}")
+                err += 1
             except Exception as e:  # noqa: BLE001
                 con.execute("UPDATE clips SET status='error', error=?, updated=? WHERE id=?",
                             (f"proxy: {str(e)[-300:]}", time.time(), r["id"]))
@@ -324,7 +337,13 @@ def sheet_times(duration: float, every: float, max_tiles: int) -> list:
 
 
 def _read_frames(cmd, w, h, n) -> list:
-    r = subprocess.run(cmd, capture_output=True, timeout=600)
+    g = governor.active()
+    if g is not None:                      # niced + footprint-watched, like media.run
+        r = g.run(cmd, kind=None, timeout=600, text=False)
+        if r.killed:
+            raise media.GovernorKilled(f"stopped by resource governor: {r.killed}")
+    else:
+        r = subprocess.run(cmd, capture_output=True, timeout=600)
     if r.returncode:
         raise media.FFError(r.stderr.decode(errors="ignore")[-500:])
     fs = w * h * 3
@@ -382,6 +401,13 @@ def _make_sheet(cfg, row) -> str:
     out = str(cfg.p("sheets", f"{row['id']}.jpg"))
     if os.path.exists(out):
         return out
+    gov = governor.for_cfg(cfg)
+    with gov.slot("heavy", label=f"sheet {row['id']}"):
+        gov.wait_for_disk(os.path.dirname(out))
+        return _build_sheet(cfg, row, out)
+
+
+def _build_sheet(cfg, row, out) -> str:
     dur = float(row["duration"] or 0)
     times = sheet_times(dur, cfg.sheet_every_s, cfg.sheet_max_tiles)
     dw, dh = display_size(row)

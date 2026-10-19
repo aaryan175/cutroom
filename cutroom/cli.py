@@ -19,6 +19,8 @@
   cutroom qa VIDEO [--plan PLAN.json]                                machine QA + contact sheet
   cutroom board [--port 8600]                                        review page for renders (phone friendly)
   cutroom notes [--since VERSION]                                    review notes captured on the board
+  cutroom studio [--port 8600] [--host 127.0.0.1] [--open]           the browser editor (docs/STUDIO.md)
+  cutroom markers [list|done ID] [--plan SLUG] [--all] [--json]      studio markers (notes pinned to timeline times)
 """
 import argparse
 import json
@@ -35,7 +37,40 @@ def _cfg_con():
 def cmd_init(a):
     from .config import init_project
     cfg = init_project(a.work, a.library, a.music or [])
+    try:
+        from .studio import ensure_project_claude
+        ensure_project_claude(cfg)              # project CLAUDE.md + AGENTS.md (Codex) + .claude/skills link
+    except Exception as e:  # noqa: BLE001
+        print(f"  (could not link CLAUDE.md / AGENTS.md / skills: {e})")
     print(f"project ready at {cfg.work}\n  library: {cfg.library_roots}\n  next: cd {cfg.work} && cutroom doctor && cutroom index")
+
+
+def _agent_checks(cfg):
+    """Doctor rows for the AI agents (studio chat + overnight tagging). Either one is enough."""
+    from . import agent
+    rows = []
+    try:
+        d = agent.detect(cfg)
+        chosen = agent.choose(cfg)
+    except Exception as e:  # noqa: BLE001
+        return [("AI agent", False, f"could not detect: {e}")]
+    login = {True: "logged in", False: "NOT logged in", None: "login status unknown"}
+    for name, label, fix in (("claude", "Claude Code (claude)", "run `claude` once and sign in"),
+                             ("codex", "Codex CLI (codex)", "run `codex login`")):
+        x = d[name]
+        if not x["path"]:
+            rows.append((label, False, "not installed (optional: Claude Code or Codex is enough)"))
+        else:
+            detail = f"{x['path']} · {login[x['logged_in']]}" + (f" ({x['method']})" if x.get("method") else "")
+            if x["logged_in"] is False:
+                detail += f" · to use it: {fix} (optional)"
+            rows.append((label, x["logged_in"] is not False, detail))
+    usable = chosen.path and d[chosen.name]["logged_in"] is not False
+    rows.append(("AI agent in use", bool(usable),
+                 f"{chosen.label} (setting: {agent.wanted(cfg)}; change with \"agent\" in cutroom.json)" if usable else
+                 f"{chosen.label} is not ready: install Claude Code or Codex and log in with your own account "
+                 "(subscription, no API key)"))
+    return rows
 
 
 def cmd_doctor(a):
@@ -46,7 +81,7 @@ def cmd_doctor(a):
     except SystemExit:
         cfg = Config()
     bad = 0
-    for name, ok, detail in doctor(cfg):
+    for name, ok, detail in doctor(cfg) + _agent_checks(cfg):
         print(f"  {'ok ' if ok else 'MISSING'}  {name:34s} {detail}")
         bad += (not ok) and "optional" not in detail
     sys.exit(1 if bad else 0)
@@ -187,6 +222,85 @@ def cmd_notes(a):
     board.print_notes(cfg, since=a.since)
 
 
+def cmd_studio(a):
+    from . import studio
+    cfg, _ = _cfg_con()
+    studio.serve(cfg, port=a.port, host=a.host, open_browser=a.open)
+
+
+def cmd_markers(a):
+    from . import studio
+    from .config import Config
+    cfg = Config.load()
+    if a.action == "done":
+        if not a.id:
+            sys.exit("usage: cutroom markers done ID [ID ...]")
+        for mid in a.id:
+            try:
+                m = studio.marker_set_status(cfg, mid, "done")
+            except KeyError as e:
+                sys.exit(str(e))
+            print(f"done  {m['id']}  @ {float(m.get('t') or 0):.2f}s  {m.get('text', '')}")
+        return
+    ms = studio.markers_load(cfg)
+    if a.plan:
+        ms = [m for m in ms if m.get("plan") == a.plan]
+    if not a.all:
+        ms = [m for m in ms if m.get("status", "open") == "open"]
+    ms.sort(key=lambda m: (str(m.get("plan") or ""), float(m.get("t") or 0)))
+    if a.json:
+        print(json.dumps(ms, indent=1, ensure_ascii=False))
+        return
+    if not ms:
+        print("no " + ("" if a.all else "open ") + "markers")
+        return
+    for m in ms:
+        frame = studio.Studio.frame_path_of(cfg, m.get("frame_url"))
+        print(f"{m['id']}  {m.get('status', 'open'):4s}  {m.get('plan') or '-':16s} @ {float(m.get('t') or 0):7.2f}s"
+              f"  [{m.get('kind', 'note')}] {m.get('text', '')}" + (f"\n    frame: {frame}" if frame else ""))
+
+
+def cmd_overnight(a):
+    from .config import Config
+    from . import overnight
+    cfg = Config.load()
+    if a.status:
+        overnight.print_status(cfg)
+        return
+    if a.stop:
+        print("stop requested; the current item finishes first" if overnight.stop(cfg) else "overnight is not running")
+        return
+    skip = []
+    if a.only:
+        want = {x.strip() for x in a.only.split(",") if x.strip()}
+        bad = want - set(overnight.STAGES)
+        if bad:
+            sys.exit(f"unknown stage(s) {sorted(bad)}; stages: {', '.join(overnight.STAGES)}")
+        skip = [s for s in overnight.STAGES if s not in want]
+    sys.exit(overnight.run(cfg, until=a.until, tag=not a.no_tag, tag_limit=a.tag_limit, model=a.model,
+                           dry_run=a.dry_run, skip_stages=skip, echo=not a.quiet))
+
+
+def cmd_governor(a):
+    from .config import Config
+    from . import governor
+    st = governor.for_cfg(Config.load()).status()
+    if a.json:
+        print(json.dumps(st, indent=1))
+        return
+    print(f"load {st['load']} · free RAM {st['ram_free_gb']} / {st['ram_total_gb']} GB · free disk {st['disk_free_gb']} GB"
+          f" · heavy allowed {st['allowed']['heavy']}/{st['limits']['heavy_slots']}")
+    for k in ("throttled", "blocked"):
+        if st[k]:
+            print(f"  {k}: {'; '.join(st[k])}")
+    for sl in st["slots"]:
+        print(f"  {sl['kind']}.{sl['index']}: " + (f"pid {sl.get('pid')} {sl.get('label') or ''} ({sl.get('age_s')}s)"
+                                                    if sl["busy"] else "free"))
+    for w in st["waiting"]:
+        print(f"  waiting: pid {w['pid']} {w['kind']} {w.get('label', '')} {w['waited_s']}s ({w.get('reason', '')})")
+    print(f"  limits: {st['limits']}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="cutroom", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -226,6 +340,20 @@ def main(argv=None):
     p = sp.add_parser("board"); p.add_argument("--port", type=int, default=8600)
     p.add_argument("--host", default="127.0.0.1"); p.set_defaults(fn=cmd_board)
     p = sp.add_parser("notes"); p.add_argument("--since", type=int); p.set_defaults(fn=cmd_notes)
+    p = sp.add_parser("overnight", help="unattended library understanding (see docs/OVERNIGHT.md)")
+    p.add_argument("--until", help="local HH:MM to stop gracefully"); p.add_argument("--no-tag", action="store_true")
+    p.add_argument("--tag-limit", type=int); p.add_argument("--model", help="ASR model: small (faster) or medium")
+    p.add_argument("--dry-run", action="store_true", help="everything except the Claude calls")
+    p.add_argument("--status", action="store_true"); p.add_argument("--stop", action="store_true")
+    p.add_argument("--only", help="comma-separated stages to run, e.g. tag or transcribe,tag")
+    p.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS); p.set_defaults(fn=cmd_overnight)
+    p = sp.add_parser("governor"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_governor)
+    p = sp.add_parser("studio"); p.add_argument("--port", type=int, default=8600)
+    p.add_argument("--host", default="127.0.0.1"); p.add_argument("--open", action="store_true")
+    p.set_defaults(fn=cmd_studio)
+    p = sp.add_parser("markers"); p.add_argument("action", nargs="?", default="list", choices=["list", "done"])
+    p.add_argument("id", nargs="*"); p.add_argument("--plan"); p.add_argument("--all", action="store_true")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_markers)
 
     a = ap.parse_args(argv)
     a.fn(a)

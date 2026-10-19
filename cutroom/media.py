@@ -13,6 +13,20 @@ class FFError(RuntimeError):
     pass
 
 
+class GovernorKilled(FFError):
+    """The resource governor stopped the process (memory cap or system RAM emergency)."""
+
+
+_RUN_HOOK = None
+
+
+def set_run_hook(fn):
+    """Route every run() through `fn(cmd, capture=, timeout=)` (the resource governor sets this so
+    ffmpeg/ffprobe run niced and footprint-monitored). None restores plain subprocess.run."""
+    global _RUN_HOOK
+    _RUN_HOOK = fn
+
+
 def which(name, fallback=None):
     p = shutil.which(name)
     if not p and fallback:
@@ -22,12 +36,21 @@ def which(name, fallback=None):
 
 def run(cmd, check=True, capture=True, log=None, timeout=None):
     t = time.time()
-    r = subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout)
+    hook = _RUN_HOOK
+    if hook is not None:
+        r = hook(cmd, capture=capture, timeout=timeout)
+    else:
+        r = subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout)
+    killed = getattr(r, "killed", None)
     if log:
         with open(log, "a") as f:
             f.write(f"[{time.strftime('%H:%M:%S')}] {time.time() - t:6.1f}s rc={r.returncode} {shlex.join(map(str, cmd))[:4000]}\n")
+            if killed:
+                f.write(f"stopped by resource governor: {killed}\n")
             if r.returncode and r.stderr:
                 f.write(r.stderr[-4000:] + "\n")
+    if killed and (check or r.returncode):
+        raise GovernorKilled(f"stopped by resource governor: {killed}: {shlex.join(map(str, cmd))[:300]}")
     if check and r.returncode:
         raise FFError(f"command failed ({r.returncode}): {shlex.join(map(str, cmd))[:600]}\n{(r.stderr or '')[-2000:]}")
     return r

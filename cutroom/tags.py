@@ -174,6 +174,7 @@ def search(cfg, con, args):
                     "setting": tags.get("setting"), "time_of_day": tags.get("time_of_day"),
                     "summary": tags.get("summary"), "match": c["where"], "hit_t": hit_t,
                     "sheet": r["sheet"], "proxy": r["proxy"], "tags": tags})
+    _note_usage(cfg, [x["id"] for x in res[:10]] if words else [])
     if getattr(args, "json", False):
         print(json.dumps(res, indent=1))
         return res
@@ -205,9 +206,19 @@ def _spark(vals, lo, hi) -> str:
     return "".join(out)
 
 
+def _note_usage(cfg, ids):
+    """Searched / opened clips are processed first by `cutroom overnight`."""
+    try:
+        from .overnight import note_usage
+        note_usage(cfg, ids)
+    except Exception:  # noqa: BLE001 - bookkeeping only
+        pass
+
+
 def describe(cfg, con, ref, frames=0):
     c = db.get_clip(con, ref)
     cid = c["id"]
+    _note_usage(cfg, [cid])
     dw, dh = display_size(c)
     print(f"{cid}  {c['rel']}\n  path     {c['path']}")
     print(f"  status   {c['status']}" + (f"  ({c['error']})" if c["error"] else ""))
@@ -244,3 +255,148 @@ def describe(cfg, con, ref, frames=0):
             if not os.path.exists(out):
                 media.frame_at(cfg, c["path"], t, out, width=max(dw, 2) // 2 * 2)
             print(f"    {t:7.2f}s  {out}")
+
+
+# -- paged query (studio) --------------------------------------------------------------------
+# `search` above is the operator's CLI: it scores in Python over every clip. The studio needs pages
+# of a 50k-clip library in milliseconds, so this does the filtering, scoring, ordering and paging in
+# SQL. Per-clip medians of the metrics windows live in `clip_stats`, refreshed incrementally.
+
+STATS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS clip_stats (
+  clip_id TEXT PRIMARY KEY, shake REAL, exposure REAL, sharpness REAL, faces INTEGER,
+  auto_q REAL, n INTEGER, clip_updated REAL
+);
+CREATE INDEX IF NOT EXISTS transcripts_words ON transcripts(n_words);
+CREATE INDEX IF NOT EXISTS clips_duration ON clips(duration);
+"""
+
+
+def refresh_stats(con, force=False) -> int:
+    """Bring clip_stats up to date for clips analyzed since the last refresh. Returns rows written."""
+    con.executescript(STATS_SCHEMA)
+    q = ("SELECT c.id, c.updated FROM clips c LEFT JOIN clip_stats s ON s.clip_id = c.id "
+         "WHERE c.status = 'analyzed' AND (s.clip_id IS NULL OR COALESCE(s.clip_updated, -1) != COALESCE(c.updated, -1))")
+    todo = con.execute("SELECT id, updated FROM clips WHERE status='analyzed'" if force else q).fetchall()
+    n = 0
+    for i in range(0, len(todo), 500):
+        chunk = todo[i:i + 500]
+        ids = [r["id"] for r in chunk]
+        vals = {cid: [] for cid in ids}
+        for r in con.execute(f"SELECT clip_id, shake, exposure, sharpness, faces FROM metrics WHERE clip_id IN "
+                             f"({','.join('?' * len(ids))})", ids):
+            vals[r["clip_id"]].append(r)
+        rows = []
+        for r in chunk:
+            ms = vals[r["id"]]
+            if not ms:
+                rows.append((r["id"], None, None, None, None, None, 0, r["updated"]))
+                continue
+            sh = statistics.median([m["shake"] for m in ms if m["shake"] is not None] or [0])
+            ex = statistics.median([m["exposure"] for m in ms if m["exposure"] is not None] or [0])
+            shp = min((m["sharpness"] for m in ms if m["sharpness"] is not None), default=0)
+            fc = max((m["faces"] or 0 for m in ms), default=0)
+            aq = analyze.auto_quality({"shake": sh, "exposure": ex, "sharpness": 100})
+            rows.append((r["id"], sh, ex, shp, fc, aq, len(ms), r["updated"]))
+        con.executemany("INSERT OR REPLACE INTO clip_stats VALUES (?,?,?,?,?,?,?,?)", rows)
+        n += len(rows)
+    if n:
+        con.commit()
+    return n
+
+
+_TRUE = "('true','yes','1','y')"
+_STATS_CHECKED = {}
+
+
+def query(cfg, con, text="", setting=None, time=None, people=None, shot=None, camera=None, max_shake=None,
+          min_quality=None, speech=None, creator=False, min_dur=None, offset=0, limit=200,
+          include_unusable=False, day=None) -> dict:
+    """Filtered, scored, paged clip search in SQL. Same filters and ranking as `search`
+    (tags x3, speech x2, path x1 per word; then quality, then duration). speech: True = with
+    speech, False = without, None = either. Returns {total, offset, limit, rows}."""
+    import time as _time
+    key = str(getattr(cfg, "db_path", ""))
+    if _time.time() - _STATS_CHECKED.get(key, 0) > 30:          # new analysis shows up within 30 s
+        refresh_stats(con)
+        _STATS_CHECKED[key] = _time.time()
+    words = [_norm(w) for w in (text or "").split() if _norm(w)]
+    where, args = ["c.status != 'error'"], []
+    tag = lambda k: f"lower(COALESCE(json_extract(t.data, '$.{k}'), ''))"     # noqa: E731
+    if not include_unusable:
+        where.append(f"(t.data IS NULL OR json_type(t.data, '$.usable') IS NULL OR "
+                     f"lower(CAST(json_extract(t.data, '$.usable') AS TEXT)) IN {_TRUE})")
+    for key, want in (("setting", setting), ("time_of_day", time), ("people", people), ("shot", shot),
+                      ("camera", camera)):
+        if want:
+            where.append(f"instr({tag(key)}, ?) > 0")
+            args.append(str(want).lower())
+    if creator:
+        where.append(f"lower(CAST(json_extract(t.data, '$.creator_visible') AS TEXT)) IN {_TRUE}")
+    if speech is True:
+        where.append("COALESCE(tr.n_words, 0) > 5")
+    elif speech is False:
+        where.append("COALESCE(tr.n_words, 0) <= 5")
+    if day:                                                       # "YYYY-MM-DD", or "unknown"
+        if day == "unknown":
+            where.append("(c.shot_at IS NULL OR c.shot_at = '')")
+        else:
+            where.append("substr(c.shot_at, 1, 10) = ?")
+            args.append(str(day))
+    if min_dur:
+        where.append("COALESCE(c.duration, 0) >= ?")
+        args.append(float(min_dur))
+    if max_shake is not None:
+        where.append("s.shake IS NOT NULL AND s.shake <= ?")
+        args.append(float(max_shake))
+    qexpr = ("COALESCE(CASE WHEN json_type(t.data, '$.quality') IN ('integer','real') THEN json_extract(t.data, '$.quality') "
+             "WHEN CAST(json_extract(t.data, '$.quality') AS REAL) > 0 THEN CAST(json_extract(t.data, '$.quality') AS REAL) END, s.auto_q)")
+    if min_quality is not None:
+        where.append(f"COALESCE({qexpr}, 0) >= ?")
+        args.append(float(min_quality))
+    score_parts, score_args = [], []
+    for w in words:
+        ht, hs, hp = "instr(lower(COALESCE(t.data, '')), ?) > 0", "instr(lower(COALESCE(tr.text, '')), ?) > 0", \
+            "instr(lower(COALESCE(c.rel, '')), ?) > 0"
+        where.append(f"({ht} OR {hs} OR {hp})")
+        args += [w, w, w]
+        score_parts.append(f"3 * ({ht}) + 2 * ({hs}) + ({hp})")
+        score_args += [w, w, w]
+    score = " + ".join(score_parts) or "0"
+    speech_hit = " OR ".join(["instr(lower(COALESCE(tr.text, '')), ?) > 0"] * len(words)) or "0"
+    frm = ("FROM clips c LEFT JOIN tags t ON t.clip_id = c.id LEFT JOIN transcripts tr ON tr.clip_id = c.id "
+           "LEFT JOIN clip_stats s ON s.clip_id = c.id WHERE " + " AND ".join(where))
+    total = con.execute(f"SELECT COUNT(*) {frm}", args).fetchone()[0]
+    limit = max(1, min(int(limit or 200), 1000))
+    offset = max(0, int(offset or 0))
+    sql = (f"SELECT c.id, c.rel, c.duration, c.width, c.height, c.rotation, c.fps, c.proxy, c.sheet, c.status, "
+           f"c.shot_at, c.has_audio, t.data AS tags, COALESCE(tr.n_words, 0) AS n_words, tr.clip_id AS has_tr, "
+           f"s.shake AS shake, {qexpr} AS quality, ({score}) AS score, ({speech_hit}) AS speech_hit {frm} "
+           f"ORDER BY score DESC, COALESCE(quality, 0) DESC, COALESCE(c.duration, 0) DESC, c.id LIMIT ? OFFSET ?")
+    rows = con.execute(sql, score_args + list(words) + args + [limit, offset]).fetchall()
+    out = []
+    for r in rows:
+        tags = json.loads(r["tags"]) if r["tags"] else {}
+        dw, dh = display_size(r)
+        out.append({"id": r["id"], "rel": r["rel"], "duration": r["duration"], "width": dw, "height": dh,
+                    "fps": r["fps"], "quality": None if r["quality"] is None else round(float(r["quality"]), 2),
+                    "shake": None if r["shake"] is None else round(r["shake"], 2), "status": r["status"],
+                    "shot_at": r["shot_at"], "has_audio": bool(r["has_audio"]),
+                    "has_transcript": bool(r["has_tr"]), "n_words": r["n_words"], "has_proxy": bool(r["proxy"]),
+                    "has_sheet": bool(r["sheet"]), "score": r["score"],
+                    "tags": {k: tags.get(k) for k in ("summary", "setting", "time_of_day", "people", "shot", "mood",
+                                                       "quality", "usable", "creator_visible") if k in tags},
+                    "tagged": bool(tags),
+                    "hit_t": first_hit(cfg, r["id"], words) if words and r["speech_hit"] else None})
+    return {"total": total, "offset": offset, "limit": limit, "rows": out}
+
+
+def days(con) -> list:
+    """Clips grouped by capture date: [{day, clips, hours, speech_clips}], newest first."""
+    rows = con.execute(
+        "SELECT COALESCE(NULLIF(substr(c.shot_at, 1, 10), ''), 'unknown') AS day, COUNT(*) AS n, "
+        "COALESCE(SUM(c.duration), 0) AS dur, SUM(CASE WHEN COALESCE(tr.n_words, 0) > 5 THEN 1 ELSE 0 END) AS sp "
+        "FROM clips c LEFT JOIN transcripts tr ON tr.clip_id = c.id WHERE c.status != 'error' "
+        "GROUP BY day ORDER BY day DESC").fetchall()
+    return [{"day": r["day"], "clips": r["n"], "hours": round(r["dur"] / 3600, 2), "speech_clips": r["sp"] or 0}
+            for r in rows]

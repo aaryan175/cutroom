@@ -51,6 +51,24 @@ class Config:
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
     remote_render: str = ""                                # optional command prefix to run ffmpeg elsewhere
+    # -- resource governor (governor.py, docs/OVERNIGHT.md). 0 / "" = automatic for this machine
+    governor: bool = True                                  # false = no throttling (the single ASR slot stays)
+    max_load: float = 0.0                                  # 1-min load above this throttles heavy work to 1 slot (auto cpus*0.8)
+    min_free_ram_gb: float = 0.0                           # new work waits below this (auto max(2, 15% of RAM))
+    max_proc_mem_gb: float = 0.0                           # per child process footprint cap (auto min(4, 25% of RAM))
+    min_free_disk_gb: float = 20.0                         # writes pause below this much free space on the work volume
+    heavy_slots: int = 0                                   # concurrent encodes/analysis machine-wide (auto cpus//4, >= 1)
+    nice_level: int = 10                                   # scheduling priority of child processes
+    pause_when_user_active: bool = False                   # macOS: 1 heavy slot while keyboard/mouse used in last 2 min
+    quiet_hours: str = ""                                  # e.g. "09:00-18:00": 1 heavy slot inside this window
+    # -- AI agent (agent.py): studio chat + overnight tagging, on the person's own login (no API keys)
+    agent: str = "auto"                                    # "auto" (the logged-in one; Claude Code if both) | "claude" | "codex"
+    codex_model: str = ""                                  # Codex model for tagging ("" = Codex default); chat: CUTROOM_CODEX_MODEL
+    # -- overnight understanding (overnight.py)
+    tag_batch: int = 8                                     # clips per tagging call (Codex: at most 8 images per call)
+    tag_sleep_s: float = 20.0                              # pause between tagging calls
+    tag_model: str = ""                                    # Claude model alias for tagging ("" = your default)
+    tag_timeout_s: float = 900.0                           # one tagging call may take this long
 
     # -- paths ---------------------------------------------------------------------------------
     def p(self, *parts) -> Path:

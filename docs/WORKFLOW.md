@@ -15,6 +15,8 @@ Pillow fallback is used.
 ## 1. Index (hours; unattended, resumable)
 `cutroom index`, then `cutroom transcribe`, then `cutroom songs index`.
 For a 2 TB library, start these in the evening. `cutroom status` shows progress at any time.
+Or run all of it, plus Claude tagging of every contact sheet, unattended and within safe resource limits:
+`cutroom overnight --until 07:00` (see `docs/OVERNIGHT.md`).
 
 Want to edit tonight? Index everything (fast), then transcribe just what you need:
 `cutroom search "<topic>"` works on filenames immediately; then run `cutroom transcribe --clip <id>`.

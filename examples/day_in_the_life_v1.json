@@ -1,0 +1,52 @@
+{
+  "title": "Day in the life",
+  "version": 1,
+  "output": {"width": 1920, "height": 1080, "fps": 25},
+  "style": {
+    "captions": {"enabled": true, "size": 54, "position": "bottom", "max_words": 5},
+    "grade": {"lut": "", "normalize_exposure": true},
+    "voice": {"clean": true, "atten_lim_db": 20},
+    "music_under_speech": "mute"
+  },
+  "sections": [
+    {
+      "name": "cold open",
+      "music": {"song": "upbeat-song", "offset": 32.0, "gain_db": -1},
+      "segments": [
+        {"type": "talk", "clip": "C0107", "in": 88.2, "out": 90.6, "tighten": false,
+         "note": "strongest line first: the hook"},
+        {"type": "montage", "beat_sync": true, "max_shot": 0.9,
+         "shots": [{"clip": "C0140", "in": 2.0}, {"clip": "C0151", "in": 10.5},
+                   {"clip": "C0163", "in": 0.8}, {"clip": "C0172", "in": 4.2},
+                   {"clip": "C0188", "in": 1.1}, {"clip": "C0195", "in": 6.0}],
+         "note": "best moments of the day, one per location, all moving"}
+      ]
+    },
+    {
+      "name": "morning",
+      "music": {"song": "calm-song", "offset": 0.0, "gain_db": -4},
+      "segments": [
+        {"type": "talk", "clip": "C0107", "in": 3.5, "out": 31.0,
+         "cutaways": [{"clip": "C0112", "in": 3.0, "at": 9.5, "dur": 2.8}],
+         "overlays": [{"kind": "callout", "text": "6:40 AM", "at": 0.4, "dur": 2.0, "position": "auto"}],
+         "note": "sets up the day; cutaway shows the coffee being talked about"},
+        {"type": "broll", "clip": "C0120", "in": 1.0, "out": 3.4, "note": "journey shot: leaving the house"}
+      ]
+    },
+    {
+      "name": "day to night",
+      "segments": [
+        {"type": "matchcut", "a": {"clip": "C0201", "t": 14.2}, "b": {"clip": "C0388", "t": 3.1},
+         "pre": 0.8, "post": 1.6, "note": "same balcony framing, day to night"}
+      ]
+    },
+    {
+      "name": "out",
+      "music": {"song": "upbeat-song", "offset": 96.0, "gain_db": -2},
+      "segments": [
+        {"type": "talk", "clip": "C0390", "in": 10.0, "out": 18.5},
+        {"type": "broll", "clip": "C0395", "in": 2.0, "out": 5.5, "note": "aspirational last shot, creator alone"}
+      ]
+    }
+  ]
+}

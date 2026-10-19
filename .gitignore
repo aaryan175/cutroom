@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.DS_Store
+# projects live outside the repo, but just in case
+library.db*
+proxies/
+sheets/
+frames/
+transcripts/
+voice/
+cache/
+renders/
+*.mp4
+*.mov
+*.wav
+*.cube

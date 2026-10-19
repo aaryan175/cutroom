@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cutroom"
+version = "0.1.0"
+description = "An AI-operated edit room: index a large clip library, plan edits with Claude Code, render captioned, beat-synced videos with ffmpeg, and review them."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "numpy>=1.24",
+  "pillow>=10",
+  "opencv-python-headless>=4.8,<5",   # OpenCV 5 dropped the bundled Haar face cascades
+  "opencv-python>=4.8,<5",            # pulled in by scenedetect; keep both builds on the same 4.x
+  "librosa>=0.10",
+  "soundfile>=0.12",
+  "scenedetect>=0.6",
+]
+
+[project.optional-dependencies]
+asr = ["faster-whisper>=1.0"]
+voice = ["deepfilternet>=0.5"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+cutroom = "cutroom.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cutroom*"]

@@ -8,7 +8,7 @@ import { h, icon, tc, toast, ago } from './util.js';
 const STEPS = ['Intake', 'Producer', 'Reference', 'Extend', 'Edit', 'Render', 'QA', 'Critic', 'Fix', 'Ready'];
 const STATE_LABEL = { queued: 'queued', picked_up: 'picked up', running: 'working', needs_you: 'needs you', ready: 'ready',
   blocked: 'blocked', stopped: 'stopped', done: 'done' };
-export const FX = { light: null, orders: [], sel: null, detail: null, sub: 'orders', lessons: null, brain: null };
+export const FX = { light: null, orders: [], sel: null, detail: null, sub: 'orders', lessons: null, brain: null, lform: null };
 let root = null;
 let refreshT = 0;
 
@@ -49,16 +49,20 @@ async function act(fn, ok) {
   try { const r = await fn(); if (ok) toast(ok, 'ok', 2200); refresh(); return r; } catch (e) { toast(e.message, 'error'); return null; }
 }
 export async function answer(order, q, k) {
-  return act(() => api.fx.answer(order, q.id, k, ''), `Answered: ${k} = ${q.options[k - 1]}`);
+  return act(() => api.fx.answer(order, q.id, k, ''), `Answered: ${k} = ${bareOpt(q.options[k - 1])}`);
 }
 
-/** A question as one short line with numbered option buttons. */
+/** An option without the numbering a model may have written ("1. Add…" -> "Add…"): the button numbers it. */
+export const bareOpt = (o) => String(o ?? '').replace(/^\s*(?:\(?\d{1,2}[.):](?=\s)|\d{1,2}\s*=|[-*\u2022](?=\s))\s*/, '').trim();
+
+/** A question as one short line with numbered option buttons (full wording in the tooltip when cut). */
 export function questionEl(order, q, { compact = false } = {}) {
   const done = q.answered;
+  const full = q.options_full || q.options;
   return h('div.fx-q' + (done ? '.done' : '') + (compact ? '.compact' : ''),
-    h('div.fx-q-t', h('span.fx-q-ic', '?'), q.text),
+    h('div.fx-q-t', { title: q.text_full || q.text }, h('span.fx-q-ic', '?'), q.text),
     h('div.fx-q-opts', q.options.map((o, i) => h('button.btn' + (done && done.option === i + 1 ? '.primary' : ''),
-      { disabled: !!done, title: `${i + 1} = ${o}`, on: { click: () => answer(order, q, i + 1) } }, h('b', `${i + 1}`), ' ', o))));
+      { disabled: !!done, title: `${i + 1} = ${bareOpt(full[i] || o)}`, on: { click: () => answer(order, q, i + 1) } }, h('b', `${i + 1}`), ' ', bareOpt(o)))));
 }
 
 // ================================================================ data
@@ -94,7 +98,7 @@ function rolesEl(d) {
     h('span.fx-rname', r.role), h('span.fx-ragent', r.agent || ''),
     h('span.fx-rtime', r.seconds ? `${Math.round(r.seconds)}s` : r.running ? 'working…' : ''),
     h('span.fx-rcost', r.cost_usd ? fmtMoney(r.cost_usd) : ''),
-    h('span.fx-rlast', r.error ? r.error.slice(0, 120) : (r.last || '')),
+    h('span.fx-rlast', { title: r.error ? (r.error_full || r.error) : (r.last_full || r.last || '') }, r.error ? r.error.slice(0, 120) : (r.last || '')),
     h('button.ib.sm', { title: 'Show this run\'s log', html: icon('doc', 12), on: { click: () => showLog(d.order.id, r.role) } }))));
 }
 async function showLog(oid, role) {
@@ -130,11 +134,13 @@ function detailEl(d) {
     ['queued', 'picked_up', 'running'].includes(st.state) ? h('button.btn', { on: { click: () => act(() => api.fx.stop(o.id), 'Stopping') } }, h('span', { html: icon('stop', 11) }), 'Stop') : null,
     st.state === 'blocked' ? h('button.btn.primary', { title: 'Run the failed phase again (manual only)', on: { click: () => act(() => api.fx.retry(o.id), 'Queued again') } }, 'Retry') : null,
     st.version && ['ready', 'needs_you'].includes(st.state) ? h('button.btn', { on: { click: () => emit('toggleReview', true) } }, 'Review v' + st.version) : null);
-  const why = st.why ? h('div.fx-why.' + st.state, st.why) : null;
+  const why = st.why ? h('div.fx-why.' + st.state, { title: 'Click to show it all', on: { click: (e) => e.currentTarget.classList.toggle('open') } }, st.why) : null;
   const qs = (st.questions || []).length ? h('div.fx-qs', st.questions.map((q) => questionEl(o.id, q))) : null;
   const text = o.text ? h('div.fx-otext', '“' + o.text.slice(0, 300) + '”') : null;
-  return h('div.fx-detail', head, stepper(d), why, qs, text,
-    h('h5', 'Team'), rolesEl(d), ledgerEl(d) ? h('h5', 'What changed') : null, ledgerEl(d),
+  // Team sits right under the stepper (it is what you watch while an order runs); the questions, the
+  // ledger and the activity follow, and the whole pane scrolls on its own.
+  return h('div.fx-detail', head, stepper(d), h('h5', 'Team'), rolesEl(d), why, qs, text,
+    ledgerEl(d) ? h('h5', 'What changed') : null, ledgerEl(d),
     h('h5', 'Activity'), eventsEl(d));
 }
 function listEl() {
@@ -154,22 +160,69 @@ function listEl() {
 }
 
 // ---------------------------------------------------------------- lessons
+const PROV_LABEL = { creator_note: 'your note', creator_reject: 'your reject', creator_answer: 'your answer', creator_confirmed: 'you confirmed',
+  operator: 'you wrote it', rules: 'house rule', critic: 'critic', machine: 'machine check' };
+function provTag(x) {
+  const pv = x.provenance || (x.scope === 'global' ? { kind: 'rules', confirmed: true } : null);
+  if (!pv) return h('span.fx-prov.unk', { title: 'Made before provenance was recorded: check that it came from you' }, 'source unknown');
+  const machine = ['critic', 'machine'].includes(pv.kind);
+  const label = machine && pv.confirmed ? `${PROV_LABEL[pv.kind]} · you confirmed` : (PROV_LABEL[pv.kind] || pv.kind);
+  return h('span.fx-prov.' + (machine && !pv.confirmed ? 'unconf' : machine ? 'conf' : 'creator'),
+    { title: pv.words ? `From: “${pv.words}”` : `Source: ${x.source || pv.kind}` }, label);
+}
+/** Inline confirmation for Delete / Supersede (no confirm() dialogs in the studio). */
+function lessonForm(x, mode, active) {
+  const reason = h('input.inp.fx-lreason', { placeholder: mode === 'delete' ? 'Why is it wrong? (optional)' : 'Why? (optional)' });
+  reason.addEventListener('keydown', (e) => e.stopPropagation());
+  const by = mode === 'supersede' ? h('select.inp.fx-lby', h('option', { value: '' }, 'no replacement'),
+    active.filter((y) => y.id !== x.id).map((y) => h('option', { value: y.id }, `${y.id}: ${y.rule.slice(0, 60)}`))) : null;
+  const go = async () => {
+    const body = { reason: reason.value.trim() || undefined, scope: x.scope };
+    if (by && by.value) body.by = by.value;
+    FX.lform = null;
+    await act(() => (mode === 'delete' ? api.fx.deleteLesson(x.id, body) : api.fx.supersedeLesson(x.id, body)),
+      mode === 'delete' ? `Deleted ${x.id}${x.check ? ` and retired check ${x.check}` : ''}` : `Superseded ${x.id}`);
+    draw();
+  };
+  return h('div.fx-lform', h('span.fx-lfq', mode === 'delete' ? `Delete ${x.id}? It leaves every brief${x.check ? ` and check ${x.check} stops running` : ''}.`
+    : `Supersede ${x.id}?${x.check ? ` Check ${x.check} stops running.` : ''}`),
+  by, reason,
+  h('button.btn' + (mode === 'delete' ? '.danger' : '.primary'), { on: { click: go } }, mode === 'delete' ? 'Delete' : 'Supersede'),
+  h('button.btn.ghost', { on: { click: () => { FX.lform = null; draw(); } } }, 'Cancel'));
+}
+function lessonRow(x, active) {
+  const editable = x.scope === 'project' && x.status === 'active';
+  const open = FX.lform && FX.lform.id === x.id ? FX.lform.mode : null;
+  const btn = (mode, label, ic) => h('button.btn.sm.ghost.fx-lact', { title: mode === 'delete' ? 'Delete this lesson (it was wrong)' : 'Supersede: retire it, optionally naming the lesson that replaces it',
+    on: { click: () => { FX.lform = { id: x.id, mode }; draw(); } } }, h('span', { html: icon(ic, 11) }), label);
+  return h('div.fx-lwrap',
+    h('div.fx-lrow' + (x.status !== 'active' ? '.dead' : ''),
+      h('span.fx-lid', x.id), h('span.fx-lrule', x.rule), provTag(x), (x.tags || []).length ? h('span.fx-ltags', x.tags.join(' ')) : null,
+      x.check ? h('span.fx-lcheck', { title: 'Enforced by a machine check on every later version' }, 'check ' + x.check) : null,
+      x.status === 'superseded' ? h('span.fx-ltags', x.superseded_by ? `→ ${x.superseded_by}` : 'retired') : null,
+      editable ? h('span.fx-lacts', btn('supersede', 'Supersede', 'undo'), btn('delete', 'Delete', 'x')) : null),
+    open ? lessonForm(x, open, active) : null);
+}
 async function lessonsEl() {
   const box = h('div.fx-lessons', h('div.fx-none', 'Loading…'));
   try {
     const r = FX.lessons = await api.fx.lessons();
     box.innerHTML = '';
     const proj = r.lessons.filter((x) => x.scope === 'project'), glob = r.lessons.filter((x) => x.scope === 'global');
+    const active = proj.filter((x) => x.status === 'active');
     const inp = h('input.inp', { placeholder: 'Add a rule for this project ("never use the 701 clip")…' });
     inp.addEventListener('keydown', async (e) => { e.stopPropagation(); if (e.key === 'Enter' && inp.value.trim()) { await act(() => api.fx.addLesson({ rule: inp.value.trim() }), 'Lesson added'); draw(); } });
-    box.append(h('div.fx-lh', h('b', `${proj.filter((x) => x.status === 'active').length} project lessons`), h('span', ` · ${glob.length} house rules · inbox ${r.inbox_count} · ${r.checks.length} machine checks · lessons ${r.lessons_sha}`)),
+    const unconf = r.unconfirmed || [];
+    box.append(h('div.fx-lh', h('b', `${active.length} project lessons`), h('span', ` · ${glob.length} house rules · inbox ${r.inbox_count} · ${unconf.length} unconfirmed · ${r.checks.filter((c) => c.status !== 'retired').length} machine checks · lessons ${r.lessons_sha}`)),
       h('div.fx-ladd', inp),
-      h('div.fx-lrows', [...proj.slice().reverse(), ...glob.slice(0, 30)].map((x) => h('div.fx-lrow' + (x.status !== 'active' ? '.dead' : ''),
-        h('span.fx-lid', x.id), h('span.fx-lrule', x.rule), (x.tags || []).length ? h('span.fx-ltags', x.tags.join(' ')) : null,
-        x.check ? h('span.fx-lcheck', { title: 'Enforced by a machine check on every later version' }, 'check ' + x.check) : null,
-        x.scope === 'project' && x.status === 'active' ? h('button.ib.sm', { title: 'Supersede (retire) this lesson', html: icon('x', 11), on: { click: async () => { await act(() => api.fx.patchLesson({ id: x.id, status: 'superseded' }), 'Superseded'); draw(); } } }) : null))),
+      h('div.fx-lrows', [...proj.slice().reverse(), ...glob.slice(0, 30)].map((x) => lessonRow(x, active))),
+      unconf.length ? h('h5', 'Found by the critic or a machine check: a lesson only if you confirm it') : null,
+      ...unconf.slice(-15).reverse().map((i) => h('div.fx-lrow.inbox', h('span.fx-lid', i.id), h('span.fx-lrule', `[${i.kind}] ${i.text}`), provTag(i),
+        h('span.fx-lacts',
+          h('button.btn.sm', { title: 'Yes, that is a real problem: it may become a lesson', on: { click: async () => { await act(() => api.fx.confirmInbox(i.id), `Confirmed ${i.id}`); draw(); } } }, 'Confirm'),
+          h('button.btn.sm.ghost', { title: 'Not a real problem (e.g. a QA bug): it never becomes a lesson', on: { click: async () => { await act(() => api.fx.dismissInbox(i.id), `Dismissed ${i.id}`); draw(); } } }, 'Dismiss')))),
       r.inbox.length ? h('h5', 'Inbox (triaged at the end of each order; never blocks a version)') : null,
-      ...r.inbox.slice(-15).map((i) => h('div.fx-lrow.inbox', h('span.fx-lid', i.id), h('span.fx-lrule', `[${i.kind}] ${i.text}`))));
+      ...r.inbox.slice(-15).map((i) => h('div.fx-lrow.inbox', h('span.fx-lid', i.id), h('span.fx-lrule', `[${i.kind}] ${i.text}`), provTag(i))));
   } catch (e) { box.innerHTML = ''; box.appendChild(h('div.fx-none', e.message)); }
   return box;
 }

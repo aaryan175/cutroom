@@ -631,3 +631,154 @@ def test_render_job(studio_srv):
     assert code == 200 and ov["available"] and ov["running"] is False
     code, ov = req(S, "POST", "/api/overnight", {"action": "bogus"})
     assert code == 400
+
+
+# ================================================================================ real-run UI fixes
+def test_saved_state_after_factory_release(studio_srv):
+    """The real run showed "Draft — unsaved changes since v5" while the draft was v3: factory versions are
+    written next to the draft and saved_state compared the draft with the NEWEST file. The draft's base is
+    the version it equals (own number first); newer versions are listed, never made the base."""
+    S = studio_srv
+    code, d = req(S, "POST", "/api/plan/new", {"title": "Saved State"})
+    slug = d["slug"]
+    req(S, "POST", f"/api/plan/{slug}/op", {"op": "insert", "at_t": 0,
+                                           "segment": {"type": "broll", "clip": S["ids"]["steady"], "in": 1.0, "out": 2.0}})
+    for _ in range(3):
+        code, c = req(S, "POST", f"/api/plan/{slug}/commit")
+        assert code == 200, c
+    assert c["version"] == 3
+    # the factory publishes v4 and v5 (different content), the draft is untouched
+    v3 = json.loads(S["cfg"].p("plans", f"{slug}_v3.json").read_text())
+    for n in (4, 5):
+        fv = json.loads(json.dumps(v3))
+        fv["version"] = n
+        fv["sections"][0]["segments"][0]["out"] = 2.0 + 0.1 * n
+        S["cfg"].p("plans", f"{slug}_v{n}.json").write_text(json.dumps(fv))
+    code, g = req(S, "GET", f"/api/plan/{slug}")
+    s = g["saved"]
+    assert s["version"] == 3 and s["latest"] == f"{slug}_v3.json" and s["dirty"] is False
+    assert s["newest_version"] == 5 and [x["version"] for x in s["newer"]] == [4, 5]
+    # an edit makes it dirty against v3 (not v5)
+    code, e = req(S, "POST", f"/api/plan/{slug}/op", {"op": "insert", "at_t": 99, "segment": {"type": "black", "dur": 0.4}})
+    assert e["saved"]["dirty"] is True and e["saved"]["version"] == 3
+    # a draft that equals a factory version is "saved as" that version, whatever its own number says
+    same = json.loads(S["cfg"].p("plans", f"{slug}_v5.json").read_text())
+    same["version"] = 3
+    code, e = req(S, "PUT", f"/api/plan/{slug}", {"plan": same})
+    assert code == 200 and e["saved"]["version"] == 5 and e["saved"]["dirty"] is False and e["saved"]["newer"] == []
+
+
+def test_commit_refuses_stale_draft_and_respects_reservations(studio_srv):
+    """Save version never writes a draft the page has not seen (expect = draft_sha) and never takes a version
+    number a running factory order reserved."""
+    from cutroom.factory import bus as fbus
+    S = studio_srv
+    code, d = req(S, "POST", "/api/plan/new", {"title": "Stale Save"})
+    slug = d["slug"]
+    code, d = req(S, "POST", f"/api/plan/{slug}/op", {"op": "insert", "at_t": 0,
+                                                     "segment": {"type": "broll", "clip": S["ids"]["steady"], "in": 1.0, "out": 2.0}})
+    seen = d["draft_sha"]
+    assert seen and len(seen) == 16
+    # the draft changes on disk behind the page's back (another tab, Claude, Open in draft)
+    p = S["cfg"].p("plans", f"{slug}.draft.json")
+    dd = json.loads(p.read_text())
+    dd["title"] = "changed elsewhere"
+    p.write_text(json.dumps(dd))
+    code, e = req(S, "POST", f"/api/plan/{slug}/commit", {"expect": seen})
+    assert code == 409 and "changed since" in e["error"]
+    assert not S["cfg"].p("plans", f"{slug}_v1.json").exists()
+    code, g = req(S, "GET", f"/api/plan/{slug}")
+    assert g["draft_sha"] != seen and g["draft"]["title"] == "changed elsewhere"
+    # a running order reserved v1: the hand save takes v2
+    assert fbus.reserve_version(S["cfg"], slug) == 1
+    code, c = req(S, "POST", f"/api/plan/{slug}/commit", {"expect": g["draft_sha"]})
+    assert code == 200 and c["version"] == 2, c
+    assert json.loads(S["cfg"].p("plans", f"{slug}_v2.json").read_text())["title"] == "changed elsewhere"
+    assert fbus.reserve_version(S["cfg"], slug) == 3                     # and the factory skips the hand one
+
+
+def test_factory_lessons_delete_supersede_confirm_routes(studio_srv, tmp_path, monkeypatch):
+    from cutroom.factory import lessons, lint
+    S = studio_srv
+    monkeypatch.setenv("CUTROOM_GLOBAL_DIR", str(tmp_path / "global"))
+    cfg = S["cfg"]
+    bad = lessons.add_lesson(cfg, "never add a film look", check={"type": "qa_metric",
+                                                                  "params": {"check": "devices_vs_reference", "worst": "warn"}})
+    good = lessons.add_lesson(cfg, "keep held shots under titles fresh")
+    newer = lessons.add_lesson(cfg, "keep held shots fresh within 10 s")
+    code, r = req(S, "GET", "/api/factory/lessons")
+    row = next(x for x in r["lessons"] if x["id"] == bad["id"])
+    assert row["provenance"]["kind"] == "operator" and row["check"]
+    # delete: the lesson leaves the list and its learned check retires
+    code, d = req(S, "POST", f"/api/factory/lessons/{bad['id']}/delete", {"reason": "taught by a QA bug"})
+    assert code == 200 and d["status"] == "deleted" and d["deleted_why"] == "taught by a QA bug"
+    code, r = req(S, "GET", "/api/factory/lessons")
+    assert bad["id"] not in {x["id"] for x in r["lessons"]} and bad["id"] in {x["id"] for x in r["deleted"]}
+    assert row["check"] not in {c["id"] for c in lint.load_checks(cfg)}
+    raw = json.loads(lint.checks_path(cfg, "project").read_text())["checks"]
+    assert next(c for c in raw if c["id"] == row["check"])["status"] == "retired"
+    assert bad["id"] not in lessons.brief(cfg)["rules"]
+    # supersede, naming the replacement; self / unknown refused
+    code, e = req(S, "POST", f"/api/factory/lessons/{good['id']}/supersede", {"by": good["id"]})
+    assert code == 400
+    code, e = req(S, "POST", "/api/factory/lessons/P9999/supersede", {})
+    assert code == 404
+    code, s = req(S, "POST", f"/api/factory/lessons/{good['id']}/supersede", {"by": newer["id"], "reason": "narrower"})
+    assert code == 200 and s["status"] == "superseded" and s["superseded_by"] == newer["id"]
+    assert good["id"] not in lessons.brief(cfg)["rules"] and newer["id"] in lessons.brief(cfg)["rules"]
+    code, e = req(S, "POST", f"/api/factory/lessons/{newer['id']}/delete", {"scope": "nowhere"})
+    assert code == 400
+    # the old PATCH path still works (and takes a reason)
+    code, e = req(S, "PATCH", "/api/factory/lessons", {"id": newer["id"], "status": "superseded", "reason": "x"})
+    assert code == 200 and e["status"] == "superseded"
+    # a machine finding is unconfirmed until the creator confirms it; dismiss keeps it out for good
+    rows = lessons.harvest(cfg, [{"source": "qa:o1", "kind": "machine_fail", "text": "film not measured on the reference"},
+                                 {"source": "critic:o1", "kind": "critic_hard", "text": "title sits on the shirt"}])
+    code, r = req(S, "GET", "/api/factory/lessons")
+    assert {x["id"] for x in r["unconfirmed"]} >= {x["id"] for x in rows}
+    code, c = req(S, "POST", f"/api/factory/inbox/{rows[1]['id']}/confirm", {})
+    assert code == 200 and c["status"] == "open" and c["provenance"]["confirmed"] is True
+    code, x = req(S, "POST", f"/api/factory/inbox/{rows[0]['id']}/dismiss", {"reason": "QA bug"})
+    assert code == 200 and x["status"] == "triaged" and x["dismissed"]
+    code, r = req(S, "GET", "/api/factory/lessons")
+    assert rows[0]["id"] not in {x["id"] for x in r["unconfirmed"]} and rows[1]["id"] in {x["id"] for x in r["inbox"]}
+
+
+def test_team_rows_show_short_paths():
+    from cutroom.studio import role_rows_for_ui, short_paths
+    w = "/data/proj/work"
+    out = role_rows_for_ui([{"role": "editor-1", "last": f'StructuredOutput {{"candidate": "{w}/factory/orders/o1/candidate.json"}}'},
+                            {"role": "critic-1", "last": f"Read {w}/renders/x_v5_preview.mp4", "error": None},
+                            {"role": "fix-1", "last": "Bash cutroom frames C5628 --at 18.2", "error": f"no file {w}/plans/a.json"}], w)
+    assert out[0]["last"] == "returned its result" and out[0]["last_full"].startswith("StructuredOutput")
+    assert out[1]["last"] == "Read renders/x_v5_preview.mp4" and out[1]["last_full"].endswith(".mp4")
+    assert out[2]["last"] == "Bash cutroom frames C5628 --at 18.2" and "last_full" not in out[2]
+    assert out[2]["error"] == "no file plans/a.json"
+    assert short_paths("open /opt/a/b/c/d/e.json now", w) == "open …/d/e.json now"
+    home = str(Path.home())
+    assert short_paths(f"{home}/x.json", w) == "~/x.json"
+    assert "/" not in short_paths(f"{w}", w).strip(".")
+
+
+def test_question_options_not_double_numbered_or_cut_mid_word():
+    from cutroom.factory import card
+    real = {"note": "n2", "question": "The cold-open title can't sit over the trees without a code change (typed titles are "
+            "always centred), and every other clip is already used within 10s. How should I handle it?",
+            "options": ["1. Add an x/y position option for typed titles in the renderer (a code change), then put DAY THREE "
+                        "over the left-side trees", "2. Raise the title into the upper frame on the same shot (also needs the "
+                        "y pass-through)", "3. Give the title a dark backing or outline so it reads on the shirt",
+                        "4. Leave it as it is"]}
+    q = card.clean_questions([real])[0]
+    assert all(not o[:1].isdigit() for o in q["options"])
+    assert " = 1." not in q["line"] and "1 = Add an x/y" in q["line"]
+    assert len(q["line"]) <= card.QMAX
+    words = set(" ".join(real["options"] + [real["question"]]).replace("(", " ").replace(")", " ").split())
+    for piece in q["options"] + [q["text"]]:
+        last = piece.rstrip("…").split()[-1].strip(",;:(")
+        assert last in words or last.rstrip(",.") in words, f"cut mid-word: {piece!r}"
+    assert len(q["text"]) >= 100                                   # the question keeps its sense
+    assert q["options_full"][0].startswith("Add an x/y") and q["text_full"].endswith("handle it?")
+    again = card.clean_questions([q])[0]                            # cleaning twice keeps the full words
+    assert again["options_full"] == q["options_full"] and again["line"] == q["line"]
+    assert card.strip_number("1.5 s gap") == "1.5 s gap" and card.strip_number("-6 dB") == "-6 dB"
+    assert card.strip_number("(3) Leave it") == "Leave it" and card.strip_number("2 = keep") == "keep"

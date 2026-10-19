@@ -185,6 +185,8 @@ def normalize(film):
     if not any(float(f.get(k) or 0) > 1e-4 for k in ("grain", "soften", "vignette", "halation", "bloom", "ca", "black")) \
             and not f.get("rolloff"):
         return None
+    if film.get("from_reference"):     # provenance: the sidecar carries it so QA rule 38 can see the match
+        f["from_reference"] = film["from_reference"]
     return f
 
 

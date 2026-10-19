@@ -62,7 +62,10 @@ function cardEl(c) {
       r.proof ? h('span.rv-proof', r.proof) : null))));
   const qs = (cd.questions || []).length ? h('div.rv-sec', h('h6', 'Couldn\'t place: needs you'), ...cd.questions.map((q) => questionEl(cd.order, q, { compact: true }))) : null;
   const crit = cd.critic && (cd.critic.findings || []).length ? h('div.rv-sec', h('h6', 'Critic'), ...cd.critic.findings.map((f) =>
-    h('div.rv-li.' + (f.sev === 'HARD' ? (f.fix ? 'ok' : 'bad') : 'soft'), `${f.id} ${f.sev}${f.t !== null && f.t !== undefined ? ' @ ' + mm(f.t) : ''}: ${f.text}`, f.fix ? h('span.rv-proof', ' → fixed: ' + f.fix) : null))) : null;
+    h('div.rv-li.' + (f.sev === 'HARD' ? (((f.status || (f.fix ? 'closed' : 'open')) === 'closed') ? 'ok' : 'bad') : 'soft'), `${f.id} ${f.sev}${f.t !== null && f.t !== undefined ? ' @ ' + mm(f.t) : ''}: ${f.text}`,
+      f.sev === 'HARD' && (f.status || (f.fix ? 'closed' : 'open')) === 'closed'
+        ? h('span.rv-proof', ' → closed' + (f.verified ? ' (re-checked on the fixed render: ' + f.verified + ')' : f.fix ? ': ' + f.fix : ''))
+        : (f.sev === 'HARD' && f.fix ? h('span.rv-proof', ' → still open (fix said: ' + f.fix + (f.verified ? '; re-check: ' + f.verified : '') + ')') : null)))) : null;
   return h('div.rv-card', badges,
     cd.passed ? null : h('div.fx-why.needs_you', 'Not passed: ' + (cd.not_passed || []).join('; ')),
     h('div.rv-theme', cd.theme), rows, qs, crit,

@@ -21,7 +21,9 @@ tab, Review card, phone page).
 
 **Decisions taken on §12's open questions.**
 1. The critic runs on every order except a pure text/caption tweak (`phases.critic_needed`).
-2. Extensions are never applied automatically. The extender is a stub in this build: a needed capability
+2. Extensions are never applied automatically. The extender is a stub in this build: a capability that
+   already exists (`phases.BUILT_CAPABILITIES`, e.g. `typed_title_position`) finishes the sub-order as done,
+   with usage text. Any other needed capability
    becomes an `extend` sub-order that asks you (needs you); the Apply route answers 501.
 3. Cost cap: **per order, default $5** notional (`budgets.cost_usd`). Reaching it stops at the next phase
    boundary with "needs you: Budget reached ... 1 = yes, +$5 / 2 = stop". Role runs (6) and the order wall
@@ -51,8 +53,30 @@ tab, Review card, phone page).
 - Chat: a message that asks for edit work ("make a 2 min edit", "fix all my notes", "match this reference")
   gets a **Run in factory** chip; the agent may also write `[[factory:revise]]`.
 
+**Hardening after the first real run.**
+- *Lessons have provenance.* Only the creator's words become lessons: a note, a reject reason, an answer, or a
+  critic/machine finding the creator confirmed (Lessons tab: Confirm / Dismiss; `lessons.confirm_item`).
+  Critic findings and machine-QA fails enter the inbox as `unconfirmed`; the lesson-keeper never sees them,
+  and `apply_ops` refuses to turn them into lessons. Lessons can be superseded or deleted (Lessons tab, or
+  `lessons.supersede` / `lessons.delete`), and either way the lesson's learned check is retired. In the real
+  run a QA bug taught "never add a film look" (P0002 + check C0002).
+- *Cold-open notes map.* Generated cold-open pieces (section −1) map to `cold_open.card`, `cold_open.shots`,
+  `cold_open.lines[k]`, `cold_open.end_shot` and `cold_open.title`, plus `cold_open` itself. A note on the
+  cold open lets plan-wide `cold_open` change in the lock check.
+- *Claims are measured.* Every number in an editor or fix ledger or summary that code can measure (LUFS,
+  swing, dB louder or quieter, true peak, LRA, "no repeat", "no clipping") is checked on the render, and
+  against the base render for deltas (`factory/claims.py`, `cutroom measure`). A false claim becomes a HARD
+  finding `K<n>`. Card rows carry the measured numbers, or "NOT on the render".
+- *Findings are re-judged.* After the fix round, the `verify` phase re-measures claim findings in code. For
+  critic findings it runs one short read-only verify role on the FIXED render; this run is outside the
+  role-run budget. A finding closes only when re-judged closed. A QA fail that was already in the base
+  version is a warning and never keeps a finding open.
+- *The right base render.* `export.find_render` with `preview=True`, the plan's version, whole renders only
+  (no `only` partials), and fresh renders only (`plan_sha` in the sidecar, else the mtime). With no fresh
+  preview of the base, the render phase renders one (`render_base`, default on).
+
 **Pipeline as built** (`phases.PLANS`): revise / reject / continue / request = intake → producer →
-[forensics] → [extend] → edit → render → qa → critic → [fix → render2 → qa2] → integrate → lessons (silent);
+[forensics] → [extend] → edit → render → qa → critic → [fix → render2 → qa2 → verify] → integrate → lessons (silent);
 variants = intake → producer → variants_edit → variants_render → variants_integrate; approve =
 approve_intake → render_final → qa_final → approve_record (no agent); extend = extend_stub.
 

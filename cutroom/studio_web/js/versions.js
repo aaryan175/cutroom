@@ -6,13 +6,15 @@ import { api, hooks, media } from './api.js';
 import { h, icon, toast, ago, dur, clamp } from './util.js';
 import { xicon, explain } from './importer.js';
 
-let last = { slug: null, saved: null, rows: [] };      // from the newest plan payload
+let last = { slug: null, saved: null, rows: [], sha: null };      // from the newest plan payload
 hooks.planPayload = (p) => {
-  last = { slug: p.slug, saved: p.saved || null, rows: p.version_files || [] };
+  last = { slug: p.slug, saved: p.saved || null, rows: p.version_files || [], sha: p.draft_sha || null };
   if (btn) syncBtn();
 };
 
 const vnum = (f) => { const m = String(f || '').match(/_v(\d+)\.json$/); return m ? +m[1] : null; };
+/** The draft hash of the newest payload this page applied (Save version sends it as `expect`). */
+export function draftSha() { return S.plan && last.slug === S.plan.slug ? last.sha : null; }
 export function savedState() { return S.plan && last.slug === S.plan.slug ? last.saved : null; }
 /** Header words for the draft's state. */
 export function draftLabel() {
@@ -21,7 +23,10 @@ export function draftLabel() {
   if (!s) return 'Draft';
   if (!s.latest) return 'Draft · not saved yet';
   const v = s.version ?? vnum(s.latest);
-  return s.dirty ? `Draft — unsaved changes since v${v}` : `Saved as v${v}`;
+  const nv = s.newest_version ?? vnum(s.newest);
+  // A newer version (usually one the factory made) does not change what the draft is based on.
+  const newer = nv !== null && nv !== undefined && v !== null && v !== undefined && nv > v ? ` · v${nv} is newer` : '';
+  return (s.dirty ? `Draft — unsaved changes since v${v}` : `Saved as v${v}`) + newer;
 }
 function versionRows() {
   if (!S.plan || last.slug !== S.plan.slug) return [];

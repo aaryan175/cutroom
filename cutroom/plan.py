@@ -87,7 +87,9 @@ Craft fields (docs/PLAN_FORMAT.md "Craft"; defaults measured from a reference vl
                           "music": {"song", "offset", "under_db": -5, "lift_db": 0}, "face_s": null (= whole line),
                           "end_flash": false, "card": {"text": "COMING UP", ...} | null, "inset": {frame} | null,
                           "gate": {frame} | null, "burns": true, "end_shot": {"clip", "in", "dur": 2.7},
-                          "title": {"text", "start": 1.12, ...} | null, "loudness": {"I": -12}}
+                          "title": {"text", "start": 1.12, ...} | null, "loudness": {"I": -12},
+                          "dynamics": {"match": "reference", "offset_db": 0} (follow the reference's measured
+                          momentary-loudness envelope element by element)}
   style.film             {"grain", "grain_size", "soften", "vignette", "halation", "bloom", "ca", "rolloff", "black"}
                           every key off by default; only what a reference measurably has (cutroom/film.py)
   style.loudness         {"I": -14, "TP": -1.5, "anchor": "dialogue"|"programme"}
@@ -419,6 +421,10 @@ def _validate_typed(w, o):
     errs = []
     if not str(o.get("text", "")).strip():
         errs.append(f"{w}: typed_title needs text")
+    pos = o.get("pos")
+    if pos is not None and pos != "auto" and not (isinstance(pos, dict) and all(
+            0.0 <= _num(pos.get(k), -1) <= 1.0 for k in ("x", "y"))):
+        errs.append(f"{w}: pos must be \"auto\" or {{\"x\": 0-1, \"y\": 0-1}} (title centre, frame fractions)")
     if o.get("char_s") is not None and not 0.005 <= _num(o["char_s"], 0) <= 1.0:
         errs.append(f"{w}: char_s must be 0.005-1 s per character")
     if o.get("size") is not None and not 0.02 <= _num(o["size"], 0) <= 0.3:
@@ -500,15 +506,25 @@ def _validate_cold_open(co, plan, chk_clip):
     if co.get("face_s") is not None and not 0 <= _num(co["face_s"], -1) <= 30:
         errs.append("cold_open.face_s must be 0-30 s (null = the whole line on the face)")
     es = co.get("end_shot")
-    if es:
+    if es == "auto" or (isinstance(es, dict) and es.get("auto") and es.get("clip") is None):
+        if isinstance(es, dict) and not 0.5 <= _num(es.get("dur", 2.7), 0) <= 8:
+            errs.append("cold_open.end_shot.dur must be 0.5-8 s")
+    elif es:
         if not isinstance(es, dict) or es.get("clip") is None:
-            errs.append("cold_open.end_shot needs {clip, in, dur}")
+            errs.append("cold_open.end_shot needs {clip, in, dur} or \"auto\"")
         else:
             chk_clip("cold_open end_shot", es.get("clip"), es.get("in"))
             if not 0.5 <= _num(es.get("dur", 2.7), 0) <= 8:
                 errs.append("cold_open.end_shot.dur must be 0.5-8 s")
     if co.get("title"):
         errs += _validate_typed("cold_open.title", co["title"] if isinstance(co["title"], dict) else {"text": co["title"]})
+    dy = co.get("dynamics")
+    if dy is not None and dy is not False:
+        dd = {"match": dy} if isinstance(dy, str) else dy
+        if not isinstance(dd, dict) or dd.get("match") != "reference":
+            errs.append("cold_open.dynamics must be {\"match\": \"reference\"} (or omitted)")
+        elif not (dd.get("reference") or co.get("from_reference") or plan.get("reference")):
+            errs.append("cold_open.dynamics needs a reference (cold_open.from_reference)")
     cl = co.get("loudness") or {}
     if cl.get("I") is not None and not -24 <= _num(cl["I"], 0) <= -8:
         errs.append("cold_open.loudness.I must be -24..-8 LUFS")

@@ -465,10 +465,21 @@ def typed_sequence(cache_dir, W, H, fps, n, spec, offset=0):
     l0 = f.getbbox(text)[0]
     pad = max(4, size // 10)
     xs = [pad + (f.getlength(text[:i + 1]) - l0) for i in range(len(text))]
-    x0 = int(round(W / 2 - full.width / 2))
+    x0 = int(round(W * float(spec.get("x", 0.5)) - full.width / 2))
     y0 = int(round(H * float(spec.get("y", 0.505)) - full.height / 2))
+    if spec.get("x") is not None:                 # an explicit/auto position never pushes the title off frame
+        x0 = max(0, min(W - full.width, x0))
+        y0 = max(0, min(H - full.height, y0))
     start, cs = float(spec.get("start", 0.0)), max(0.005, float(spec.get("char_s", TITLE["char_s"])))
     blank = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    plate = blank
+    if spec.get("backing"):                       # titleplace found no readable area: a dark plate behind it
+        from PIL import ImageDraw
+        pad_b = int(round(full.height * 0.18))
+        plate = blank.copy()
+        ImageDraw.Draw(plate).rounded_rectangle(
+            (x0 - pad_b, y0 - pad_b // 2, x0 + full.width + pad_b, y0 + full.height + pad_b // 2),
+            radius=max(2, pad_b // 2), fill=(12, 12, 12, 190))
     prev = None
     for i in range(n):
         t = (i + offset) / fps
@@ -477,7 +488,7 @@ def typed_sequence(cache_dir, W, H, fps, n, spec, offset=0):
         if shown == prev and i > 0:
             os.link(tmp / f"{i - 1:04d}.png", p)
             continue
-        im = blank.copy()
+        im = (plate if shown else blank).copy()
         if shown:
             cut = int(round(xs[shown - 1])) + 2 if shown < len(text) else full.width
             im.paste(full.crop((0, 0, min(full.width, cut), full.height)), (x0, y0),

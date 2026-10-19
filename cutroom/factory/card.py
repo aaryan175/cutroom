@@ -33,19 +33,53 @@ def question_line(text, opts) -> str:
     return f"{text.strip()} " + " / ".join(f"{i + 1} = {o}" for i, o in enumerate(opts))
 
 
+_NUM = re.compile(r"^\s*(?:\(?\d{1,2}[.):](?=\s)|\d{1,2}\s*=|[-*\u2022](?=\s))\s*")
+
+
+def strip_number(o) -> str:
+    """'1. Add an x/y option' / '(2) Raise it' / '3 = Leave it' -> the bare option (the UI numbers options itself)."""
+    return _NUM.sub("", " ".join(str(o or "").split()), count=1).strip()
+
+
+def cut_words(s, n) -> str:
+    """At most n chars, cut at a word boundary with an ellipsis (never mid-word)."""
+    s = " ".join(str(s or "").split())
+    if len(s) <= n:
+        return s
+    cut = s[:max(1, n - 1)]
+    sp = cut.rfind(" ")
+    if sp >= max(8, (n - 1) // 2):
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:-(/") + "\u2026"
+
+
+OPT_MAX, OPT_MIN, TEXT_MIN = 80, 40, 120
+
+
 def clean_questions(qs, kind="taste") -> list:
-    """Shape-checked questions; an over-long one is cut to fit (never dropped: the operator must see it)."""
+    """Shape-checked questions; an over-long one is cut to fit (never dropped: the operator must see it).
+    Options lose any numbering the model wrote ("1. ...": the UI numbers them) and every cut lands on a word
+    boundary with an ellipsis. Options shrink before the question does (down to OPT_MIN each) so the question
+    keeps at least TEXT_MIN chars; the uncut words stay in text_full / options_full (tooltips)."""
     out = []
     for i, q in enumerate(qs or []):
-        opts = [str(o).strip()[:80] for o in q.get("options") or [] if str(o).strip()][:4]
-        if len(opts) < 2:
-            opts = (opts + ["yes", "no"])[:2] if opts else ["yes", "no"]
-        text = " ".join(str(q.get("text") or q.get("question") or "").split())
-        room = QMAX - len(question_line("", opts)) - 1
-        if len(text) > room:
-            text = text[:max(20, room - 1)].rstrip() + "…"
-        out.append({"id": q.get("id") or f"q{i + 1}", "text": text, "options": opts, "note": q.get("note"),
-                    "kind": q.get("kind") or kind, "line": question_line(text, opts)})
+        full_opts = [strip_number(o) for o in q.get("options_full") or q.get("options") or [] if strip_number(o)][:4]
+        if len(full_opts) < 2:
+            full_opts = (full_opts + ["yes", "no"])[:2] if full_opts else ["yes", "no"]
+        full_text = " ".join(str(q.get("text_full") or q.get("text") or q.get("question") or "").split())
+        cap = OPT_MAX
+        while True:
+            opts = [cut_words(o, cap) for o in full_opts]
+            room = QMAX - len(question_line("", opts)) - 1
+            if room >= min(TEXT_MIN, len(full_text)) or cap <= OPT_MIN:
+                break
+            cap -= 4
+        text = cut_words(full_text, max(20, room))
+        row = {"id": q.get("id") or f"q{i + 1}", "text": text, "options": opts, "note": q.get("note"),
+               "kind": q.get("kind") or kind, "line": question_line(text, opts)}
+        if text != full_text or opts != full_opts:
+            row["text_full"], row["options_full"] = full_text, full_opts
+        out.append(row)
     return out
 
 
@@ -91,7 +125,11 @@ def markdown(card) -> str:
     if card.get("critic") and card["critic"].get("findings"):
         L += ["", "## Critic", ""]
         for f in card["critic"]["findings"]:
-            L.append(f"- {f.get('id')} {f.get('sev')} @ {mmss(f.get('t'))}: {f.get('text')} -> {f.get('fix') or 'open'}")
+            st = f.get("status") or ("closed" if f.get("fix") else "open")
+            tail = (f"closed (re-judged on the fixed render: {f.get('verified')})" if st == "closed" and f.get("verified")
+                    else "closed" if st == "closed" else "open" + (f" (fix said: {f.get('fix')}; " + (
+                        f"re-judged: {f.get('verified')})" if f.get("verified") else "not confirmed)") if f.get("fix") else ""))
+            L.append(f"- {f.get('id')} {f.get('sev')} @ {mmss(f.get('t'))}: {f.get('text')} -> {tail if f.get('sev') == 'HARD' else 'soft'}")
     L += ["", "## Checked", ""] + [f"- {c}" for c in card["checked"]]
     if card["warns"]:
         L += ["", "## Warnings (explained)", ""] + [f"- {w}" for w in card["warns"]]

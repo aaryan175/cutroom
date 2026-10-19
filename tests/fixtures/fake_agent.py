@@ -126,6 +126,12 @@ def default_result():
     if role == "critic":
         return {"findings": [], "per_note": [{"note": x["id"], "addressed": "yes", "why": "stub"} for x in notes],
                 "summary": "stub critic: nothing found"}
+    if role == "verify":
+        ids = re.findall(r"^- ((?:F\d+)|(?:K\d+)) @", prompt, re.M)
+        unproved = set(re.findall(r"^- ((?:F\d+)|(?:K\d+)): \(no proof given\)", prompt, re.M))
+        return {"results": [{"id": i, "closed": i not in unproved,
+                             "evidence": f"stub: looked at the new render for {i}" if i not in unproved
+                             else f"stub: {i} still shows on the new render"} for i in ids], "summary": "stub verify"}
     if role == "lessons":
         ids = re.findall(r"^- (I\d{4}) ", prompt, re.M)
         return {"ops": [{"op": "none", "inbox": i, "lesson": None, "rule": None, "symptom": None, "tags": [],

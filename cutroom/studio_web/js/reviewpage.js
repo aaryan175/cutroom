@@ -16,9 +16,11 @@ function toast(msg) {
 }
 let data = null, busy = false;
 
+const bareOpt = (o) => String(o ?? '').replace(/^\s*(?:\(?\d{1,2}[.):](?=\s)|\d{1,2}\s*=|[-*\u2022](?=\s))\s*/, '').trim();
 function qHtml(q) {
+  const full = q.options_full || q.options;
   return `<div class="card q" data-order="${esc(q.order)}" data-q="${esc(q.id)}"><div class="sub">${esc(q.plan)}${q.version ? ' · v' + q.version : ''}</div>
-    <h3>${esc(q.text)}</h3><div class="opts">${q.options.map((o, i) => `<button class="opt" data-k="${i + 1}"><b>${i + 1}</b>${esc(o)}</button>`).join('')}</div></div>`;
+    <h3 title="${esc(q.text_full || q.text)}">${esc(q.text)}</h3><div class="opts">${q.options.map((o, i) => `<button class="opt" data-k="${i + 1}" title="${esc(bareOpt(full[i] || o))}"><b>${i + 1}</b>${esc(bareOpt(o))}</button>`).join('')}</div></div>`;
 }
 function vHtml(v) {
   const cd = v.card;

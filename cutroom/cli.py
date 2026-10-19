@@ -233,6 +233,66 @@ def cmd_frames(a):
         print(out)
 
 
+def cmd_title(a):
+    """cutroom title place <plan> [--choose-shot]: where each typed title would sit with pos "auto" (measured
+    on the held shot under it), and with --choose-shot which cold-open pool shot suits it best."""
+    from pathlib import Path
+    from . import cards as CD
+    from . import db, titleplace as TP
+    from .render import resolve_timeline
+    cfg, con = _cfg_con()
+    plan = json.loads(Path(a.plan).read_text())
+    tl = resolve_timeline(cfg, con, plan, preview=True)
+    pcs = tl.get("pieces") or []
+    co = plan.get("cold_open") or {}
+    ti = co.get("title") or {}
+    ti = {"text": ti} if isinstance(ti, str) else dict(ti)
+    out = []
+
+    def path_of(cid):
+        r = dict(db.get_clip(con, cid))
+        return r["proxy"] if r.get("proxy") and Path(r["proxy"]).exists() else r["path"]
+    for t in [p for p in pcs if p.get("kind") == "typed_title"]:
+        mid = (t["start"] + t["end"]) / 2
+        under = next((p for p in pcs if p.get("track") == "V1" and p.get("clip") and p["start"] <= mid < p["end"]), None)
+        row = {"text": t.get("label"), "t0": t["start"], "t1": t["end"]}
+        if under is None:
+            row["why"] = "no clip under the title"
+            out.append(row)
+            continue
+        sp = float(under.get("speed") or 1.0)
+        a0 = float(under["in"]) + (t["start"] - under["start"]) * sp
+        a1 = a0 + (min(t["end"], under["end"]) - t["start"]) * sp
+        size, color = float(ti.get("size", CD.TITLE["size"])), ti.get("color", CD.TITLE["color"])
+        r = TP.place(cfg, path_of(under["clip"]), a0, a1, row["text"] or "", size, color)
+        row.update(clip=under.get("clip_rel") or under["clip"], src=[round(a0, 3), round(a1, 3)],
+                   pos={"x": r["x"], "y": r["y"]}, ok=r.get("ok"), backing=r.get("backing"), why=r.get("why"))
+        if a.debug_dir:
+            fr = TP.sample_frames(cfg, path_of(under["clip"]), a0, a1, n=1)
+            if fr:
+                row["debug"] = TP.debug_image(fr[0], r, Path(a.debug_dir) / f"title_{under['clip']}_{a0:.2f}.jpg")
+        if a.choose_shot:
+            used = {}
+            for p in pcs:
+                if p.get("track") in ("V1", "V2") and p.get("clip") and p.get("in") is not None and p is not under \
+                        and p["start"] < t["end"] + 10 and p["end"] > t["start"] - 10:
+                    sp2 = float(p.get("speed") or 1.0)
+                    used.setdefault(p["clip"], []).append((float(p["in"]), float(p["in"]) + (p["end"] - p["start"]) * sp2))
+            cands = []
+            for x in (co.get("shots") or []) + ([co["end_shot"]] if isinstance(co.get("end_shot"), dict)
+                                                 and co["end_shot"].get("clip") else []):
+                crow = dict(db.get_clip(con, x["clip"]))
+                cid = crow["id"]
+                cands.append({"clip": cid, "ref": x["clip"], "in": float(x.get("in") or 0.0), "path": path_of(cid),
+                              "duration": crow.get("duration")})
+            ch = TP.choose_shot(cfg, cands, row["text"] or "", size, color, dur=t["end"] - t["start"], used=used)
+            names = {c["clip"]: c["ref"] for c in cands}
+            row["choose_shot"] = {**ch, "ref": names.get(ch.get("clip")),
+                                  "ranking": [{**r2, "ref": names.get(r2["clip"])} for r2 in ch.get("ranking") or []]}
+        out.append(row)
+    print(json.dumps(out, indent=1, default=str))
+
+
 def cmd_songs(a):
     from . import music
     cfg, con = _cfg_con()
@@ -412,6 +472,21 @@ def cmd_qa(a):
     cfg, con = _cfg_con()
     rep = qa.run(cfg, a.video, plan_path=a.plan)
     print(json.dumps(rep["summary"], indent=2))
+
+
+def cmd_measure(a):
+    """Loudness / dynamics of a video (or a window of it), measured by ebur128: what the factory's claim check
+    and QA swing_vs_reference use. Roles measure with this; they never estimate a number."""
+    from . import dynamics
+    cfg, _ = _cfg_con()
+    v = a.video if Path(a.video).is_absolute() or Path(a.video).exists() else str(Path(cfg.work) / a.video)
+    st = dynamics.window_stats(cfg, v, a.start or 0.0, a.end)
+    if a.json:
+        print(json.dumps(st))
+        return
+    w = f"{a.start or 0:.2f}-{a.end:.2f}s" if a.end is not None else "whole file"
+    print(f"{Path(v).name} [{w}]  I {st['I']} LUFS  swing {st['swing']} LU (momentary p95-p10)  "
+          f"M p10 {st['M_p10']} / p95 {st['M_p95']} / max {st['M_max']} LUFS  TP {st['TP']} dBTP  LRA {st['LRA']} LU")
 
 
 def cmd_board(a):
@@ -780,6 +855,9 @@ def main(argv=None):
     p.add_argument("--to", dest="end", type=float); p.set_defaults(fn=cmd_say)
     p = sp.add_parser("frames"); p.add_argument("ref"); p.add_argument("t", nargs="+")
     p.add_argument("--width", type=int, default=960); p.set_defaults(fn=cmd_frames)
+    p = sp.add_parser("title", help="typed-title placement: where pos \"auto\" puts it, which held shot suits it")
+    p.add_argument("action", choices=["place"]); p.add_argument("plan")
+    p.add_argument("--choose-shot", action="store_true"); p.add_argument("--debug-dir"); p.set_defaults(fn=cmd_title)
     p = sp.add_parser("songs"); p.add_argument("action", choices=["index", "list"]); p.set_defaults(fn=cmd_songs)
     p = sp.add_parser("beats"); p.add_argument("song"); p.set_defaults(fn=cmd_beats)
     p = sp.add_parser("matchcuts"); p.add_argument("--limit", type=int); p.add_argument("--min-score", type=float, default=0.75)
@@ -788,6 +866,9 @@ def main(argv=None):
     p = sp.add_parser("render"); p.add_argument("plan"); p.add_argument("--preview", action="store_true")
     p.add_argument("--out"); p.add_argument("--only"); p.set_defaults(fn=cmd_render)
     p = sp.add_parser("qa"); p.add_argument("video"); p.add_argument("--plan"); p.set_defaults(fn=cmd_qa)
+    p = sp.add_parser("measure", help="loudness of a video or a window: I, swing (p95-p10 momentary), TP, LRA")
+    p.add_argument("video"); p.add_argument("--from", dest="start", type=float); p.add_argument("--to", dest="end", type=float)
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_measure)
     p = sp.add_parser("export", help="platform files, reframes, captions, chapters, thumbnails, cutdowns")
     p.add_argument("target", help="a render .mp4 (with its .json sidecar) or a plan .json")
     p.add_argument("--preset", action="append", help="youtube, youtube_4k, reels, tiktok, shorts, square, feed, all "

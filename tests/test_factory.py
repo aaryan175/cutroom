@@ -1065,3 +1065,295 @@ def test_acceptance_replay_v022_to_v023_stub(fproj, tmp_path, monkeypatch):
                                                               "passed": cd["passed"], "not_passed": cd["not_passed"],
                                                               "qa_phase": qa}, indent=1))
     print(f"\nreplay: {len(resolved)}/11 resolved, {len(cd['questions'])} questions, {wall:.0f}s, passed={cd['passed']}")
+
+
+def test_film_provenance_reaches_sidecar_normalize():
+    from cutroom import film
+    f = film.normalize({"rolloff": {"knee": 0.82, "ceiling": 0.94}, "from_reference": "9fe6442b1b", "measured": "x"})
+    assert f["from_reference"] == "9fe6442b1b" and f["rolloff"]["ceiling"] == 0.94 and "measured" not in f
+    assert "from_reference" not in film.normalize({"rolloff": {"knee": 0.82, "ceiling": 0.94}})
+    assert film.normalize({"from_reference": "r"}) is None          # provenance alone is no effect
+    assert film.chain(f, 1920, 1080)                                   # still renders
+
+
+def test_render_lock_excused_only_by_asked_style_change():
+    hard = [{"sev": "HARD", "ref": "1.2", "text": "untouched segment 1.2 looks different", "t": 49.0}]
+    ex = lockcheck.excuse_global(hard, ["cold_open", "style"], True)
+    assert ex[0]["sev"] == "warn" and "style" in ex[0]["text"] and hard[0]["sev"] == "HARD"
+    assert lockcheck.excuse_global(hard, ["style"], False)[0]["sev"] == "HARD"       # not asked for
+    assert lockcheck.excuse_global(hard, ["cold_open"], True)[0]["sev"] == "HARD"    # cold open can't touch body frames
+
+
+def test_role_path_has_cutroom_command(tmp_path, monkeypatch):
+    from cutroom.factory import runner as R
+    cfg = Config(work=str(tmp_path))
+    fake = tmp_path / "py" / "bin"
+    fake.mkdir(parents=True)
+    monkeypatch.setattr(sys, "executable", str(fake / "python3"))
+    d = Path(R.cli_bindir(cfg))
+    assert d == tmp_path / "factory" / ".bin" and os.access(d / "cutroom", os.X_OK)
+    assert f'"{fake / "python3"}" -m cutroom.cli' in (d / "cutroom").read_text()
+    (fake / "cutroom").write_text("#!/bin/sh\n")                         # a venv install: use it as is
+    assert R.cli_bindir(cfg) == str(fake)
+
+
+def test_fix_round_drops_answered_unplaced_questions():
+    from cutroom.factory import phases
+    pr = {"questions": [{"text": "producer q", "note": None}]}
+    ed = {"unplaced": [{"note": "n2", "text": "title can't move"}, {"note": "n3", "text": "still open"}]}
+    fx = {"ledger": [{"note": "n2", "change": "swapped the held shot"}, {"note": "n1", "change": "x"}]}
+    assert [q["text"] for q in phases.round_questions(pr, ed, fx)] == ["producer q", "still open"]
+    assert len(phases.round_questions(pr, ed, None)) == 3                 # no fix round: all stay
+
+
+# ============================================================================================== hardening after the first real run
+def test_lessons_only_from_the_creator_and_supersede_delete(tmp_path):
+    """QA bugs taught false lessons in the real run ("never add a film look" from a broken rule-38 check). A
+    lesson comes only from the creator's words or a finding the creator confirmed; delete / supersede retire
+    the lesson's check too."""
+    cfg = Config(work=str(tmp_path))
+    rows = lessons.harvest(cfg, [
+        {"source": "qa:o1", "kind": "machine_fail", "text": "film: not measured on the creator's reference"},
+        {"source": "critic:o1", "kind": "critic_hard", "text": "the same setup three times in 5 s"},
+        {"source": "comment:m1", "kind": "note", "text": "never put the title on my shirt"},
+        {"source": "verdict:x_v2", "kind": "reject", "text": "too quiet, no punch"}], order="o1")
+    st = {r["kind"]: r["status"] for r in rows}
+    assert st == {"machine_fail": "unconfirmed", "critic_hard": "unconfirmed", "note": "open", "reject": "open"}
+    assert {r["provenance"]["kind"] for r in rows} == {"machine", "critic", "creator_note", "creator_reject"}
+    assert [r["kind"] for r in lessons.inbox(cfg, order="o1")] == ["note", "reject"]   # the keeper never sees the rest
+    m_id, c_id, n_id = rows[0]["id"], rows[1]["id"], rows[2]["id"]
+    # a lesson-keeper that tries anyway is refused by code
+    done = lessons.apply_ops(cfg, [{"op": "add", "inbox": m_id, "rule": "Never add a film look",
+                                    "check_json": {"type": "qa_metric", "params": {"check": "devices_vs_reference"}}}])
+    assert done[0]["op"] == "refused" and not lessons.load(cfg)["lessons"] and not lint.load_checks(cfg, "project")
+    # the creator's own note can become a lesson (with a check), with provenance on the lesson
+    d = lessons.apply_ops(cfg, [{"op": "add", "inbox": n_id, "rule": "Titles never sit on the creator",
+                                 "check_json": {"type": "qa_metric", "params": {"check": "text_vs_faces"}}}])
+    les = lessons.load(cfg)["lessons"][0]
+    assert d[0]["op"] == "add" and les["provenance"]["kind"] == "creator_note" and les["provenance"]["creator"]
+    # the creator confirms the critic finding -> eligible
+    lessons.confirm_item(cfg, c_id, text="yes: never repeat a setup within 10 s")
+    assert c_id in [r["id"] for r in lessons.inbox(cfg)]
+    d2 = lessons.apply_ops(cfg, [{"op": "supersede", "inbox": c_id, "lesson": les["id"], "rule": "Never repeat a setup within 10 s"}])
+    new = d2[0]["lesson"]
+    allc = bus.read_json(lint.checks_path(cfg), {})["checks"]
+    assert next(c for c in allc if c["lesson"] == les["id"])["status"] == "retired"      # superseded lesson's check off
+    assert not lint.load_checks(cfg, "project")
+    assert next(x for x in lessons.load(cfg)["lessons"] if x["id"] == new)["provenance"]["confirmed"]
+    # delete: gone from the law and the brief, check retired, kept in `deleted`; ids never reused
+    l3 = lessons.add_lesson(cfg, "Never add a film look", check={"type": "qa_metric", "params": {"check": "devices_vs_reference"}})
+    assert l3["provenance"]["kind"] == "operator" and lint.load_checks(cfg, "project")
+    rec = lessons.delete(cfg, l3["id"], reason="taught by a QA bug")
+    assert rec["status"] == "deleted" and not lint.load_checks(cfg, "project")
+    assert f"[{l3['id']}]" not in lessons.brief(cfg, "s")["text"]
+    assert lessons.load(cfg)["deleted"][0]["id"] == l3["id"]
+    assert lessons.add_lesson(cfg, "another")["id"] not in {x["id"] for x in lessons.load(cfg)["lessons"][:-1]} | {l3["id"]}
+    lessons.supersede(cfg, new, reason="replaced by hand")
+    with pytest.raises(KeyError):
+        lessons.supersede(cfg, new, by="P9999")
+    lessons.dismiss_item(cfg, m_id, "a QA bug")
+    assert not lessons.unconfirmed(cfg)[0]["id"] == m_id if lessons.unconfirmed(cfg) else True
+
+
+def _co_tl():
+    """A resolved timeline with a generated cold open (section -1) like the real run: card, strobe blocks,
+    teaser lines, the held end shot with its typed title, then the body."""
+    P = []
+
+    def add(sec, seg, typ, kind, a, b, track="V1", clip="c1"):
+        P.append({"track": track, "sec": sec, "seg": seg, "type": typ, "kind": kind, "start": a, "end": b,
+                  "clip": clip if kind == "clip" else None, "in": 0.0 if kind == "clip" else None, "speed": 1.0})
+    add(-1, 0, "card", "card", 0.0, 0.84)
+    add(-1, 1, "montage", "clip", 0.84, 1.44)
+    add(-1, 2, "talk", "clip", 1.44, 2.6)
+    add(-1, 2, "talk", "voice", 1.44, 2.6, track="A1")
+    add(-1, 3, "montage", "clip", 2.6, 3.4)
+    add(-1, 4, "talk", "clip", 3.4, 5.6)
+    add(-1, 5, "broll", "clip", 7.4, 10.1)
+    add(-1, 5, "overlay", "typed_title", 7.4, 10.1, track="V3")
+    add(0, 0, "talk", "clip", 10.1, 20.0)
+    return {"pieces": P, "duration": 20.0}
+
+
+def test_cold_open_notes_map_to_its_pieces(monkeypatch):
+    """The real run: notes on the intro mapped to '0 segments'. Generated cold-open pieces, cards and the typed
+    title now map to cold_open.* refs, and the lock check lets a cold-open note change plan['cold_open']."""
+    tl = _co_tl()
+    plan = {"sections": [{"name": "body", "segments": [{"type": "talk", "clip": "c1", "in": 0, "out": 10}]}],
+            "cold_open": {"lines": [{}, {}]}}
+    refs = mapnotes.cold_open_refs(tl)
+    assert refs[(-1, 0)] == "cold_open.card" and refs[(-1, 2)] == "cold_open.lines[0]" and refs[(-1, 4)] == "cold_open.lines[1]"
+    assert refs[(-1, 1)] == "cold_open.shots" and refs[(-1, 5)] == "cold_open.end_shot"
+    assert mapnotes.cold_open_span(tl) == [0.0, 10.1]
+    monkeypatch.setattr(mapnotes, "_words_in", lambda *a, **k: "")
+    n = mapnotes.map_comment(None, None, tl, plan, {"id": "m", "t": 0.3, "text": "louder like the reference"}, 1)
+    assert "cold_open.card" in n["segments"] and "cold_open" in n["segments"] and n["cold_open"]
+    n4 = mapnotes.map_comment(None, None, tl, plan, {"id": "m4", "t": 8.9, "text": "move the title off the sun"}, 4)
+    assert {"cold_open.end_shot", "cold_open.title"} <= set(n4["segments"]) and "0.0" not in n4["segments"]
+    nb = mapnotes.map_comment(None, None, tl, plan, {"id": "mb", "t": 14.0, "text": "cut this"}, 5)
+    assert nb["segments"] == ["0.0"] and not nb["cold_open"]
+    base = {**plan, "cold_open": {"music": {"lift_db": 12}}}
+    cand = {**plan, "cold_open": {"music": {"lift_db": 20}}}
+    assert lockcheck.plan_lock(base, cand)["status"] == "fail"
+    lk = lockcheck.plan_lock(base, cand, allowed_top={"cold_open"})
+    assert lk["status"] == "pass" and "a note on it asked for it" in lk["issues"][0]["text"]
+
+
+def test_find_render_same_version_same_mode_whole_and_fresh(tmp_path):
+    """The real run compared a v3 FINAL render (picked over a stale preview) with v4 previews. The base is the
+    plan version's render in the same mode, never a cold-open-only partial, never one older than the plan."""
+    from cutroom import export
+    from cutroom.factory import phases
+    cfg = Config(work=str(tmp_path))
+    pd, rd = tmp_path / "plans", tmp_path / "renders"
+    pd.mkdir()
+    rd.mkdir()
+    plan = {"title": "x", "version": 3, "sections": []}
+    pf = pd / "trip_v3.json"
+    pf.write_text(json.dumps(plan))
+
+    def side(name, preview, only=None, version=3, plan_path=pf, sha=True, age=0):
+        mp4 = rd / f"{name}.mp4"
+        mp4.write_bytes(b"x")
+        d = {"schema": "cutroom-render-v1", "plan": str(plan_path.resolve()), "preview": preview, "only": only,
+             "version": version, "plan_sha": export.plan_sha(plan) if sha else "stale000"}
+        (rd / f"{name}.json").write_text(json.dumps(d))
+        t = time.time() - age
+        os.utime(mp4, (t, t))
+        return mp4
+    final = side("trip-a_v3", False, age=10)
+    side("trip-a_v3_cold-open", True, only="cold_open", age=5)            # partial: never a base
+    side("trip-a_v3_stale_preview", True, sha=False, age=1)                # made before the plan changed
+    assert phases.find_render(cfg, pf) is None                             # no fresh whole preview -> none
+    assert export.find_render(cfg, pf) == final                            # export: final preferred, partial skipped
+    good = side("trip-a_v3_preview", True, age=20)
+    side("trip-a_v2_preview", True, version=2, age=0)                     # wrong version
+    assert phases.find_render(cfg, pf) == good
+    assert export.find_render(cfg, pf, preview=False) == final
+    # a factory version: its render's sidecar points at the order's candidate; found by name
+    cand = tmp_path / "candidate.json"
+    cand.write_text(json.dumps({**plan, "version": 4}))
+    pf4 = pd / "trip_v4.json"
+    pf4.write_text(json.dumps({**plan, "version": 4}))
+    v4 = side("trip_v4_preview", True, version=4, plan_path=cand, sha=False)
+    side("trip_v4_var1_preview", True, version=4, plan_path=cand, sha=False)
+    assert phases.find_render(cfg, pf4) == v4
+
+
+CLAIM_TEXTS = [
+    ("So the old music swing was 12 dB and the new one is 20 dB, with the floor 6 dB deeper and the hits 2 dB hotter.",
+     [("floor", "delta", -6.0), ("hits", "delta", 2.0)]),
+    ("The plan check passes, and the runner should confirm the ~11 LU swing, I at -10 and TP at or below -1.5.",
+     [("swing", "abs", 11.0)]),
+    ("The lift on the no-talk hits goes from 20 to 22 dB (cold_open.music.lift_db), so the hits now sit at dialogue +6 dB, "
+     "about -10 LUFS.", [("hits_over_lines", "abs", 6.0), ("hits", "abs", -10.0)]),
+    ("Raised the cold open loudness target from -12 to -10 LUFS (cold_open.loudness.I).", []),
+    ("C5655 is not used anywhere else within 10s.", [("repeats", "none", 0)]),
+]
+
+
+@pytest.mark.parametrize("text,want", CLAIM_TEXTS)
+def test_claims_parse_real_run_sentences(text, want):
+    from cutroom.factory import claims
+    assert [(c["qty"], c["kind"], c["claimed"]) for c in claims.parse(text)] == want
+
+
+def _punchy_clip(path, quiet_db=-30, loud_db=-8):
+    """10 s: 2 s quiet / 0.5 s loud, repeated - a known swing."""
+    expr = f"if(lt(mod(t,2.5),2.0),{10 ** (quiet_db / 20):.5f},{10 ** (loud_db / 20):.5f})*sin(2*PI*440*t)"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=160x90:r=25:d=10",
+                    "-f", "lavfi", "-i", f"aevalsrc='{expr}':s=48000:d=10", "-shortest", "-c:v", "libx264", "-c:a", "aac",
+                    "-b:a", "192k", str(path)], check=True)
+    return path
+
+
+def test_claims_checked_against_the_render(tmp_path):
+    from cutroom import dynamics
+    from cutroom.factory import claims
+    cfg = Config(work=str(tmp_path))
+    v = _punchy_clip(tmp_path / "v.mp4")
+    base = _punchy_clip(tmp_path / "b.mp4", quiet_db=-24, loud_db=-12)
+    sw = dynamics.window_stats(cfg, v)["swing"]
+    assert 15 < sw < 26, sw
+    note = {"id": "n1", "t": 5.0}
+    rows = claims.check(cfg, [{"note": note, "source": "editor n1 change", "text": f"The cold open now has a ~{sw:.0f} LU swing."},
+                              {"note": note, "source": "editor n1 proof", "text": "That gives a 40 LU swing."},
+                              {"note": note, "source": "editor n1 change", "text": "The quiet floor is 6 dB deeper."},
+                              {"note": note, "source": "editor n1 change", "text": "The hits are now 4 dB louder."},
+                              {"note": note, "source": "editor n1 change", "text": "No clipping anywhere."}],
+                        str(v), None, str(base), None, {})
+    by = {(r["text"][:30], r["qty"]): r for r in rows}
+    ok = {k[0][:12]: r["ok"] for k, r in by.items()}
+    assert ok["The cold ope"] is True and ok["That gives a"] is False
+    assert ok["The quiet fl"] is True and ok["The hits are"] is True and ok["No clipping "] is True
+    bad = claims.findings(rows)
+    assert len(bad) == 1 and bad[0]["sev"] == "HARD" and "40" in bad[0]["text"] and bad[0]["source"] == "claims"
+    led = claims.annotate_ledger([{"note": "n1", "change": "x", "proof": "y"}], rows)
+    assert "NOT on the render" in led[0]["change"] and "measured:" in led[0]["proof"]
+
+
+def _no_dark_plan(ids, title):
+    """base_plan without the clip an earlier test grades NEVER (the module project is shared)."""
+    p = base_plan(ids, title)
+    p["sections"][0]["segments"] = [s for s in p["sections"][0]["segments"] if s.get("clip") != ids["dark"]]
+    return p
+
+
+def test_false_claim_becomes_a_finding_and_is_rejudged(fproj, tmp_path, monkeypatch):
+    """An editor number the render doesn't show becomes a HARD finding; after the fix round it is re-measured
+    on the FIXED render: still claimed -> open (not passed); withdrawn -> closed, with the measured number."""
+    cfg, ids = fproj["cfg"], fproj["ids"]
+    new_plan(cfg, ids, "claim", plan=_no_dark_plan(ids, "claim"))
+    say = {"summary": "Done: the programme now has a 45 LU swing."}
+    # 1) the fix round repeats the claim -> still false on the fixed render -> not passed
+    use_fake(tmp_path, monkeypatch, {"editor": {"result": say}, "fix": {"result": say}})
+    _marker(cfg, "claim", 1.0, "make it punchier", mid="q1")
+    oid, d = _drive_one(cfg, "claim", ["q1"])
+    cd = d["card"]
+    k = next(f for f in cd["critic"]["findings"] if f["id"] == "K1")
+    assert k["sev"] == "HARD" and k["status"] == "open" and "45" in k["text"]
+    assert d["status"]["state"] == "needs_you" and any(x.startswith("claim K1") for x in cd["not_passed"])
+    ver = next(p for p in d["phases"] if p["name"] == "verify")
+    assert not ver.get("skipped")
+    # 2) the fix round withdraws it -> closed by code, passes
+    use_fake(tmp_path, monkeypatch, {"editor": {"result": say}, "fix": {"result": {"summary": "Corrected the swing figure."}}})
+    _marker(cfg, "claim", 1.2, "make it punchier again", mid="q2")
+    oid, d = _drive_one(cfg, "claim", ["q2"])
+    k = next(f for f in d["card"]["critic"]["findings"] if f["id"] == "K1")
+    assert k["status"] == "closed" and "withdrew" in k["verified"], k
+    assert d["status"]["state"] == "ready", d["card"]["not_passed"]
+
+
+def test_preexisting_qa_fail_never_blocks_closure(fproj, tmp_path, monkeypatch):
+    """A QA fail already in the base version is a 'was already there' warning; the critic's HARD finding closes
+    when the verify run re-judges it closed on the fixed render."""
+    from cutroom.factory import gates
+    cfg, ids = fproj["cfg"], fproj["ids"]
+    new_plan(cfg, ids, "pre", plan=_no_dark_plan(ids, "pre"))
+    rep = {"summary": {"fail": 1, "warn": 0, "status": "fail"},
+           "checks": [{"id": "text_vs_faces", "title": "Captions clear of faces", "status": "fail",
+                       "issues": [{"severity": "fail", "t": 6.0, "msg": "caption overlaps a face"}]},
+                      {"id": "av_length", "status": "pass", "issues": []}]}
+    monkeypatch.setattr(gates, "run_qa", lambda *a, **k: (json.loads(json.dumps(rep)), None))
+    hard = {"findings": [{"id": "F1", "sev": "HARD", "t": 1.0, "note": "n1", "rule": None, "text": "jump in the words",
+                          "evidence": "frame"}]}
+    log, _ = use_fake(tmp_path, monkeypatch, {"critic": {"result": hard}})
+    _marker(cfg, "pre", 1.0, "tighten the start", mid="p1")
+    oid, d = _drive_one(cfg, "pre", ["p1"])
+    roles_ = [c["role"] for c in calls(log)]
+    assert "verify" in roles_ and roles_.index("verify") > roles_.index("fix")
+    f = d["card"]["critic"]["findings"][0]
+    assert f["status"] == "closed" and f["verified"]
+    assert d["status"]["state"] == "ready", d["card"]["not_passed"]
+    assert any("was already in v1" in w for w in d["card"]["warns"] if isinstance(w, str)) or \
+        "already in v1" in json.dumps(d["card"])
+
+
+def test_qa_check_missing_from_base_is_not_a_new_fail():
+    from cutroom.factory import gates
+    cand = {"checks": [{"id": "swing_vs_reference", "title": "Swing", "status": "fail",
+                        "issues": [{"severity": "fail", "t": 0.0, "msg": "swing 7 vs 12"}]},
+                       {"id": "black", "title": "Black", "status": "fail", "issues": [{"severity": "fail", "t": 3, "msg": "b"}]}]}
+    base = {"checks": [{"id": "black", "title": "Black", "status": "pass", "issues": []}]}
+    new, kept = gates.qa_regressions(cand, base)
+    assert [x["check"] for x in new] == ["black"] and kept[0]["check"] == "swing_vs_reference" and kept[0]["not_on_base"]

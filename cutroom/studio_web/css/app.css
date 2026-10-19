@@ -702,3 +702,13 @@ details.xcode summary::-webkit-details-marker { display: none; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* ------------------------------------------------------------------ no text selection on chrome
+   A drag that starts on a button, a tab, the timeline or a monitor must not paint a text selection across
+   the panels. Chrome is not selectable; inputs, logs, cards, chat text and tables stay selectable. */
+#hdr, .ptabs, .ptab-tools, .splitter, #p-timeline, .monitor .pbody, .menu, .btn, .ib, .tb-btn, .tb-icon,
+.ptab, .badge, .fx-tabs, .fx-bar, .fx-row, .fx-steps, .fx-pill, .cm-ftab, .toolbar, .tl-tools, #toasts {
+  -webkit-user-select: none; user-select: none; }
+input, textarea, select, [contenteditable="true"], pre, code, .fx-log, .fx-ledger, .fx-q-t, .fx-why, .fx-otext,
+.fx-rlast, .fx-lrule, .selectable {
+  -webkit-user-select: text; user-select: text; }

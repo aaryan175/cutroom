@@ -49,7 +49,8 @@ chat panel. Then:
 
 ### Review comments: one at a time
 The creator reviews like on a review site: they pause, press M, type a note and often draw on the frame
-(arrow, box, circle, pen). "Send to AI" runs ONE turn per comment, in timeline order. In such a turn:
+(arrow, box, circle, pen). **Send to factory** hands all of them to the factory (above). **Quick fix** runs ONE
+turn per comment, in timeline order. In such a turn:
 - **One change per comment.** Change exactly what that comment asks, nothing else. Open its frame first:
   the attached image has their drawing on it, so "this" means what they circled or pointed at. A
   comment with `t_end` covers that range ("from here to here").

@@ -103,6 +103,7 @@ def _fail_counts(rep):
 def qa_regressions(cand, base=None):
     """(new fails [{check, n, msgs, t}], kept fails [...]) of the candidate QA report vs the base's."""
     cf, bf = _fail_counts(cand), _fail_counts(base) if base else {}
+    base_ids = {c.get("id") for c in (base or {}).get("checks") or []}
     new, kept = [], []
     for c in (cand or {}).get("checks") or []:
         n = cf.get(c["id"], 0)
@@ -111,6 +112,10 @@ def qa_regressions(cand, base=None):
         iss = [i for i in c.get("issues") or [] if i.get("severity") == "fail"]
         row = {"check": c["id"], "title": c.get("title"), "n": n, "t": iss[0].get("t") if iss else None,
                "msgs": [i.get("msg") for i in iss[:3]], "evidence": (iss[0].get("evidence") or [None])[0] if iss else None}
+        if base is not None and c["id"] not in base_ids:     # the base was measured before this check existed
+            row["not_on_base"] = True
+            kept.append(row)
+            continue
         (new if (base is None or n > bf.get(c["id"], 0)) else kept).append(row)
     return new, kept
 

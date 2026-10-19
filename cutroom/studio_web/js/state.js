@@ -246,6 +246,8 @@ export function op(o, { quiet = false } = {}) {
   });
   return opChain;
 }
+/** Resolves once every plan op already sent has landed (Save version waits for it: never saves a stale draft). */
+export function flushOps() { return opChain.then(() => undefined, () => undefined); }
 export async function undo() {
   if (!S.plan) return;
   try { applyPlanResponse(await api.undo(S.plan.slug), { by: 'undo' }); } catch (e) { toast(`Undo: ${e.message}`, 'error'); }

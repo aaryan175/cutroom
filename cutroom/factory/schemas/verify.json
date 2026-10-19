@@ -1,0 +1,36 @@
+{
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "results",
+  "summary"
+ ],
+ "properties": {
+  "results": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "id",
+     "closed",
+     "evidence"
+    ],
+    "properties": {
+     "id": {
+      "type": "string"
+     },
+     "closed": {
+      "type": "boolean"
+     },
+     "evidence": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "summary": {
+   "type": "string"
+  }
+ }
+}

@@ -808,6 +808,18 @@ class _ShotPool:
     def mark(self, cid, a, b):
         self.used.setdefault(cid, []).append((a, b))
 
+    def free_at(self, p, dur):
+        """First source time in pool entry p whose [t, t + dur] window is not used (no marking)."""
+        D = float(p["row"]["duration"] or 0)
+        t = p["next"]
+        for _ in range(400):
+            if t + dur > D - 0.05:
+                t = 0.1
+            if not any(t < b2 + 0.2 and t + dur > a2 - 0.2 for a2, b2 in self.used.get(p["row"]["id"], [])):
+                return round(t, 3)
+            t += 0.25
+        return None
+
     def take(self, dur):
         for _ in range(len(self.pool)):
             p = self.pool[self.k % len(self.pool)]
@@ -913,6 +925,11 @@ def reference_teaser(an, fps):
         if d_ and len(els) > 1 and els[1]["kind"] == "block" and els[1]["frames"][0] - d_ >= 3:
             els[0]["frames"] += d_
             els[1]["frames"][0] -= d_
+    f = shots[0]["f0"] if shots else 0                 # each element's span on the reference (dynamics match)
+    for e in els:
+        nf = sum(e["frames"]) if isinstance(e["frames"], list) else int(e["frames"])
+        e["t0"], e["t1"] = round(f / fps, 4), round((f + nf) / fps, 4)
+        f += nf
     # the end shot: the last long element when a burn leads into it (the "teaser ends" hit)
     for e in reversed(els):
         if e["kind"] == "slot":
@@ -936,6 +953,8 @@ def build_cold_open(ctx, plan):
     co = plan.get("cold_open")
     if not co:
         return None
+    if co.get("end_shot") == "auto":                 # titleplace.choose_shot picks the held shot (below)
+        co = {**co, "end_shot": {"auto": True}}
     ref_style = co.get("style") == "reference"
     lines = [_resolve_line(ctx, plan, ln) for ln in (co.get("lines") or [])]
     m, song = _co_music(ctx, co, plan, ref_style)
@@ -967,8 +986,81 @@ def _line_seg(ctx, co, row, la, lb, text, frame=None):
     return seg, (float("inf") if face_s is None else float(face_s))
 
 
+def _auto_end_shot(ctx, co, pool, dur):
+    """cold_open.end_shot "auto": the pool's held shot whose quiet / dark area suits the title best
+    (titleplace.choose_shot), at a source window not used anywhere in the edit (repeats rule). Cached on
+    disk by the candidates + title, so the timeline resolver and the renderer agree."""
+    from . import titleplace as TP
+    ti = co.get("title") or {}
+    ti = {"text": ti} if isinstance(ti, str) else dict(ti)
+    text, size = ti.get("text") or "TITLE", float(ti.get("size", CD.TITLE["size"]))
+    color = ti.get("color", CD.TITLE["color"])
+    cands = []
+    for p in pool.pool:
+        t = pool.free_at(p, dur)
+        if t is not None:
+            cands.append({"clip": p["ref"], "in": t, "path": ctx.source(p["row"])})
+    key = _sha(json.dumps([[c["clip"], c["in"]] for c in cands] + [text, size, color, round(dur, 3), "v1"]))
+    cp = Path(ctx.cache) / "titlepos" / f"shot_{key}.json"
+    res = None
+    try:
+        res = json.loads(cp.read_text())
+    except (OSError, ValueError):
+        pass
+    if res is None:
+        res = TP.choose_shot(ctx.cfg, cands, text, size, color, dur=dur)
+        res = {k: v for k, v in res.items() if k != "ranking"} | {"ranking": [
+            {k: v for k, v in r.items() if k in ("clip", "in", "ok", "score", "contrast", "skipped")} for r in res.get("ranking") or []]}
+        try:
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            cp.write_text(json.dumps(res))
+        except OSError:
+            pass
+    if not res.get("clip"):
+        ctx.warn(f"cold_open.end_shot auto: {res.get('why')}; taking the next pool shot")
+        return {}
+    pool.mark(ctx.clip(res["clip"])["id"], float(res["in"]), float(res["in"]) + dur)
+    ctx.end_shot_choice = res
+    return {"clip": res["clip"], "in": float(res["in"]), "dur": dur, "title_pos": {"x": res["x"], "y": res["y"]}}
+
+
+def _title_pos(ctx, seg, o, a, b):
+    """typed_title "pos": {x, y} as given, or "auto" measured on the segment's clip span [a, b] (source s).
+    Returns {x, y, backing?, why} or None (default centre line). Cached on disk per clip span + title."""
+    pos = o.get("pos")
+    if isinstance(pos, dict) and pos.get("x") is not None and pos.get("y") is not None:
+        return {"x": float(pos["x"]), "y": float(pos["y"]), "why": "given in the plan"}
+    if pos != "auto":
+        return None
+    if not seg.get("clip"):
+        ctx.warn(f"typed_title '{o.get('text', '')}': pos auto needs a clip under it; default position used")
+        return None
+    from . import titleplace as TP
+    row = ctx.clip(seg["clip"])
+    zoom = float((seg.get("push") or {}).get("to", 1.0)) if isinstance(seg.get("push"), dict) else 1.0
+    size, color = float(o.get("size", CD.TITLE["size"])), o.get("color", CD.TITLE["color"])
+    key = _sha(json.dumps([row["id"], round(a, 3), round(b, 3), o.get("text"), size, color, o.get("font"), zoom,
+                           ctx.W, ctx.H, "v1"]))
+    cp = Path(ctx.cache) / "titlepos" / f"pos_{key}.json"
+    try:
+        return json.loads(cp.read_text())
+    except (OSError, ValueError):
+        pass
+    r = TP.place(ctx.cfg, ctx.source(row), a, b, o.get("text") or "", size, color, o.get("font") or "",
+                 (ctx.W, ctx.H), zoom)
+    out = {"x": r["x"], "y": r["y"], "backing": bool(r.get("backing")), "why": "auto: " + str(r.get("why"))}
+    try:
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_text(json.dumps(out))
+    except OSError:
+        pass
+    return out
+
+
 def _end_shot_seg(ctx, co, pool, dur, title_meas=None):
     es = dict(co.get("end_shot") or {})
+    if es.get("auto") and es.get("clip") is None:
+        es.update(_auto_end_shot(ctx, co, pool, float(es.get("dur", dur))))
     if es.get("clip") is None:
         es.update(pool.take(dur))
     seg = {"type": "broll", "clip": es["clip"], "in": float(es.get("in", 0.0)),
@@ -986,6 +1078,8 @@ def _end_shot_seg(ctx, co, pool, dur, title_meas=None):
              "color": ti.get("color", meas.get("color", CD.TITLE["color"])),
              "size": float(ti.get("size", meas.get("size", CD.TITLE["size"]))),
              **({"font": ti["font"]} if ti.get("font") else {}),
+             **({"pos": es["title_pos"] if ti.get("pos") == "auto" and es.get("title_pos") else ti["pos"]}
+                if ti.get("pos") else {}),
              **({"sfx": ti.get("sfx", "hiss")} if ti.get("sfx", "hiss") else {})}
         seg["overlays"] = [o]
     return seg
@@ -1044,7 +1138,15 @@ def _build_reference_teaser(ctx, plan, co, lines, pool):
             title_meas["start"] = float(ty["start_s"])
         if ty.get("char_s"):
             title_meas["char_s"] = float(ty["char_s"])
+    dyn_on = bool(dynamics_spec(co))
+    prev_e, n_before = None, 0
+
+    def tag_prev():             # dynamics match: the element's last segment follows that element's span
+        if dyn_on and prev_e is not None and len(segs) > n_before:
+            segs[-1]["_ref_span"] = [prev_e["t0"], prev_e["t1"]]
     for e in els:
+        tag_prev()
+        prev_e, n_before = e, len(segs)
         burn = _burn(co, strength=0.3 if (segs and segs[-1]["type"] == "card") else 1.0) if e.get("burn_in") else None
         if e["kind"] == "card":
             if card_spec is False:
@@ -1085,6 +1187,7 @@ def _build_reference_teaser(ctx, plan, co, lines, pool):
             if b and e.get("burn_in"):
                 seg["transition"] = b
             segs.append(seg)
+    tag_prev()
     sec = {"name": co.get("name", "cold open"), "segments": segs, "_generated": "cold_open",
            "_basis": f"reference {co['from_reference']} cold open, element by element ({len(els)} elements)",
            "_cuts": [], "_dur": info["t_end"], "frame": None}
@@ -1668,6 +1771,18 @@ def apply_layers(ctx, tl, segs):
                           "dur": total, "first_atom": parts[0][0], "t0": T0, "t1": T0 + total})
             if o["kind"] == "typed_title":
                 specs[-1]["opts"] = {k: o[k] for k in ("color", "size", "font", "start", "char_s", "y") if o.get(k) is not None}
+                if o.get("pos"):
+                    a_src = (seg_in + float(o.get("at", 0.0))) if talk else (seg_in + (T0 - S0) * float(seg.get("speed") or 1.0))
+                    tp = _title_pos(ctx, seg, o, a_src, a_src + (T1 - T0) * float(seg.get("speed") or 1.0))
+                    if tp:
+                        specs[-1]["opts"].update({"x": round(tp["x"], 4), "y": round(tp["y"], 4)},
+                                                 **({"backing": True} if tp.get("backing") else {}))
+                        specs[-1]["pos_why"] = tp.get("why")
+                        from . import titleplace as TP
+                        bw, bh = TP.title_box(o.get("text") or "", float(o.get("size", CD.TITLE["size"])), ctx.W, ctx.H,
+                                              o.get("font") or "")
+                        specs[-1]["box"] = [round(max(0.0, tp["x"] - bw / 2), 4), round(max(0.0, tp["y"] - bh / 2), 4),
+                                            round(bw, 4), round(bh, 4)]
                 if o.get("sfx"):
                     sfx.append({"name": o["sfx"], "t": T0 + float(o.get("start", 0.0)) - 0.04,
                                 "gain_db": float(o.get("sfx_gain_db", -16)), "on": f"typed:{sid}"})
@@ -2413,6 +2528,227 @@ def render_graphics(ctx, specs):
     return gfx
 
 
+def dynamics_spec(co) -> dict:
+    """cold_open.dynamics -> {"match": "reference", ...} or {} (off). Accepts the string "reference"."""
+    d = (co or {}).get("dynamics")
+    if isinstance(d, str):
+        d = {"match": d}
+    return dict(d) if isinstance(d, dict) and d.get("match") == "reference" else {}
+
+
+def _limit_wav(cfg, src, dst, ceil_db):
+    """The house true-peak limiter (4x oversampled alimiter, as normalize_mix) on one file."""
+    lim = 10 ** (ceil_db / 20)
+    media.ffmpeg(cfg, ["-i", str(src), "-af", f"aresample=192000,alimiter=limit={lim:.5f}:attack=1:release=60:level=false,"
+                                              f"aresample={SR}", "-c:a", "pcm_f32le", "-ar", str(SR), str(dst)])
+
+
+def dyn_target_curve(ref_curve, spans, co_end, ref_end, step=0.1):
+    """The reference's momentary loudness mapped onto OUR cold open: [(t_ours, M_target)].
+    spans: [(our_t0, our_t1, ref_t0, ref_t1)] per element (piecewise-linear time map; outside the knots the
+    edges are held by offset); with no spans our [0, co_end] is stretched onto the reference's [0, ref_end]."""
+    rc = np.asarray(ref_curve, float).reshape(-1, 2)
+    if not len(rc):
+        return []
+    if spans:
+        kx, ky = [], []
+        for a, b, ra, rb in sorted(spans):
+            if kx and a < kx[-1] - 1e-6:
+                continue
+            kx += [a, b]
+            ky += [ra, rb]
+        kx, ky = np.asarray(kx), np.asarray(ky)
+
+        def mp(t):
+            if t < kx[0]:
+                return ky[0] - (kx[0] - t)
+            if t > kx[-1]:
+                return ky[-1] + (t - kx[-1])
+            return float(np.interp(t, kx, ky))
+    else:
+        def mp(t):
+            return t * ref_end / max(co_end, 1e-6)
+    out = []
+    t = step
+    while t <= co_end + 1e-6:
+        out.append((round(t, 3), float(np.interp(mp(t), rc[:, 0], rc[:, 1]))))
+        t += step
+    return out
+
+
+def _apply_gain_curve(win, sr, centres, G, co_end, smooth_s=0.012):
+    """dB gain knots (at `centres`) -> per-sample gain on the window: linear between knots, back to unity over
+    the last 20 ms before the cut into the edit, unity after it, then a 12 ms box smooth so a gain step
+    never clicks (a click is a peak the encoder turns into true-peak overshoot)."""
+    n = len(win)
+    ts = np.arange(n) / sr
+    g_db = np.interp(ts, centres, G, left=G[0], right=G[-1])
+    g_db[ts > co_end] = 0.0
+    m = (ts > co_end - 0.02) & (ts <= co_end)
+    if m.any():
+        g_db[m] *= np.linspace(1, 0, m.sum())
+    k = max(1, int(smooth_s * sr))
+    g = 10 ** (g_db / 20)
+    g = np.convolve(np.pad(g, (k // 2, k - 1 - k // 2), mode="edge"), np.ones(k) / k, mode="valid")
+    return (win * g.astype(np.float32)[:, None]).astype(np.float32)
+
+
+def relimit_overshoots(cfg, wav, encoded, out_wav, tp_target, block_s=0.5, pad_s=0.25):
+    """Post-encode true-peak fix that leaves the programme level alone: decode the encoded file 4x oversampled,
+    find the blocks whose peak crosses `tp_target`, and replace only those stretches (padded, 30 ms
+    crossfades) with the mix limited lower by the worst overshoot + 0.3 dB. Returns {extra_db, spans} or None
+    (nothing to fix / undecodable)."""
+    import soundfile as sf
+    r = subprocess.run([getattr(cfg, "ffmpeg", None) or "ffmpeg", "-v", "error", "-i", str(encoded), "-map", "0:a:0",
+                        "-f", "f32le", "-ac", "2", "-ar", str(SR * 4), "-"], capture_output=True)
+    a = np.frombuffer(r.stdout, np.float32)
+    if not len(a):
+        return None
+    pk = np.abs(a.reshape(-1, 2)).max(axis=1)
+    bl = int(block_s * SR * 4)
+    nb = len(pk) // bl + 1
+    over = []
+    for i in range(nb):
+        seg = pk[i * bl:(i + 1) * bl]
+        if len(seg):
+            db = 20 * np.log10(float(seg.max()) + 1e-12)
+            if db > tp_target - 0.05:
+                over.append((i * block_s, (i + 1) * block_s, db))
+    if not over:
+        return None
+    extra = max(db for _, _, db in over) - tp_target + 0.3
+    x, sr = sf.read(str(wav), dtype="float32", always_2d=True)
+    lim = Path(str(out_wav) + ".lim.wav")
+    _limit_wav(cfg, wav, lim, tp_target - 1.0 - extra)
+    y = sf.read(str(lim), dtype="float32", always_2d=True)[0]
+    lim.unlink(missing_ok=True)
+    n = min(len(x), len(y))
+    w = np.zeros(n, np.float32)
+    for a0, b0, _ in over:
+        w[max(0, int((a0 - pad_s) * sr)):min(n, int((b0 + pad_s) * sr))] = 1.0
+    k = int(0.03 * sr)
+    w = np.convolve(np.pad(w, (k // 2, k - 1 - k // 2), mode="edge"), np.ones(k) / k, mode="valid").astype(np.float32)
+    out = x.copy()
+    out[:n] = x[:n] * (1 - w[:, None]) + y[:n] * w[:, None]
+    sf.write(str(out_wav), out, sr, subtype="PCM_24")
+    return {"extra_db": round(extra, 2), "spans": [[round(a0, 2), round(b0, 2)] for a0, b0, _ in over]}
+
+
+def _encoded_tp(cfg, wav, tmp):
+    """True peak (dBTP) of a wav after the final AAC encode (192k, as render_plan encodes)."""
+    try:
+        media.ffmpeg(cfg, ["-i", str(wav), "-c:a", "aac", "-b:a", "192k", "-ar", str(SR), str(tmp)])
+        return _ebur128(cfg, str(tmp))["TP"]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def shape_cold_open(ctx, plan, tl, segs, wav, target, iters=5):
+    """cold_open.dynamics {"match": "reference"}: after programme normalisation, give the cold open the
+    reference's measured momentary-loudness envelope (its swing: lines vs hits vs the held end), element
+    by element. The gain curve (0.1 s knots, dB) acts on the summed cold-open stems (voice + music + SFX) and
+    is solved by measuring: apply -> limit -> measure (ebur128) -> correct, a few rounds. The hits' peaks
+    are caught by the same oversampled limiter ON THE COLD OPEN ONLY, before the final encode, so the
+    loud moments are limited locally instead of the whole programme being pulled down afterwards.
+    Returns the sidecar record. `wav` is rewritten in place."""
+    import soundfile as sf
+    from . import dynamics as D
+    from . import reference as R
+    co = plan.get("cold_open") or {}
+    dyn = dynamics_spec(co)
+    rid = dyn.get("reference") or co.get("from_reference") or plan.get("reference")
+    if not rid:
+        ctx.warn("cold_open.dynamics: no reference to match (cold_open.from_reference)")
+        return {"status": "skipped", "why": "no reference"}
+    fps = ctx.fps
+    recs = [r for r in segs if r["sec"] == -1 and r["atoms"]]
+    if not recs:
+        return {"status": "skipped", "why": "no cold open"}
+    co_end = max(tl.atoms[i]["f1"] for r in recs for i in r["atoms"]) / fps
+    spans = []
+    for r in recs:
+        sp = r["spec"].get("_ref_span")
+        if sp:
+            a = tl.atoms[r["atoms"][0]]["f0"] / fps
+            b = max(tl.atoms[i]["f1"] for i in r["atoms"]) / fps
+            spans.append((a, b, float(sp[0]), float(sp[1])))
+    try:
+        ref = R.intro_envelope(ctx.cfg, rid)
+    except Exception as e:  # noqa: BLE001
+        ctx.warn(f"cold_open.dynamics: reference envelope not measured ({e})")
+        return {"status": "skipped", "why": str(e)[:200]}
+    off = float(dyn.get("offset_db", 0.0) or 0.0)
+    tgt = [(t, m + off) for t, m in dyn_target_curve(ref["curve"], spans, co_end, float(ref["t1"]) - float(ref["t0"]))]
+    if not tgt:
+        return {"status": "skipped", "why": "empty reference envelope"}
+    tt = np.asarray([t for t, _ in tgt])
+    tv = np.asarray([v for _, v in tgt])
+    x, sr = sf.read(str(wav), dtype="float32", always_2d=True)
+    tail = 0.5
+    n_win = min(len(x), int(round((co_end + tail) * sr)))
+    win = x[:n_win].copy()
+    centres = tt - 0.2                                        # a momentary value measures [t - 0.4, t]
+    lo_g, hi_g = float(dyn.get("min_db", -24.0)), float(dyn.get("max_db", 15.0))
+    ceil_db = float(target["TP"]) - 1.0
+    work = Path(str(wav) + ".dyn")
+    work.mkdir(exist_ok=True)
+    pre, lim_p = work / "pre.wav", work / "lim.wav"
+    hist = []
+
+    def solve(G, ceil, iters_):
+        best = None
+        for _ in range(iters_):
+            sf.write(str(pre), _apply_gain_curve(win, sr, centres, G, co_end), sr, subtype="FLOAT")
+            _limit_wav(ctx.cfg, pre, lim_p, ceil)
+            env = D.envelope(ctx.cfg, lim_p, 0.0, co_end)
+            et = np.asarray(env["t"], float)
+            em = np.asarray(env["M"], float)
+            ours = np.interp(tt, et, em) if len(et) else np.full(len(tt), -120.0)
+            ok = (ours > -60) & (tv > -60)
+            err = np.where(ok, tv - ours, 0.0)
+            rec = {"iter": len(hist), "ceil_db": round(ceil, 2), "swing": D.swing(env), "I": env.get("I"),
+                   "TP": env.get("TP"), "rms_err_lu": round(float(np.sqrt(np.mean(err[ok] ** 2))) if ok.any() else 0.0, 2)}
+            hist.append(rec)
+            if best is None or rec["rms_err_lu"] < best[0]["rms_err_lu"]:
+                best = (dict(rec), sf.read(str(lim_p), dtype="float32", always_2d=True)[0], G.copy())
+            if rec["rms_err_lu"] < 0.8:
+                break
+            G = np.clip(G + 0.8 * err, lo_g, hi_g)
+        return best
+
+    rec, yb, Gb = solve(np.zeros(len(tt)), ceil_db, iters)
+    # the encoder overshoots sharp hits (AAC inter-sample peaks): measure the cold open through it and, when it
+    # would cross the programme ceiling, limit ITS peaks lower and re-solve the envelope at that ceiling, so
+    # the hits are limited here and the whole programme is never pulled down after the encode
+    lim_extra = 0.0
+    for _ in range(2):
+        sf.write(str(lim_p), yb, sr, subtype="FLOAT")
+        tp = _encoded_tp(ctx.cfg, lim_p, work / "enc.m4a")
+        rec["TP_encoded"] = tp
+        if tp is None or tp <= float(target["TP"]) - 0.2:
+            break
+        lim_extra += tp - float(target["TP"]) + 0.3
+        rec, yb, Gb = solve(Gb, ceil_db - lim_extra, 3)
+        rec["peak_limit_extra_db"] = round(lim_extra, 2)
+    yb = yb[:n_win]
+    m = min(len(yb), n_win)
+    out = x.copy()
+    xf = int(0.05 * sr)                                       # splice back inside the unity tail
+    s0 = max(0, m - xf)
+    out[:s0] = yb[:s0]
+    r = np.linspace(1, 0, m - s0, dtype=np.float32)[:, None]
+    out[s0:m] = yb[s0:m] * r + x[s0:m] * (1 - r)
+    sf.write(str(wav), out, sr, subtype="PCM_24")
+    shutil.rmtree(work, ignore_errors=True)
+    info = {"status": "ok", "reference": rid, "co_end": round(co_end, 3), "spans": len(spans),
+            "ref": {k: ref.get(k) for k in ("t0", "t1", "I", "swing", "M_max")},
+            "result": rec, "iterations": hist, "gain_db": {"min": round(float(Gb.min()), 1), "max": round(float(Gb.max()), 1)},
+            "curve": [[round(float(c), 2), round(float(g), 1)] for c, g in zip(centres, Gb)]}
+    print(f"  cold-open dynamics: swing {rec['swing']} LU (reference {ref.get('swing')}), I {rec['I']} LUFS, "
+          f"gain {info['gain_db']['min']}..{info['gain_db']['max']} dB, {len(hist)} pass(es)", flush=True)
+    return info
+
+
 def normalize_mix(ctx, mix_wav, out_wav, n, target, dialog_wav=None):
     """Programme loudness: measure, apply the exact gain, catch peaks with a 4x-oversampled limiter,
     re-measure and correct (limiting costs a little loudness). Deterministic, unlike loudnorm's
@@ -2687,6 +3023,16 @@ def build_buses(ctx, cfg, con, tl, segs, secs, parts, n_samples):
                          "music": [{k: v for k, v in e.items() if k not in ("speech", "natural")} for e in bed_secs if e["song"]]}
 
 
+def _plan_file_sha(plan_path):
+    """Content hash of the plan a render was made from (export.plan_sha): find_render uses it to tell a fresh
+    render from one made before the plan file changed."""
+    try:
+        from .export import plan_sha
+        return plan_sha(json.loads(Path(plan_path).read_text()))
+    except (OSError, ValueError):
+        return None
+
+
 def render_plan(cfg, con, plan_path, preview=False, out=None, only=None):
     t_start = time.time()
     raw = P.load(plan_path)
@@ -2751,6 +3097,9 @@ def render_plan(cfg, con, plan_path, preview=False, out=None, only=None):
     ctx._voice_bus = None
     norm_wav = run_dir / "mix_norm.wav"
     measured = normalize_mix(ctx, mix_wav, norm_wav, n_samples, target, dialog_wav)
+    ctx.dynamics_info = None
+    if co and dynamics_spec(plan.get("cold_open")) and any(r["sec"] == -1 for r in segs):
+        ctx.dynamics_info = shape_cold_open(ctx, plan, tl, segs, norm_wav, target)
 
     # ---- final encode
     slug = slugify(plan["title"])
@@ -2771,14 +3120,25 @@ def render_plan(cfg, con, plan_path, preview=False, out=None, only=None):
                      timeout=7200)
     loud = _ebur128(cfg, tmp_out)
     fix = 0.0
-    for _ in range(3):                  # AAC overshoot on sharp transients (hits) can need more than one pass
+    cur_wav = norm_wav
+    for k in range(3):                  # AAC overshoot on sharp transients (hits) can need more than one pass
         if loud["TP"] is None or loud["TP"] <= target["TP"]:
             break
-        fix += target["TP"] - loud["TP"] - 0.1
-        ctx.warn(f"true peak {loud['TP']} dBTP after encode; lowering programme by {-fix:.2f} dB")
         tmp2 = out.with_name(f".{out.stem}.tmp2.mp4")
-        media.ffmpeg(cfg, ["-i", tmp_out, "-i", norm_wav, "-map", "0:v", "-map", "1:a", "-c:v", "copy",
-                           "-af", f"volume={fix:.2f}dB", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", tmp2])
+        lw = run_dir / f"mix_peaks{k}.wav"
+        res = relimit_overshoots(cfg, cur_wav, tmp_out, lw, float(target["TP"])) if k < 2 else None
+        if res:
+            # only the stretches whose ENCODED peak crosses the ceiling get limited lower; the rest of the
+            # programme (and an already-verified cold open) keeps its level and its punch
+            ctx.warn(f"true peak {loud['TP']} dBTP after encode; limiting the peaks {res['extra_db']:.2f} dB lower in "
+                     f"{len(res['spans'])} spot(s) (programme level kept)")
+            cur_wav, af = lw, []
+        else:                           # last resort: the old whole-programme drop
+            fix += target["TP"] - loud["TP"] - 0.1
+            ctx.warn(f"true peak {loud['TP']} dBTP after encode; lowering programme by {-fix:.2f} dB")
+            af = ["-af", f"volume={fix:.2f}dB"]
+        media.ffmpeg(cfg, ["-i", tmp_out, "-i", cur_wav, "-map", "0:v", "-map", "1:a",
+                           "-c:v", "copy", *af, "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", tmp2])
         os.replace(tmp2, tmp_out)
         loud = _ebur128(cfg, tmp_out)
     os.replace(tmp_out, out)
@@ -2826,7 +3186,9 @@ def sidecar(ctx, plan, plan_path, tl, segs, secs, specs, gfx, sfx, total_f, loud
                           for c in at["captions"]],
              "overlays": [{"kind": specs[o["spec"]]["kind"], "text": specs[o["spec"]]["text"],
                            "position": specs[o["spec"]]["position"], "t0": round(t0 + o["t0"], 3),
-                           "t1": round(t0 + o["t1"], 3), "renderer": gfx[o["spec"]]["renderer"]} for o in at["overlays"]],
+                           "t1": round(t0 + o["t1"], 3), "renderer": gfx[o["spec"]]["renderer"],
+                           **({"box": specs[o["spec"]]["box"]} if specs[o["spec"]].get("box") else {})}
+                          for o in at["overlays"]],
              "cutaways": [{"clip": c["clip"]["id"], "clip_rel": c["clip"]["rel"], "in": round(c["a"], 3),
                            "t0": round(t0 + c["t0"], 3), "t1": round(t0 + c["t1"], 3), "auto": c["auto"]}
                           for c in at["cutaways"]],
@@ -2840,7 +3202,8 @@ def sidecar(ctx, plan, plan_path, tl, segs, secs, specs, gfx, sfx, total_f, loud
                      {"typed_title" for sp in specs if sp.get("kind") == "typed_title"} |
                      ({"film"} if getattr(ctx, "film", None) else set()))
     return {"schema": "cutroom-render-v1", "title": plan["title"], "version": plan["version"],
-            "plan": str(Path(plan_path).resolve()), "output": str(out), "preview": ctx.preview, "only": only,
+            "plan": str(Path(plan_path).resolve()), "plan_sha": _plan_file_sha(plan_path),
+            "output": str(out), "preview": ctx.preview, "only": only,
             "width": ctx.W, "height": ctx.H, "fps": fps, "frames": total_f, "duration": round(total_f / fps, 4),
             "code_version": CODE_VERSION, "render_seconds": round(secs_taken, 1),
             "font": ctx.font_pi[0], "lut": ctx.lut,
@@ -2850,8 +3213,11 @@ def sidecar(ctx, plan, plan_path, tl, segs, secs, specs, gfx, sfx, total_f, loud
             "typed_titles": [{"text": sp["text"], "t0": round(sp["t0"], 3), "t1": round(sp["t1"], 3),
                               "start": float((sp.get("opts") or {}).get("start", 0.0)),
                               "char_s": float((sp.get("opts") or {}).get("char_s", CD.TITLE["char_s"])),
-                              "font": gfx.get(sp["id"], {}).get("font")}
+                              "font": gfx.get(sp["id"], {}).get("font"),
+                              "pos": ({"x": sp["opts"]["x"], "y": sp["opts"]["y"]} if "x" in (sp.get("opts") or {}) else None),
+                              "backing": bool((sp.get("opts") or {}).get("backing")), "pos_why": sp.get("pos_why")}
                              for sp in specs if sp.get("kind") == "typed_title"],
+            "end_shot_choice": getattr(ctx, "end_shot_choice", None),
             "sections": [{"name": s["name"], "index": s["index"], "start": round(s["start"], 4), "end": round(s["end"], 4),
                           "music": {k: v for k, v in s["music"].items() if not k.startswith("_")} if s["music"] else None,
                           "music_breaks": (s["music"] or {}).get("_breaks", []),
@@ -2866,6 +3232,7 @@ def sidecar(ctx, plan, plan_path, tl, segs, secs, specs, gfx, sfx, total_f, loud
             "matchcuts": [{"section": r["sec"], "seg": r["seg"], "cut_at": r.get("match_t")} for r in segs if r["type"] == "matchcut"],
             "segments": rows, "sfx": sfx,
             "loudness": {"target": target, "measured_before": measured, "final": loud},
+            "cold_open_dynamics": getattr(ctx, "dynamics_info", None),
             "warnings": ctx.warnings}
 
 

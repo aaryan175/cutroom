@@ -116,7 +116,8 @@ stop. Nothing is ever brightened after the LUT, because that turns blacks milky.
 (1–3 px), `soften` (gaussian sigma px at 1080), `vignette` (corner fall-off 0–0.6), `halation` / `bloom`
 (0–1), `ca` (lateral fringe px at the corners), `rolloff` (`{"knee": 0.86, "ceiling": 0.96}`), `black`
 (lift 0–0.1). Fill it from a measurement only: `film.match(ref_stats, ours_stats)` returns the traits the
-reference measurably has more of (rule 38).
+reference measurably has more of (rule 38); set `"from_reference": "<ref id>"` beside them (the sidecar carries it, and QA
+`devices_vs_reference` fails film without it).
 `"exposure_stops": 0.5` on a segment is a manual trim the creator names (rule 94). The sidecar records each
 piece's applied `stops` and its LUT-only probe numbers (`lut_stats`: luma, p1, p99, sat) that QA
 `grade_bounds` checks the render against.
@@ -231,6 +232,14 @@ the reference's broadband hiss under the typing.
 ```json
 {"kind": "typed_title", "text": "DAY THREE", "at": 0.0, "dur": 2.7, "start": 1.12, "char_s": 0.07}
 ```
+`"pos"` places it (default: centred on the 0.505 line): `{"x": 0.72, "y": 0.2}` is the title's centre in
+frame fractions (kept inside the frame), `"auto"` measures the held shot under it (`cutroom/titleplace.py`):
+a grid of title-sized boxes over 4 frames of the span, scored by detail (gradient energy) and luma spread;
+boxes touching a face/head or person, or holding blown highlights (the sun), are out; the title colour
+must have a WCAG contrast of 3:1 against the box (2:1 against its bright patches), so yellow on a white
+shirt or a pale sky fails. When no box reads, the quietest one gets a dark backing plate. The sidecar's
+`typed_titles[]` records `pos`, `backing` and `pos_why`, and the overlay's real `box` (QA's faces check uses
+it). `cold_open.title` takes `pos` too.
 
 **Cold open (teaser template).** A plan-level object. It renders as a generated first section (index −1
 in the sidecar and in `resolve_timeline`):
@@ -255,7 +264,26 @@ the typed title → burn into the edit. Optional: `inset` / `gate` (override the
   (rule 49). A number cuts away to b-roll after that many seconds (style "teaser").
 - `loudness.I` (−12 LUFS): the cold open's own dialogue target, about 2 LU over the programme, so the intro
   is not quieter than the body. `music.lift_db` raises the bed between lines (reference ≈ +10 dB).
+- `dynamics: {"match": "reference"}` (punch): the cold open follows the reference's measured
+  momentary-loudness envelope (`cutroom.reference.intro_envelope`, p95−p10 "swing" in LU), element by
+  element: each cold-open segment is mapped onto its reference element's span, and a gain curve (0.1 s
+  knots) on the summed cold-open audio (voice + music + SFX) is solved by measuring (apply → limit → ebur128 →
+  correct). Where the reference is quiet (its held end shot) ours goes quiet; where it hits, ours hits. Only
+  the cold open's peaks are limited (the same 4× oversampled limiter, before the encode), so the programme
+  is not pulled down. Options: `offset_db` (0: the reference's absolute level), `min_db` / `max_db` (gain
+  clamp, −24 / +15), `reference` (another ref id). It replaces the `music.under_db` / `lift_db` balancing as
+  the thing that sets the swing; QA `swing_vs_reference` checks the result (fails over 2 LU off when
+  `dynamics` is set, warns otherwise). The sidecar records `cold_open_dynamics`.
+- An encode that overshoots the true-peak ceiling (AAC on sharp hits) is fixed by limiting the peaks lower
+  (up to two passes), not by lowering the whole programme; a whole-programme drop is the last resort.
 - `end_flash` defaults to false.
+- `end_shot: "auto"` (or `{"auto": true, "dur": 2.7}`) picks the held end shot from the cold-open shot pool:
+  each pool clip's first window not used anywhere in the edit is scored for the title (as `pos: "auto"`),
+  readable without a backing first, then the quietest area; with `title.pos: "auto"` the title goes where
+  that measurement found room. The choice is cached and recorded in the sidecar (`end_shot_choice`).
+  `cutroom title place <plan> [--choose-shot] [--debug-dir D]` prints where auto would put each typed
+  title, and the held-shot ranking (pool shots, sliding to a free window when the given one is used within
+  10 s), without rendering.
 - `card`, `inset`, `gate`, `burns`, `end_shot` and `title` also work in style "teaser".
 - Lines are teaser lines from later in the edit. `{"from": "<section>/<segment>"}` picks the strongest
   0.8–2.6 s claim in that talk segment by itself (numbers, superlatives, stakes words, clean edges).

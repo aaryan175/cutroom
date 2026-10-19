@@ -1,7 +1,7 @@
 """Role table + prompt assembly. Every prompt is generated from the brain and the lessons on every run, so
 nothing drifts (the reel factory's hand-copied re-briefs did).
 
-Read-only roles (producer, forensics, critic, lessons) are guarded by code: the runner hashes the version
+Read-only roles (producer, forensics, critic, verify, lessons) are guarded by code: the runner hashes the version
 files, the brain and the order's comments before and after the run; any change fails the phase as HARD.
 """
 import json
@@ -23,8 +23,11 @@ ROLES = {
     "variants": {"tools": READ_TOOLS + ["Write", "Edit", "Bash(cutroom:*)"],
                  "sandbox": "workspace-write", "readonly": False, "schema": "variants", "wall": "edit", "prompt": "editor",
                  "model_key": "editor"},
-    "critic": {"tools": READ_TOOLS + ["Bash(cutroom frames:*)", "Bash(cutroom ref compare:*)"],
+    "critic": {"tools": READ_TOOLS + ["Bash(cutroom frames:*)", "Bash(cutroom ref compare:*)", "Bash(cutroom measure:*)"],
                "sandbox": "read-only", "readonly": True, "schema": "findings", "wall": "critic", "prompt": "critic"},
+    "verify": {"tools": READ_TOOLS + ["Bash(cutroom frames:*)", "Bash(cutroom measure:*)", "Bash(cutroom ref compare:*)"],
+               "sandbox": "read-only", "readonly": True, "schema": "verify", "wall": "verify", "prompt": "verify",
+               "model_key": "critic"},
     "lessons": {"tools": ["Read", "Grep"], "sandbox": "read-only", "readonly": True, "schema": "lessonops",
                 "wall": "lessons", "prompt": "lessonkeeper"},
     "extender": {"tools": READ_TOOLS, "sandbox": "read-only", "readonly": True, "schema": "extend", "wall": "extend",

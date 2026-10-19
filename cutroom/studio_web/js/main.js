@@ -1,5 +1,5 @@
 // Cutroom Studio bootstrap: header/toolbar, live events, keyboard map, monitor focus.
-import { S, on, emit, openPlan, reloadPlan, undo, redo, setPlayhead, fps, loadMarkers, normProject, normGovernor, normJob, normOvernight } from './state.js';
+import { S, on, emit, openPlan, reloadPlan, flushOps, undo, redo, setPlayhead, fps, loadMarkers, normProject, normGovernor, normJob, normOvernight } from './state.js';
 import { api, connectEvents } from './api.js';
 import { $, h, icon, hydrateIcons, toast, isTyping, LS, ago } from './util.js';
 import { initLayout } from './layout.js';
@@ -10,7 +10,7 @@ import { initTimeline, razor, freeze, deleteSelection, toggleSnap, zoomBy, fit, 
 import { initChat } from './chat.js';
 import { initDock } from './dock.js';
 import { initImporter } from './importer.js';
-import { initVersions, draftLabel } from './versions.js';
+import { initVersions, draftLabel, draftSha } from './versions.js';
 import { initReference, _test as refTest } from './reference.js';
 import { initComments } from './comments.js';
 import { initLooks } from './looks.js';
@@ -118,11 +118,15 @@ async function doExport(kind) {
 async function commit() {
   if (!S.plan) return;
   try {
-    const r = await api.commit(S.plan.slug);
+    await flushOps();                                     // every edit already made lands first
+    const r = await api.commit(S.plan.slug, { expect: draftSha() });
     toast(`Saved as v${r.version || (String(r.name).match(/_v(\d+)/) || [0, '?'])[1]}`, 'ok', 2200);
     await reloadPlan('commit');
     refreshProject();
-  } catch (e) { toast(`Save version failed: ${e.message}`, 'error'); }
+  } catch (e) {
+    toast(`Save version failed: ${e.message}`, 'error');
+    if (/changed since/.test(e.message)) reloadPlan('commit');
+  }
 }
 
 // ---------------------------------------------------------------- new plan prompt (inline, no dialogs)

@@ -40,6 +40,29 @@ def notify(kind, data):
             pass
 
 
+def cli_bindir(cfg) -> str:
+    """A directory with a `cutroom` command for the role agents (their prompts and allowed tools say
+    `cutroom ...`). The interpreter's own bin dir when the console script lives there (venv install);
+    otherwise a shim in <work>/factory/.bin that runs this interpreter's `-m cutroom.cli` (a studio started
+    with `python -m cutroom.cli studio` has no `cutroom` next to sys.executable: roles got exit 127)."""
+    import shutil
+    bd = Path(sys.executable).parent
+    if (bd / "cutroom").exists():
+        return str(bd)
+    shim_dir = fconfig.factory_dir(cfg) / ".bin"
+    shim = shim_dir / "cutroom"
+    body = f'#!/bin/sh\nexec "{sys.executable}" -m cutroom.cli "$@"\n'
+    try:
+        if not shim.exists() or shim.read_text() != body:
+            shim_dir.mkdir(parents=True, exist_ok=True)
+            shim.write_text(body)
+            shim.chmod(0o755)
+        return str(shim_dir)
+    except OSError:
+        found = shutil.which("cutroom")
+        return str(Path(found).parent) if found else str(bd)
+
+
 def emit(cfg, oid, state, **kw):
     ev = bus.append(cfg, oid, state, **kw)
     try:
@@ -184,13 +207,13 @@ class OrderCtx:
             self.progress(f"{role}: {ev.get('text')}", force=False, role=role)
 
     # -- one role run -------------------------------------------------------------------------------------
-    def role(self, name, prompt, images=(), env=None, quiet=False):
+    def role(self, name, prompt, images=(), env=None, quiet=False, budgeted=True):
         from .. import agent as agentmod
         from ..governor import for_cfg
         from .roles import ROLES, schema
         rdef = ROLES[name]
         b = self.budget()
-        if self.role_runs() >= int(b.get("role_runs") or 6) and not quiet:
+        if budgeted and self.role_runs() >= int(b.get("role_runs") or 6) and not quiet:
             raise phases.NeedsYou("budget reached: role runs", questions=_budget_q(self, "role runs"), kind="budget")
         n = len(list((self.dir / "roles").glob(f"{name}-*"))) + 1 if (self.dir / "roles").exists() else 1
         od = self.dir / "roles" / f"{name}-{n}"
@@ -199,7 +222,8 @@ class OrderCtx:
         model = (fc.get("models") or {}).get(rdef.get("model_key", name), "")
         ag_name = fc.get("agent") if fc.get("agent") in agentmod.AGENTS else None
         e = {"CUTROOM_WORK": str(self.cfg.work), "CUTROOM_FACTORY_ORDER_DIR": str(self.dir),
-             "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+             "PATH": cli_bindir(self.cfg) + os.pathsep + str(Path(sys.executable).parent) + os.pathsep
+                     + os.environ.get("PATH", ""),
              "PYTHONPATH": str(Path(__file__).resolve().parents[2]) + (os.pathsep + os.environ["PYTHONPATH"]
                                                                        if os.environ.get("PYTHONPATH") else "")}
         e.update(env or {})
@@ -914,7 +938,13 @@ def order_detail(cfg, oid) -> dict:
         ph.append({"name": name, "step": phases.STEP_OF.get(name, name), "label": phases.LABELS.get(name, name),
                    "state": state, "skipped": (done or {}).get("skipped"), "attempts": (inj or {}).get("attempts")})
     roles_ = []
-    for rd in sorted((d / "roles").iterdir(), key=lambda p: p.stat().st_mtime) if (d / "roles").exists() else []:
+    order_of = {"producer": 0, "forensics": 1, "extender": 2, "editor": 3, "variants": 3, "critic": 4, "fix": 5,
+                "verify": 6, "lessons": 7}
+
+    def _rk(p):                       # pipeline order (producer, editor, critic, fix, verify, lessons), then run number
+        name, _, n = p.name.rpartition("-")
+        return (order_of.get(name, 9), int(n) if n.isdigit() else 0, p.name)
+    for rd in sorted((d / "roles").iterdir(), key=_rk) if (d / "roles").exists() else []:
         u = bus.read_json(rd / "usage.json", {}) or {}
         roles_.append({"role": rd.name, "agent": u.get("agent") or (bus.read_json(rd / "cmd.json", {}) or {}).get("agent"),
                        "ok": u.get("ok"), "cost_usd": u.get("cost_usd"), "seconds": u.get("seconds"),

@@ -23,6 +23,7 @@ import collections
 import contextlib
 import copy
 import fcntl
+import hashlib
 import json
 import math
 import mimetypes
@@ -108,6 +109,54 @@ def _f(v, name="value"):
     if x != x or x in (float("inf"), float("-inf")):
         raise ApiError(400, f"{name} must be finite")
     return x
+
+
+_ABS_PATH = re.compile(r"(?<![\w.~])/(?:[^\s\"'`,;:()\[\]{}<>|]+/)+[^\s\"'`,;:()\[\]{}<>|]*")
+
+
+def short_paths(text, work=None, keep=2):
+    """Absolute paths inside a line of text -> short ones for the UI: relative to the project work folder,
+    else ~/..., else the last `keep` parts after an ellipsis. The full text stays available as a tooltip."""
+    if not text:
+        return text
+    roots = []
+    if work:
+        for w in {str(Path(work)), str(Path(work).resolve())}:
+            roots.append(w.rstrip("/") + "/")
+    home = str(Path.home()).rstrip("/") + "/"
+
+    def one(m):
+        p = m.group(0)
+        for r in roots:
+            if p.startswith(r):
+                return p[len(r):] or "."
+            if p == r.rstrip("/"):
+                return "."
+        parts = [x for x in p.split("/") if x]
+        if p.startswith(home):
+            rest = p[len(home):]
+            return "~/" + rest if rest.count("/") < keep else "~/…/" + "/".join(parts[-keep:])
+        return p if len(parts) <= keep else "…/" + "/".join(parts[-keep:])
+    return _ABS_PATH.sub(one, str(text))
+
+
+def role_rows_for_ui(roles, work):
+    """Team rows: short relative paths in `last` / `error` (full text kept in last_full / error_full), and a
+    finished run's StructuredOutput call reads as 'returned its result' instead of a JSON dump."""
+    out = []
+    for r in roles or []:
+        r = dict(r)
+        for k in ("last", "error"):
+            v = r.get(k)
+            if not v:
+                continue
+            short = short_paths(v, work)
+            if k == "last" and str(v).startswith("StructuredOutput"):
+                short = "returned its result"
+            if short != v:
+                r[k + "_full"], r[k] = v, short
+        out.append(r)
+    return out
 
 
 def _within(root, rel):
@@ -588,6 +637,7 @@ class PlanStore:
         self._locks = {}
         self._glock = threading.Lock()
         self.own = {}                       # path -> (mtime_ns, size) of the studio's own writes
+        self._vcanon = {}                   # version file -> ((mtime_ns, size), canonical json without `version`)
 
     def lock(self, slug):
         with self._glock:
@@ -708,15 +758,30 @@ class PlanStore:
             self.write_draft(s, plan)
         return s, plan
 
-    def commit(self, slug):
+    def draft_sha(self, plan):
+        return hashlib.sha1(_canon(plan).encode()).hexdigest()[:16] if isinstance(plan, dict) else None
+
+    def commit(self, slug, expect=None):
+        """Save the draft as the next version. `expect` (the draft_sha the client last saw) refuses a save
+        whose draft changed on disk since (another tab, Claude, the factory's Open in draft): 409, never a
+        stale or unseen copy. The number comes from the factory's reservation table, so a version a running
+        order has reserved is never taken by a hand save (and the reverse)."""
         with self.lock(slug):
             self.sync(slug)
             plan = self.read_draft(slug)
+            if expect and self.draft_sha(plan) != expect:
+                raise ApiError(409, "the draft changed since this page last saw it; reloaded, press Save version again",
+                               draft_sha=self.draft_sha(plan))
             n = 0
             for v in self.version_files(slug):
                 if isinstance(v["version"], (int, float)):
                     n = max(n, int(v["version"]))
             n += 1
+            try:
+                from .factory import bus as fbus
+                n = max(n, fbus.reserve_version(self.s.cfg, slug))
+            except Exception:  # noqa: BLE001 - no factory folder possible: plain numbering
+                pass
             plan["version"] = n
             name = f"{slug}_v{n}.json"
             out = self.dir / name
@@ -741,13 +806,43 @@ class PlanStore:
                 _atomic_write(self.hist_dir(slug) / "versions.json", json.dumps(log))
 
     def saved_state(self, slug, plan):
-        """{latest, version, dirty}: is the draft different from the newest saved version (ignoring `version`)?"""
+        """{latest, version, dirty, newest, newest_version, newer}: which saved version the draft is based on and
+        whether it differs from THAT version (ignoring `version`). The base is the version the draft equals, else
+        the one its `version` field names, else the newest. A factory release (plans/<slug>_vN.json written next
+        to the draft) adds a newer version; it never makes the draft look 'unsaved since vN'."""
         vs = [v for v in self.version_files(slug) if v["kind"] == "version"]
         if not vs:
-            return {"latest": None, "version": None, "dirty": True}
-        d = _read_json(self.dir / vs[-1]["file"], {})
+            return {"latest": None, "version": None, "dirty": True, "newest": None, "newest_version": None, "newer": []}
         bare = lambda x: {k: v for k, v in x.items() if k != "version"} if isinstance(x, dict) else x   # noqa: E731
-        return {"latest": vs[-1]["file"], "version": vs[-1]["version"], "dirty": _canon(bare(d)) != _canon(bare(plan))}
+        me = _canon(bare(plan))
+        own_v = plan.get("version") if isinstance(plan, dict) else None
+        by_v = {v["version"]: v for v in vs if isinstance(v["version"], (int, float))}
+        base, dirty = None, True
+        order = ([by_v[own_v]] if own_v in by_v else []) + [v for v in reversed(vs) if v["version"] != own_v]
+        def canon_of(v):
+            p = self.dir / v["file"]
+            try:
+                st = p.stat()
+            except OSError:
+                return None
+            key = (st.st_mtime_ns, st.st_size)
+            hit = self._vcanon.get(v["file"])
+            if not hit or hit[0] != key:
+                hit = (key, _canon(bare(_read_json(p, {}))))
+                self._vcanon[v["file"]] = hit
+            return hit[1]
+        for v in order:                                       # the version the draft IS (own number first)
+            if canon_of(v) == me:
+                base, dirty = v, False
+                break
+        if base is None:
+            base = by_v.get(own_v) or vs[-1]
+        newest = vs[-1]
+        newer = [{"file": v["file"], "version": v["version"], "by": v.get("by")} for v in vs
+                 if isinstance(v["version"], (int, float)) and isinstance(base["version"], (int, float))
+                 and v["version"] > base["version"]]
+        return {"latest": base["file"], "version": base["version"], "dirty": dirty, "newest": newest["file"],
+                "newest_version": newest["version"], "newer": newer}
 
     # -- history ----------------------------------------------------------------------------------
     def _hidx(self, slug):
@@ -2170,7 +2265,7 @@ class Studio:
     def plan_payload(self, slug, plan=None):
         plan = plan if plan is not None else self.plans.read_draft(slug)
         hist = self.plans.history_info(slug)
-        out = {"slug": slug, "draft": plan, "draft_file": f"plans/{slug}.draft.json",
+        out = {"slug": slug, "draft": plan, "draft_file": f"plans/{slug}.draft.json", "draft_sha": self.plans.draft_sha(plan),
                "draft_path": str(self.plans.draft_path(slug)),
                "version_files": self.plans.version_files(slug), "history": hist,
                "can_undo": hist["can_undo"], "can_redo": hist["can_redo"]}
@@ -2844,7 +2939,7 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         if errs and not (isinstance(body, dict) and body.get("force")):
             raise ApiError(422, "draft has problems; fix them before saving a version (or force: true)", errors=errs)
-        name, plan = st.plans.commit(slug)
+        name, plan = st.plans.commit(slug, expect=body.get("expect") if isinstance(body, dict) else None)
         self._json({"name": name, "file": f"plans/{name}", "version": plan["version"], "slug": slug})
 
     def api_plan_new(self):
@@ -3686,7 +3781,9 @@ class Handler(BaseHTTPRequestHandler):
                                                    state=self.q.get("state") or None)})
 
     def api_factory_order(self, oid):
-        self._json(self._fr().order_detail(self.studio.cfg, self._oid(oid)))
+        d = self._fr().order_detail(self.studio.cfg, self._oid(oid))
+        d["roles"] = role_rows_for_ui(d.get("roles"), self.studio.cfg.work)
+        self._json(d)
 
     def api_factory_role_log(self, oid, role):
         from .factory import bus
@@ -3771,6 +3868,8 @@ class Handler(BaseHTTPRequestHandler):
         rows = [x for x in d["lessons"] + g["lessons"] if (not tag or tag in (x.get("tags") or []))
                 and (self.q.get("scope") in (None, "", x.get("scope")))]
         self._json({"lessons": rows, "inbox": [r for r in d["inbox"] if r.get("status") == "open"],
+                    "unconfirmed": [r for r in d["inbox"] if r.get("status") == "unconfirmed"][-30:],
+                    "deleted": (d.get("deleted") or [])[-20:],
                     "inbox_count": len([r for r in d["inbox"] if r.get("status") == "open"]),
                     "checks": lint.load_checks(cfg), "check_types": list(lint.TYPES), "lessons_sha": lessons.lessons_sha(cfg)})
 
@@ -3789,7 +3888,10 @@ class Handler(BaseHTTPRequestHandler):
         cfg = self.studio.cfg
         lid = b.get("id")
         if b.get("status") == "superseded":
-            return self._json(self._fcall(lessons.supersede, cfg, lid, by=b.get("by"), scope=b.get("scope") or "project"))
+            return self._json(self._fcall(lessons.supersede, cfg, lid, by=b.get("by") or None,
+                                          scope=self._lscope(b), reason=b.get("reason")))
+        if b.get("status") == "deleted":
+            return self._json(self._fcall(lessons.delete, cfg, lid, scope=self._lscope(b), reason=b.get("reason")))
         if b.get("check"):
             rec = self._fcall(lint.add_check, cfg, {**b["check"], "lesson": lid}, scope=b.get("scope") or "project")
             with lessons._lock(cfg, "project"):
@@ -3800,6 +3902,39 @@ class Handler(BaseHTTPRequestHandler):
                 lessons._save(cfg, "project", d)
             return self._json(rec)
         raise ApiError(400, "send {id, status: superseded} or {id, check: {type, params}}")
+
+    @staticmethod
+    def _lscope(b):
+        sc = (b or {}).get("scope") or "project"
+        if sc not in ("project", "global"):
+            raise ApiError(400, "scope is project or global")
+        return sc
+
+    def api_factory_lesson_delete(self, lid):
+        """Delete a wrong lesson (e.g. one a QA bug taught): it leaves the law and its learned check retires."""
+        from .factory import lessons
+        b = self._body() or {}
+        self._json(self._fcall(lessons.delete, self.studio.cfg, lid, scope=self._lscope(b), reason=b.get("reason")))
+
+    def api_factory_lesson_supersede(self, lid):
+        """Retire a lesson, optionally naming the lesson that replaces it ({by, reason})."""
+        from .factory import lessons
+        b = self._body() or {}
+        by = str(b.get("by") or "").strip() or None
+        if by == lid:
+            raise ApiError(400, "a lesson can't supersede itself")
+        self._json(self._fcall(lessons.supersede, self.studio.cfg, lid, by=by, scope=self._lscope(b), reason=b.get("reason")))
+
+    def api_factory_inbox_confirm(self, iid):
+        """The creator confirms a critic / machine finding is a real problem: it may now become a lesson."""
+        from .factory import lessons
+        b = self._body() or {}
+        self._json(self._fcall(lessons.confirm_item, self.studio.cfg, iid, by="operator", text=b.get("text")))
+
+    def api_factory_inbox_dismiss(self, iid):
+        from .factory import lessons
+        b = self._body() or {}
+        self._json(self._fcall(lessons.dismiss_item, self.studio.cfg, iid, reason=b.get("reason") or "not a real problem"))
 
     def api_factory_brain(self, slug):
         from .factory import brain
@@ -4027,6 +4162,10 @@ ROUTES = [
     _r("POST", r"/api/factory/resume", Handler.api_factory_resume),
     _r("GET", r"/api/factory/lessons", Handler.api_factory_lessons),
     _r("POST", r"/api/factory/lessons", Handler.api_factory_lessons_post),
+    _r("POST", rf"/api/factory/lessons/{ID}/delete", Handler.api_factory_lesson_delete),
+    _r("POST", rf"/api/factory/lessons/{ID}/supersede", Handler.api_factory_lesson_supersede),
+    _r("POST", rf"/api/factory/inbox/{ID}/confirm", Handler.api_factory_inbox_confirm),
+    _r("POST", rf"/api/factory/inbox/{ID}/dismiss", Handler.api_factory_inbox_dismiss),
     _r("PATCH", r"/api/factory/lessons", Handler.api_factory_lessons_patch),
     _r("GET", rf"/api/factory/brain/{ID}", Handler.api_factory_brain),
     _r("GET", rf"/api/factory/brain/{ID}/{ID}", Handler.api_factory_brain_file),

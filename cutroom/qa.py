@@ -1101,6 +1101,7 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
     _craft_checks(rep, vs, au, shots, real, fps, n, H, duration, raw_side, side, talk_spans, black_ok, still_spans,
                   frozen, cfg)
     _reference_checks(rep, vs, fps, n, raw_side, framed)
+    swing_check(cfg, rep, au.momentary if (au and au.error is None) else None, raw_side)
 
     # ---------------------------------------------------------------- contact sheets
     issue_frames = {}
@@ -1513,6 +1514,56 @@ def _reference_checks(rep, vs, fps, n, raw, framed):
             value={"shots": rows[:60], "tolerance": {"luma": GRADE_LUMA_TOL, "p1_drop": GRADE_P1_DROP,
                                                      "sat_gain": GRADE_SAT_GAIN}},
             status=None if rows else "info")
+
+
+SWING_TOL_LU = 2.0
+
+
+def swing_check(cfg, rep, momentary, raw):
+    """QA swing_vs_reference: the cold open's punch (p95 - p10 of momentary loudness, cutroom.dynamics) vs
+    the reference intro's. Over SWING_TOL_LU off = fail when the plan asked for `cold_open.dynamics` (the
+    renderer promised it), warn otherwise. Info (skipped, with the reason) without a reference or a cold
+    open."""
+    from . import dynamics as D
+    title = "Cold-open punch: loudness swing vs the reference intro"
+    raw = raw or {}
+    co = next((s for s in raw.get("sections") or [] if s.get("index") == -1 or s.get("generated") == "cold_open"), None)
+    dyn = raw.get("cold_open_dynamics") or {}
+    rid = dyn.get("reference") or (raw.get("reference") or {}).get("id")
+    why = ("no cold open in this render" if not co else "no reference on the cold open" if not rid
+           else "no audio measured" if momentary is None or not len(momentary) else None)
+    ref = None
+    if not why:
+        try:
+            from . import reference as R
+            ref = R.intro_envelope(cfg, rid)
+        except Exception as e:  # noqa: BLE001
+            why = f"reference intro not measured ({e})"
+    if why:
+        rep.add("swing_vs_reference", "audio", title, [], status="info", detail=why)
+        return
+    a, b = float(co["start"]), float(co["end"])
+    m = np.asarray(momentary, float).reshape(-1, 2)
+    sel = m[(m[:, 0] > a) & (m[:, 0] <= b + 1e-6)]
+    ours = D.swing({"t": list(sel[:, 0]), "M": list(sel[:, 1]), "t0": a})
+    theirs = ref.get("swing")
+    iss = []
+    asked = bool(dyn)                     # the plan asked for cold_open.dynamics: the renderer promised it
+    if ours is None or theirs is None:
+        rep.add("swing_vs_reference", "audio", title, [], status="info", detail="too little audio to measure a swing")
+        return
+    off = ours - float(theirs)
+    if abs(off) > SWING_TOL_LU:
+        iss.append(rep.issue("fail" if asked else "warn",
+                             f"cold-open swing {ours:.1f} LU vs the reference intro's {float(theirs):.1f} LU "
+                             f"({off:+.1f}; tolerance {SWING_TOL_LU:g})"
+                             + ("" if asked else "; set cold_open.dynamics {\"match\": \"reference\"}"), t=a, t_end=b))
+    sel_m = sel[:, 1][sel[:, 1] > D.GATE]
+    rep.add("swing_vs_reference", "audio", title, iss,
+            value={"ours_lu": ours, "reference_lu": theirs, "diff_lu": round(off, 2), "window": [round(a, 3), round(b, 3)],
+                   "reference_window": [ref.get("t0"), ref.get("t1")], "reference": rid,
+                   "ours_M_max": round(float(sel_m.max()), 1) if len(sel_m) else None,
+                   "reference_M_max": ref.get("M_max"), "dynamics": bool(dyn)})
 
 
 def _nanmed(xs):

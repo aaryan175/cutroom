@@ -9,15 +9,27 @@ const DEFAULTS = {
   dockH: Math.round(Math.min(230, Math.max(140, H0 * 0.19))),
 };
 
+let fitDock = () => {};
+/** Tabs that need room (the Factory tab: stepper + team + questions) ask the dock for a comfortable height
+ *  while they show: a temporary boost that is not saved; the dock goes back to your height on any other tab.
+ *  Dragging the splitter while boosted keeps the boosted height as yours. */
+export function dockFit(on) { fitDock(on); }
+
 export function initLayout() {
   const L = { ...DEFAULTS, ...LS.get('layout', {}) };
   const root = document.documentElement.style;
+  let boost = 0;
+  fitDock = (on) => {
+    const want = on ? Math.round(clamp(window.innerHeight * 0.42, 300, Math.min(460, window.innerHeight * 0.55))) : 0;
+    const nb = want > L.dockH ? want : 0;
+    if (nb !== boost) { boost = nb; apply(); emit('layout'); }
+  };
   const apply = () => {
     root.setProperty('--projW', L.projW + 'px');
     root.setProperty('--srcFrac', L.srcFrac);
     root.setProperty('--claudeW', L.claudeW + 'px');
     root.setProperty('--topH', (L.topH * 100).toFixed(2) + '%');
-    root.setProperty('--dockH', L.dockH + 'px');
+    root.setProperty('--dockH', Math.max(L.dockH, boost) + 'px');
   };
   apply();
 
@@ -29,6 +41,7 @@ export function initLayout() {
       const key = sp.dataset.split;
       const vertical = sp.classList.contains('v');
       document.body.classList.add('resizing', vertical ? 'resizing-v' : 'resizing-h');
+      if (key === 'dockH' && boost) { L.dockH = Math.max(L.dockH, boost); boost = 0; }     // you take over the boosted height
       const x0 = e.clientX, y0 = e.clientY, start = { ...L };
       const topRow = $('#row-top'), colLeft = $('#col-left');
       const monW = $('#p-source').offsetWidth + $('#p-program').offsetWidth;
@@ -57,6 +70,7 @@ export function initLayout() {
     sp.addEventListener('dblclick', () => {
       const key = sp.dataset.split;
       L[key] = DEFAULTS[key];
+      if (key === 'dockH') boost = 0;
       apply(); LS.set('layout', L); emit('layout');
     });
   }

@@ -26,6 +26,7 @@ section), picks the strongest lines (transcript stakes words + highlight score +
 ends on the payoff (the last line), fitted to the length within 10 % using the renderer's own timeline
 resolution; then it is rendered and exported like any other edit.
 """
+import hashlib
 import json
 import math
 import os
@@ -134,23 +135,62 @@ def sidecar_plan(cfg, sidecar) -> Path | None:
     return p if p.exists() else None
 
 
-def find_render(cfg, plan_path) -> Path | None:
-    """Newest render of this plan (final preferred over preview), by sidecar."""
-    want = str(Path(plan_path).resolve())
-    name = Path(plan_path).name
+def plan_sha(plan) -> str:
+    """Canonical content hash of a plan dict (key order and whitespace don't count; the version number does)."""
+    return hashlib.sha1(json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                        .encode()).hexdigest()[:16]
+
+
+def find_render(cfg, plan_path, preview=None, version=None, names=(), fresh=True) -> Path | None:
+    """The newest render of this plan, by sidecar.
+
+    A render counts when its sidecar's plan is this file (or `names`: render stems like "<slug>_v4" whose
+    sidecar points at a factory candidate), it is a WHOLE render (no `only`: a cold-open-only render is never
+    a base), its version matches the plan's (`version`, default: the plan file's own "version"), and it is
+    fresh: same content hash when the sidecar has one, else not older than the plan file.
+    preview=True/False demands that mode (the factory compares preview with preview: a final render as the
+    base of a preview made every PSNR and QA comparison wrong); None prefers final, then preview."""
+    plan_path = Path(plan_path)
+    want = str(plan_path.resolve())
+    name = plan_path.name
+    try:
+        pobj = json.loads(plan_path.read_text())
+    except (OSError, ValueError):
+        pobj = None
+    if version is None and isinstance(pobj, dict):
+        version = pobj.get("version")
+    psha = plan_sha(pobj) if isinstance(pobj, dict) else None
+    try:
+        pmt = plan_path.stat().st_mtime
+    except OSError:
+        pmt = 0
+    stems = tuple(f"{n}_" for n in names or ())
     best = None
     for sc in cfg.p("renders").glob("*.json"):
-        if sc.name.endswith((".qa.json",)):
+        if sc.name.endswith((".qa.json", ".card.json")):
             continue
         try:
             d = json.loads(sc.read_text())
         except (OSError, ValueError):
             continue
-        if (d.get("plan") != want and Path(d.get("plan") or "").name != name) or d.get("only"):
+        if not isinstance(d, dict) or d.get("only"):
             continue
         mp4 = sc.with_suffix(".mp4")
+        by_name = bool(stems) and mp4.name.startswith(stems) and not re.match(r".*_v\d+_var\d+", mp4.stem)
+        if d.get("plan") != want and Path(d.get("plan") or "").name != name and not by_name:
+            continue
         if not mp4.exists():
             continue
+        if preview is not None and bool(d.get("preview")) != bool(preview):
+            continue
+        if version is not None and d.get("version") is not None and str(d.get("version")) != str(version):
+            continue
+        if fresh:
+            if d.get("plan_sha") and psha:
+                if d["plan_sha"] != psha and not by_name:
+                    continue
+            elif not by_name and mp4.stat().st_mtime < pmt - 1:
+                continue
         key = (0 if d.get("preview") else 1, mp4.stat().st_mtime)
         if best is None or key > best[0]:
             best = (key, mp4)

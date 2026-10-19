@@ -2,7 +2,7 @@
 import { S, on, emit, op, selectedPieces, segmentOf, KIND_COLOR, fps, setPlayhead, loadMarkers, piecesOfSeg, normOvernight } from './state.js';
 import { api, media } from './api.js';
 import { h, icon, tc, md, toast, eta, ago, LS, clamp } from './util.js';
-import { tabs } from './layout.js';
+import { tabs, dockFit } from './layout.js';
 import { renderComments } from './comments.js';
 import { renderLooks, lookField } from './looks.js';
 import { renderFactory } from './factory.js';
@@ -409,7 +409,7 @@ export function lightbox(url) {
 
 // ================================================================ init
 const RENDER = { inspector: renderInspector, story: renderStory, markers: renderMarkers, comments: () => renderComments(pane()), looks: () => renderLooks(pane()), factory: () => renderFactory(pane()), qa: renderQA, jobs: renderJobs, overnight: renderOvernight };
-function show(name) { if (!RENDER[name]) name = 'inspector'; current = name; RENDER[name](); }
+function show(name) { if (!RENDER[name]) name = 'inspector'; current = name; dockFit(name === 'factory'); RENDER[name](); }
 export function initDock(el) {
   body = el;
   const t = tabs(document.getElementById('p-dock'), 'dock', show);

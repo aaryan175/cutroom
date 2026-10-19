@@ -11,7 +11,13 @@ segment, read the words in that span), made into code so every role starts from 
          supersedes: decision id | None, frames: [clean frame paths]}
 
 A point comment covers [t - 1, t + 1]; a range comment [t, t_end] (EDITING_RULES: a range note means the
-whole span). Output (timeline) seconds are mapped to source seconds through the resolved pieces, never by
+whole span).
+
+The generated cold open (section index -1: card, strobe blocks, teaser lines, the held end shot and its typed
+title) is not a plan section, so its pieces map to `cold_open.*` refs of the plan's `cold_open` block
+(`cold_open.card`, `cold_open.shots`, `cold_open.lines[k]`, `cold_open.end_shot`, `cold_open.title`, plus
+`cold_open` itself). In the real run every note on the intro said "0 segments" and the lock check could not
+tell a cold-open change from an unexplained one. Output (timeline) seconds are mapped to source seconds through the resolved pieces, never by
 subtracting across a jump cut.
 """
 import re
@@ -59,10 +65,55 @@ def _seg_of(plan, sec, seg):
         return None
 
 
+CO_TYPES = {"card": "cold_open.card", "montage": "cold_open.shots", "block": "cold_open.shots"}
+
+
+def cold_open_refs(tl) -> dict:
+    """{(sec, seg) of the generated cold open: ref} from the resolved timeline. Teaser lines are numbered in
+    timeline order (the plan's cold_open.lines order); the last picture segment that is not a line is the held
+    end shot."""
+    segs = sorted({(p.get("seg"), p.get("type")) for p in tl.get("pieces") or []
+                   if p.get("sec") == -1 and p.get("track") == "V1" and isinstance(p.get("seg"), int)},
+                  key=lambda x: x[0])
+    out, li = {}, 0
+    last_pic = max((g for g, ty in segs if ty not in ("talk", "card")), default=None)
+    for g, ty in segs:
+        if ty == "talk":
+            out[(-1, g)] = f"cold_open.lines[{li}]"
+            li += 1
+        elif g == last_pic and ty not in CO_TYPES:
+            out[(-1, g)] = "cold_open.end_shot"
+        elif g == last_pic and ty in ("montage", "block") and any(p.get("sec") == -1 and p.get("seg") == g and p.get("track") == "V3"
+                                                                      for p in tl.get("pieces") or []):
+            out[(-1, g)] = "cold_open.end_shot"
+        else:
+            out[(-1, g)] = CO_TYPES.get(ty, "cold_open.shots")
+    return out
+
+
+def cold_open_span(tl):
+    """[start, end] of the generated cold open on the timeline, or None."""
+    xs = [(p["start"], p["end"]) for p in tl.get("pieces") or [] if p.get("sec") == -1 and p.get("track") == "V1"]
+    return [round(min(a for a, _ in xs), 3), round(max(b for _, b in xs), 3)] if xs else None
+
+
+def _piece_ref(p, co_refs):
+    """The note-level ref of a piece: "s.g" for a plan segment, a cold_open.* ref for the generated intro."""
+    sec, sg = p.get("sec"), p.get("seg")
+    if isinstance(sec, int) and sec >= 0:
+        return f"{sec}.{sg}"
+    if sec == -1:
+        if p.get("track") == "V3" or p.get("kind") in ("typed_title", "title") or p.get("type") == "overlay":
+            return "cold_open.title" if "title" in str(p.get("kind") or "") else "cold_open.overlays"
+        return co_refs.get((-1, sg), "cold_open")
+    return None
+
+
 def pieces_in(cfg, tl, plan, a, b):
     """Every piece of the resolved timeline overlapping [a, b] (all tracks except music), with the source
     span inside the window and the words spoken in it."""
     out = []
+    co_refs = cold_open_refs(tl)
     for p in tl.get("pieces") or []:
         if p.get("track") == "A2" or p["end"] <= a or p["start"] >= b:
             continue
@@ -78,7 +129,8 @@ def pieces_in(cfg, tl, plan, a, b):
         sec, sg = p.get("sec"), p.get("seg")
         seg = _seg_of(plan, sec, sg) if isinstance(sec, int) and sec >= 0 else None
         out.append({"track": p.get("track"), "kind": p.get("kind"), "type": p.get("type"), "sec": sec, "seg": sg,
-                    "ref": f"{sec}.{sg}", "key": brain.seg_key(seg) if seg is not None else None,
+                    "ref": f"{sec}.{sg}", "note_ref": _piece_ref(p, co_refs),
+                    "key": brain.seg_key(seg) if seg is not None else None,
                     "clip": p.get("clip"), "clip_rel": p.get("clip_rel"), "src_in": src_a, "src_out": src_b,
                     "start": round(lo, 3), "end": round(hi, 3), "label": p.get("label"),
                     "words": _words_in(cfg, p.get("clip"), src_a, src_b) if p.get("track") in ("V1", "A1") and
@@ -93,7 +145,9 @@ def map_comment(cfg, con, tl, plan, marker, n, frames_dir=None, decisions=None) 
     te = marker.get("t_end")
     a, b = (t, float(te)) if te is not None and float(te) > t + 0.04 else (max(0.0, t - WINDOW), t + WINDOW)
     ps = pieces_in(cfg, tl, plan, a, b)
-    segs = list(dict.fromkeys(p["ref"] for p in ps if isinstance(p.get("sec"), int) and p["sec"] >= 0))
+    segs = list(dict.fromkeys(p["note_ref"] for p in ps if p.get("note_ref")))
+    if any(str(r).startswith("cold_open") for r in segs) and "cold_open" not in segs:
+        segs.append("cold_open")
     keys = list(dict.fromkeys(p["key"] for p in ps if p.get("key")))
     words = " ".join(dict.fromkeys(p["words"] for p in ps if p.get("words")))
     from ..studio import Studio, drawing_words
@@ -102,7 +156,7 @@ def map_comment(cfg, con, tl, plan, marker, n, frames_dir=None, decisions=None) 
             "text": str(marker.get("text") or "").strip(), "drawing": drawing_words(marker.get("drawing")) or None,
             "frame": str(frame) if frame and Path(frame).exists() else None, "window": [round(a, 3), round(b, 3)],
             "pieces": ps, "segments": segs, "keys": keys, "words": words, "flags": flags_of(marker.get("text")),
-            "supersedes": None, "frames": []}
+            "supersedes": None, "frames": [], "cold_open": any(str(r).startswith("cold_open") for r in segs)}
     for d in decisions or []:
         if set(d.get("segments") or []) & set(keys):
             note["supersedes"] = d.get("id")

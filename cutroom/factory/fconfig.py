@@ -21,7 +21,8 @@ DEFAULTS = {
                 "wall_s_large": 14400,
                 "role_runs": 6},
     "walls": {"intake": 120, "producer": 240, "forensics": 1200, "extend": 3600, "edit": 1800, "edit_large": 4500,
-              "render": 5400, "qa": 900, "critic": 900, "fix": 1800, "integrate": 300, "lessons": 300},
+              "render": 5400, "qa": 900, "critic": 900, "fix": 1800, "verify": 600, "integrate": 300, "lessons": 300},
+    "render_base": True,               # no fresh preview of the base version: render it once (like-for-like QA)
     "limit_backoff_s": 1800,           # usage limit / overload: not_before = now + this, at most limit_retries
     "limit_retries": 3,
     "refusal_backoff_s": 21600,        # login refused: everything pauses (Resume clears it at once)

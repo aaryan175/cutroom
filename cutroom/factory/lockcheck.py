@@ -36,7 +36,8 @@ def _sections_meta(plan):
     return [{k: v for k, v in (s or {}).items() if k != "segments"} for s in plan.get("sections") or []]
 
 
-def plan_lock(base, cand, allowed_refs=(), locked_keys=(), allowed_global=False, allowed_locked_refs=()) -> dict:
+def plan_lock(base, cand, allowed_refs=(), locked_keys=(), allowed_global=False, allowed_locked_refs=(),
+              allowed_top=()) -> dict:
     """{status: pass|fail, issues: [{sev: HARD|warn, text, ref?}], changed: [base refs], added: [cand refs],
         pairs: [(base ref, cand ref)] untouched}"""
     allowed = set(allowed_refs)
@@ -70,7 +71,9 @@ def plan_lock(base, cand, allowed_refs=(), locked_keys=(), allowed_global=False,
     if _sections_meta(base) != _sections_meta(cand) and len(base.get("sections") or []) == len(cand.get("sections") or []):
         diff_top.append("sections (names / music)")
     for k in diff_top:
-        if not allowed_global:
+        if k in set(allowed_top):          # e.g. a note on the generated cold open names plan["cold_open"]
+            issues.append({"sev": "warn", "ref": None, "text": f"plan-wide '{k}' changed (a note on it asked for it)"})
+        elif not allowed_global:
             issues.append({"sev": "HARD", "ref": None, "text": f"plan-wide '{k}' changed but no note asked for a "
                            "global change"})
         else:
@@ -132,3 +135,21 @@ def render_lock(cfg, base_video, base_tl, cand_video, cand_tl, pairs, out_dir, m
             issues.append({"sev": "warn", "ref": ra, "text": f"untouched segment {ra}: PSNR {p} dB (re-encode drift?)",
                            "t": tb})
     return {"status": "fail" if any(i["sev"] == "HARD" for i in issues) else "pass", "rows": rows, "issues": issues}
+
+
+PICTURE_GLOBALS = {"style"}     # plan-wide fields whose change legitimately alters every frame (grade, film, captions)
+
+
+def excuse_global(render_issues, global_changed, allowed_global) -> list:
+    """Render-lock issues after an asked-for plan-wide picture change (e.g. a note asked for the film
+    roll-off, which acts on every bright frame): untouched segments are expected to differ, so HARD
+    becomes warn with the reason. Without an allowed global change nothing is excused."""
+    why = sorted(set(global_changed or ()) & PICTURE_GLOBALS)
+    if not allowed_global or not why:
+        return list(render_issues or [])
+    out = []
+    for i in render_issues or []:
+        if i.get("sev") == "HARD":
+            i = {**i, "sev": "warn", "text": f"{i['text']}; expected: plan-wide '{why[0]}' changed (a note asked for it)"}
+        out.append(i)
+    return out

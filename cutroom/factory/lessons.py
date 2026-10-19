@@ -5,8 +5,18 @@ triages them into lessons; lessons that can be measured become declarative check
     ~/.cutroom/lessons.json         global lessons (seeded once from docs/EDITING_RULES.md; CUTROOM_GLOBAL_DIR)
 
 Lesson: {id: P0012 | G0003 | R017, scope, at, source, symptom, rule, check: <check id> | None, tags, status:
-active | superseded, superseded_by}. Inbox item: {id: I0007, key, at, order, source, kind, text, tags,
-status: open | triaged, lesson?, reason?}.
+active | superseded, superseded_by, provenance}. Inbox item: {id: I0007, key, at, order, source, kind, text,
+tags, provenance, status: open | unconfirmed | triaged, lesson?, reason?}.
+
+PROVENANCE (the real run taught false lessons from QA bugs: "never add a film look" came from a broken
+rule-38 check, not from the creator). A lesson is only ever created from the CREATOR: a reject reason, a
+NOTES text, a comment (note / restore / the same spot noted again), an answer, or a critic / machine item
+the creator CONFIRMED (`confirm_item`). Critic findings and machine-QA fails land in the inbox as
+`unconfirmed`: they are shown, never triaged into a lesson, and `apply_ops` refuses to turn them into one.
+    provenance = {kind: creator_note | creator_reject | creator_answer | critic | machine | operator | rules,
+                  creator: bool, confirmed: bool, by?, at?}
+`supersede` and `delete` retire a lesson AND its learned check (a check whose lesson is gone must not keep
+failing versions: C0002 kept the poisoned P0002 alive in lint).
 
 Nothing here blocks a version: triage runs at the end of an order over that order's items only (at most 10),
 and an untriaged backlog only shows as a count. Roles get a SCOPED brief (brief()): every active project
@@ -99,9 +109,48 @@ def ensure_global_seed():
             bus.write_json(p, {"lessons": les, "inbox": [], "seen": [], "seeded_from": str(md)})
 
 
+# ---------------------------------------------------------------------------------------------- provenance
+CREATOR_KINDS = {"reject": "creator_reject", "notes": "creator_note", "note": "creator_note", "restore": "creator_note",
+                 "repeat_note": "creator_note", "answer": "creator_answer", "ruling": "creator_answer",
+                 "operator": "operator"}
+MACHINE_KINDS = {"machine_fail": "machine", "lint_fail": "machine", "critic_hard": "critic", "critic": "critic"}
+
+
+def provenance_of(item) -> dict:
+    """Where an inbox signal came from, and whether it may become a lesson."""
+    pv = item.get("provenance")
+    if isinstance(pv, dict) and pv.get("kind"):
+        return {**pv, "creator": bool(pv.get("creator")), "confirmed": bool(pv.get("confirmed") or pv.get("creator"))}
+    kind = str(item.get("kind") or "")
+    src = str(item.get("source") or "")
+    if kind in CREATOR_KINDS or src.startswith(("verdict:", "comment:", "answer:", "operator")):
+        k = CREATOR_KINDS.get(kind) or ("creator_reject" if kind == "reject" else "creator_note")
+        return {"kind": k, "creator": True, "confirmed": True}
+    k = MACHINE_KINDS.get(kind) or ("critic" if src.startswith("critic:") else "machine")
+    return {"kind": k, "creator": False, "confirmed": False}
+
+
+def eligible(item) -> bool:
+    """May this inbox item become a lesson? Only the creator's own words, or a machine/critic item the creator
+    confirmed."""
+    pv = provenance_of(item)
+    return bool(pv["creator"] or pv["confirmed"])
+
+
+def _next_id(rows, prefix):
+    n = 0
+    for x in rows:
+        m = re.match(rf"{prefix}(\d+)$", str(x.get("id") or ""))
+        if m:
+            n = max(n, int(m.group(1)))
+    return f"{prefix}{n + 1:04d}"
+
+
 # ---------------------------------------------------------------------------------------------- harvest
 def harvest(cfg, items, order=None) -> list:
-    """Add signals to the project inbox (idempotent by key). items: [{source, kind, text, tags?}] -> new rows."""
+    """Add signals to the project inbox (idempotent by key). items: [{source, kind, text, tags?, provenance?}]
+    -> new rows. Creator signals are `open` (triage may make them lessons); critic / machine signals are
+    `unconfirmed` until the creator confirms them."""
     new = []
     with _lock(cfg, "project"):
         d = load(cfg, "project")
@@ -114,9 +163,11 @@ def harvest(cfg, items, order=None) -> list:
             if key in seen:
                 continue
             seen.add(key)
-            row = {"id": f"I{len(d['inbox']) + 1:04d}", "key": key, "at": bus.now_iso(), "order": order or it.get("order"),
+            pv = provenance_of(it)
+            row = {"id": _next_id(d["inbox"], "I"), "key": key, "at": bus.now_iso(), "order": order or it.get("order"),
                    "source": it.get("source"), "kind": it.get("kind"), "text": text[:1500],
-                   "tags": list(it.get("tags") or []), "status": "open"}
+                   "tags": list(it.get("tags") or []), "provenance": pv,
+                   "status": "open" if eligible({**it, "provenance": pv}) else "unconfirmed"}
             d["inbox"].append(row)
             new.append(row)
         d["seen"] = sorted(seen)[-5000:]
@@ -125,8 +176,44 @@ def harvest(cfg, items, order=None) -> list:
 
 
 def inbox(cfg, order=None, open_only=True) -> list:
+    """Items the lesson-keeper may triage (open AND eligible); open_only=False lists everything."""
     rows = load(cfg, "project")["inbox"]
-    return [r for r in rows if (not open_only or r.get("status") == "open") and (order is None or r.get("order") == order)]
+    return [r for r in rows if (not open_only or (r.get("status") == "open" and eligible(r)))
+            and (order is None or r.get("order") == order)]
+
+
+def unconfirmed(cfg, order=None) -> list:
+    return [r for r in load(cfg, "project")["inbox"] if r.get("status") == "unconfirmed"
+            and (order is None or r.get("order") == order)]
+
+
+def confirm_item(cfg, iid, by="operator", text=None) -> dict:
+    """The creator confirms a critic / machine finding ("yes, that is a real problem"): it becomes eligible
+    for triage. `text` may restate it in the creator's words."""
+    with _lock(cfg, "project"):
+        d = load(cfg, "project")
+        item = next((r for r in d["inbox"] if r["id"] == iid), None)
+        if item is None:
+            raise KeyError(f"no inbox item {iid}")
+        pv = provenance_of(item)
+        item["provenance"] = {**pv, "confirmed": True, "by": by, "at": bus.now_iso()}
+        if text:
+            item["text"] = " ".join(str(text).split())[:1500]
+        if item.get("status") == "unconfirmed":
+            item["status"] = "open"
+        _save(cfg, "project", d)
+    return item
+
+
+def dismiss_item(cfg, iid, reason="not a real problem") -> dict:
+    with _lock(cfg, "project"):
+        d = load(cfg, "project")
+        item = next((r for r in d["inbox"] if r["id"] == iid), None)
+        if item is None:
+            raise KeyError(f"no inbox item {iid}")
+        item.update(status="triaged", reason=str(reason)[:300], dismissed=True)
+        _save(cfg, "project", d)
+    return item
 
 
 def apply_ops(cfg, ops, order=None) -> list:
@@ -139,7 +226,13 @@ def apply_ops(cfg, ops, order=None) -> list:
         for op in ops or []:
             kind = op.get("op")
             item = by_in.get(op.get("inbox"))
-            if item is None or item.get("status") != "open":
+            if item is None or item.get("status") not in ("open", "unconfirmed"):
+                continue
+            if item.get("status") == "unconfirmed" and kind == "none":
+                continue                                # waits for the creator, not for the keeper
+            if kind in ("add", "supersede", "merge") and not eligible(item):
+                done.append({"op": "refused", "inbox": item["id"],
+                             "why": "not from the creator and not confirmed by the creator"})
                 continue
             if kind == "none":
                 item.update(status="triaged", reason=str(op.get("reason") or "no lesson")[:300])
@@ -154,11 +247,12 @@ def apply_ops(cfg, ops, order=None) -> list:
             if kind in ("add", "supersede"):
                 if not op.get("rule"):
                     continue
-                lid = f"P{len(d['lessons']) + 1:04d}"
+                lid = _next_id(d["lessons"] + d.get("deleted", []), "P")
                 les = {"id": lid, "scope": "project", "at": bus.now_iso(), "source": item.get("source"),
                        "symptom": str(op.get("symptom") or item["text"])[:600], "rule": str(op["rule"])[:600],
                        "check": None, "tags": list(op.get("tags") or item.get("tags") or []), "status": "active",
-                       "superseded_by": None, "order": order}
+                       "superseded_by": None, "order": order,
+                       "provenance": {**provenance_of(item), "inbox": item["id"], "words": item["text"][:300]}}
                 chk = op.get("check_json")
                 if chk:
                     try:
@@ -169,7 +263,8 @@ def apply_ops(cfg, ops, order=None) -> list:
                         les["check_error"] = str(e)[:200]
                 if kind == "supersede" and op.get("lesson") in by_les:
                     old = by_les[op["lesson"]]
-                    old.update(status="superseded", superseded_by=lid)
+                    old.update(status="superseded", superseded_by=lid, superseded_at=bus.now_iso())
+                    _retire_check(cfg, old.get("check"), "project", f"lesson {old['id']} superseded by {lid}")
                 d["lessons"].append(les)
                 by_les[lid] = les
                 item.update(status="triaged", lesson=lid)
@@ -179,11 +274,13 @@ def apply_ops(cfg, ops, order=None) -> list:
 
 
 def add_lesson(cfg, rule, symptom="", tags=(), check=None, source="operator", scope="project") -> dict:
+    """A lesson the creator writes by hand (Lessons tab / CLI): creator provenance by definition."""
     with _lock(cfg, scope):
         d = load(cfg, scope)
-        lid = f"{'P' if scope == 'project' else 'G'}{len(d['lessons']) + 1:04d}"
+        lid = _next_id(d["lessons"] + d.get("deleted", []), "P" if scope == "project" else "G")
         les = {"id": lid, "scope": scope, "at": bus.now_iso(), "source": source, "symptom": symptom, "rule": rule,
-               "check": None, "tags": list(tags), "status": "active", "superseded_by": None}
+               "check": None, "tags": list(tags), "status": "active", "superseded_by": None,
+               "provenance": {"kind": "operator", "creator": True, "confirmed": True}}
         if check:
             les["check"] = lint.add_check(cfg, {**check, "lesson": lid, "why": rule}, scope=scope)["id"]
         d["lessons"].append(les)
@@ -191,15 +288,61 @@ def add_lesson(cfg, rule, symptom="", tags=(), check=None, source="operator", sc
     return les
 
 
-def supersede(cfg, lid, by=None, scope="project") -> dict:
+def _retire_check(cfg, cid, scope, why):
+    """Deactivate a learned check (kept in checks.json with status retired, so the history stays readable)."""
+    if not cid:
+        return None
+    p = lint.checks_path(cfg, scope)
+    with bus.flocked(p.with_name(".checks.lock")):
+        d = bus.read_json(p, {}) or {}
+        cs = d.get("checks", []) if isinstance(d, dict) else []
+        hit = None
+        for c in cs:
+            if c.get("id") == cid:
+                c.update(status="retired", retired_at=bus.now_iso(), retired_why=str(why)[:300])
+                hit = c
+        if hit is not None:
+            bus.write_json(p, {**(d if isinstance(d, dict) else {}), "checks": cs})
+    return hit
+
+
+def supersede(cfg, lid, by=None, scope="project", reason=None) -> dict:
+    """Retire a lesson (and its check). `by` names the lesson that replaces it, if any."""
     with _lock(cfg, scope):
         d = load(cfg, scope)
         les = next((x for x in d["lessons"] if x["id"] == lid), None)
         if les is None:
             raise KeyError(f"no lesson {lid}")
-        les.update(status="superseded", superseded_by=by)
+        if by and not any(x["id"] == by for x in d["lessons"]):
+            raise KeyError(f"no lesson {by} to supersede with")
+        les.update(status="superseded", superseded_by=by, superseded_at=bus.now_iso())
+        if reason:
+            les["superseded_why"] = str(reason)[:300]
         _save(cfg, scope, d)
+    _retire_check(cfg, les.get("check"), scope, f"lesson {lid} superseded" + (f" by {by}" if by else ""))
     return les
+
+
+def delete(cfg, lid, scope="project", reason=None) -> dict:
+    """Remove a lesson from the law (a wrong one: e.g. taught by a QA bug). It moves to `deleted` (kept for the
+    record, never shown in a brief), its check is retired, and the inbox items that pointed at it are marked."""
+    with _lock(cfg, scope):
+        d = load(cfg, scope)
+        les = next((x for x in d["lessons"] if x["id"] == lid), None)
+        if les is None:
+            raise KeyError(f"no lesson {lid}")
+        d["lessons"] = [x for x in d["lessons"] if x["id"] != lid]
+        rec = {**les, "status": "deleted", "deleted_at": bus.now_iso(), "deleted_why": str(reason or "")[:300]}
+        d.setdefault("deleted", []).append(rec)
+        for x in d["lessons"]:                       # a lesson superseded BY the deleted one comes back
+            if x.get("superseded_by") == lid and x.get("status") == "superseded":
+                x.update(status="active", superseded_by=None)
+        for r in d["inbox"]:
+            if r.get("lesson") == lid:
+                r["lesson_deleted"] = True
+        _save(cfg, scope, d)
+    _retire_check(cfg, les.get("check"), scope, f"lesson {lid} deleted" + (f": {reason}" if reason else ""))
+    return rec
 
 
 # ---------------------------------------------------------------------------------------------- brief

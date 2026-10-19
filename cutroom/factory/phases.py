@@ -1,8 +1,8 @@
 """The pipeline phases. Code phases are deterministic; role phases are one agent run each (roles.py).
 
     revise / reject / continue / request:
-        intake -> producer -> [forensics] -> [extend] -> edit -> render -> qa -> critic -> [fix -> render2 -> qa2]
-        -> integrate -> (lessons, silent)
+        intake -> producer -> [forensics] -> [extend] -> edit -> render -> qa -> critic -> [fix -> render2 -> qa2
+        -> verify] -> integrate -> (lessons, silent)
     variants: intake -> producer -> variants_edit -> variants_render -> variants_integrate
     approve:  approve_intake -> render_final -> qa_final -> approve_record     (no agent; never publishes)
     extend:   extend_stub                                                      (the extender is a stub)
@@ -17,7 +17,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import brain, bus, card, gates, lessons, lint, lockcheck, mapnotes, roles
+from . import brain, bus, card, claims, gates, lessons, lint, lockcheck, mapnotes, roles
 
 TEXT_ACTIONS = {"caption_text", "text"}
 
@@ -48,7 +48,7 @@ class Stopped(Exception):
 
 PLANS = {
     "revise": ["intake", "producer", "forensics", "extend", "edit", "render", "qa", "critic", "fix", "render2", "qa2",
-               "integrate", "lessons"],
+               "verify", "integrate", "lessons"],
     "variants": ["intake", "producer", "variants_edit", "variants_render", "variants_integrate"],
     "approve": ["approve_intake", "render_final", "qa_final", "approve_record"],
     "extend": ["extend_stub"],
@@ -59,13 +59,13 @@ SILENT = {"lessons"}
 LABELS = {"intake": "reading the notes", "producer": "planning the changes", "forensics": "measuring the reference",
           "extend": "checking for new features", "edit": "editing", "render": "rendering", "qa": "machine checks",
           "critic": "independent review", "fix": "fixing what the review found", "render2": "re-rendering",
-          "qa2": "re-checking", "integrate": "publishing the version", "lessons": "learning",
+          "qa2": "re-checking", "verify": "re-judging the findings on the fixed render", "integrate": "publishing the version", "lessons": "learning",
           "variants_edit": "making options", "variants_render": "rendering options", "variants_integrate": "publishing options",
           "approve_intake": "approved", "render_final": "full-quality render", "qa_final": "checking the final render",
           "approve_record": "recording", "extend_stub": "feature request"}
 STEPS = ["Intake", "Producer", "Reference", "Extend", "Edit", "Render", "QA", "Critic", "Fix", "Ready"]
 STEP_OF = {"intake": "Intake", "producer": "Producer", "forensics": "Reference", "extend": "Extend", "edit": "Edit",
-           "render": "Render", "qa": "QA", "critic": "Critic", "fix": "Fix", "render2": "Fix", "qa2": "Fix",
+           "render": "Render", "qa": "QA", "critic": "Critic", "fix": "Fix", "render2": "Fix", "qa2": "Fix", "verify": "Fix",
            "integrate": "Ready", "lessons": "Ready", "variants_edit": "Edit", "variants_render": "Render",
            "variants_integrate": "Ready", "approve_intake": "Intake", "render_final": "Render", "qa_final": "QA",
            "approve_record": "Ready", "extend_stub": "Extend"}
@@ -98,31 +98,16 @@ def _rel(ctx, p):
         return Path(p).name
 
 
-def find_render(cfg, plan_file):
-    """Newest preview render whose sidecar points at `plan_file` (or named after it)."""
-    plan_file = Path(plan_file).resolve()
-    rd = Path(cfg.work) / "renders"
-    best = None
-    for side in rd.glob("*.json"):
-        if side.name.endswith((".qa.json", ".card.json")):
-            continue
-        try:
-            d = json.loads(side.read_text())
-        except (OSError, ValueError):
-            continue
-        if not isinstance(d, dict) or d.get("schema") != "cutroom-render-v1":
-            continue
-        mp4 = side.with_suffix(".mp4")
-        if not mp4.exists():
-            continue
-        try:
-            same = Path(d.get("plan") or "").resolve() == plan_file
-        except OSError:
-            same = False
-        if same or mp4.stem.startswith(plan_file.stem + "_"):
-            if best is None or mp4.stat().st_mtime > best.stat().st_mtime:
-                best = mp4
-    return best
+def find_render(cfg, plan_file, preview=True):
+    """The base render to compare against: export.find_render with the factory's rules - a PREVIEW render
+    (the factory renders previews; comparing them with a final made every PSNR / QA delta wrong), of this
+    plan's version, whole (never a cold-open-only partial), fresh (made from this content). A factory
+    version's render is found by name (<slug>_v<N>_preview.mp4: its sidecar points at the order's candidate)."""
+    from ..export import find_render as _find
+    plan_file = Path(plan_file)
+    m = bus.VERSION_RE.match(plan_file.name)
+    names = [plan_file.stem] if m else []
+    return _find(cfg, plan_file, preview=preview, names=names)
 
 
 def _note_lines(notes, with_pieces=True):
@@ -147,7 +132,7 @@ def _note_lines(notes, with_pieces=True):
                 extra = (f" words: \"{p['words'][:160]}\"" if p.get("words") else "") + \
                         (f" captions: {p['captions'][:3]}" if p.get("captions") else "") + \
                         (f" overlay: {p['overlays'][:2]}" if p.get("overlays") else "")
-                out.append(f"- seg {p['ref']} {p['track']} {p['type']}/{p['kind']} {card.mmss(p['start'])}-"
+                out.append(f"- seg {p.get('note_ref') or p['ref']} {p['track']} {p['type']}/{p['kind']} {card.mmss(p['start'])}-"
                            f"{card.mmss(p['end'])}{src}{extra}")
         if n.get("frames"):
             out.append("Clean frames: " + ", ".join(n["frames"]))
@@ -327,8 +312,34 @@ def extend(ctx):
     return {"capabilities": caps, "suborders": subs}
 
 
+# capabilities a producer asked for that have since been built: name pattern -> how to use it
+BUILT_CAPABILITIES = [
+    (re.compile(r"typed[ _-]?title.*(pos|place|placement|position|move)|title[ _-]?(pos|placement|position)", re.I),
+     "typed_title_position",
+     "Built: typed titles take \"pos\": {\"x\": 0-1, \"y\": 0-1} (title centre, frame fractions) or \"pos\": \"auto\" "
+     "(measured: the quietest readable area of the held shot, off faces/people and the sun, with a contrast check; "
+     "a dark backing plate when no area reads) on a typed_title overlay or on cold_open.title. "
+     "cold_open.end_shot: \"auto\" picks the held shot whose quiet/dark area suits the title, at a source window not "
+     "used nearby. Preview it with `cutroom title place <plan> --choose-shot`. Send the note again (or a new comment) "
+     "to have the factory use it."),
+]
+
+
+def built_capability(cap):
+    """(name, how-to text) when the requested capability already exists, else None."""
+    for rx, name, how in BUILT_CAPABILITIES:
+        if rx.search(str(cap or "")):
+            return name, how
+    return None
+
+
 def extend_stub(ctx):
     cap = ctx.order.get("text") or "a new capability"
+    have = built_capability(cap)
+    if have:
+        ctx.progress(f"already built: {have[0]}")
+        return {"state": "done", "why": None, "version": None, "questions": [], "capability": have[0],
+                "text": f"feature {have[0]}: {have[1]}"}
     raise NeedsYou(f"new feature needed: {cap[:120]}", questions=card.clean_questions([{
         "text": f"New feature needed: {cap[:150]}. The extender is not enabled in this build.",
         "options": ["build it by hand (see the extending-cutroom skill)", "skip it"]}], kind="extend"), kind="extend")
@@ -435,9 +446,41 @@ def do_render(ctx, plan_path, out, preview=True):
             "seconds": round(time.time() - t0, 1), "preview": preview}
 
 
+def base_render(ctx):
+    """The base version's render (intake found one, or the render phase made one)."""
+    br = _intake(ctx).get("base_render") or (ctx.outs.get("render") or {}).get("base_render")
+    return br if br and Path(br).exists() else None
+
+
+def _render_base(ctx):
+    """No fresh preview of the base version exists (only a final, a partial or a stale one): render it once
+    so QA regressions, the render lock and the claim deltas compare like with like. Never overwrites."""
+    it = _intake(ctx)
+    if it.get("base_render") or not it.get("base_n") or not ctx.fc.get("render_base", True):
+        return None
+    rd = Path(ctx.cfg.work) / "renders"
+    out = rd / f"{ctx.order['plan']}_v{it['base_n']}_preview.mp4"
+    if out.exists():
+        out = rd / f"{ctx.order['plan']}_v{it['base_n']}_base_preview.mp4"
+    if out.exists():
+        return str(out)
+    ctx.progress(f"no fresh preview of v{it['base_n']}: rendering it once as the base")
+    plan = Path(ctx.cfg.work) / "plans" / it["base_file"]
+    try:
+        do_render(ctx, plan if plan.exists() else it["base_path"], out)
+    except Blocked as e:
+        ctx.progress(f"base render failed ({str(e)[:120]}): comparing without a base")
+        return None
+    return str(out) if out.exists() else None
+
+
 def render(ctx):
     _finish_candidate(ctx, "candidate")
-    return do_render(ctx, _candidate(ctx), _render_out(ctx))
+    out = do_render(ctx, _candidate(ctx), _render_out(ctx))
+    br = _render_base(ctx)
+    if br:
+        out["base_render"] = br
+    return out
 
 
 def render2(ctx):
@@ -448,8 +491,8 @@ def render2(ctx):
 
 # ================================================================================================ machine QA
 def _base_qa(ctx):
-    br = _intake(ctx).get("base_render")
-    if not br or not Path(br).exists():
+    br = base_render(ctx)
+    if not br:
         return None
     qj = Path(br).with_name(Path(br).stem + ".qa.json")
     if qj.exists() and qj.stat().st_mtime >= Path(br).stat().st_mtime:
@@ -488,8 +531,10 @@ def machine_qa(ctx, round_=1):
             fails.append({"id": f"qa:{x['check']}", "text": f"{x['title']}: {'; '.join(m for m in x['msgs'] if m)}",
                           "t": x["t"], "evidence": x.get("evidence")})
         for x in kept:
-            warns.append(f"{x['title']} ({x['n']} fail{'s' if x['n'] > 1 else ''}) was already in "
-                         f"v{it.get('base_n')}: not caused by this round")
+            warns.append(f"{x['title']} ({x['n']} fail{'s' if x['n'] > 1 else ''}) "
+                         + (f"is new, but v{it.get('base_n')} was measured before this check existed: not comparable"
+                            if x.get("not_on_base") else
+                            f"was already in v{it.get('base_n')}: not caused by this round"))
         if s.get("warn"):
             warns.append(f"{s['warn']} QA warning(s): see the QA report")
     # lock check
@@ -499,26 +544,44 @@ def machine_qa(ctx, round_=1):
     acts = {c.get("action") for c in pr.get("changes") or []}
     lk = lockcheck.plan_lock(base, cand, allowed_refs=noted | ledger_refs,
                              locked_keys=set(brain.locks(ctx.cfg, ctx.order["plan"])), allowed_locked_refs=noted,
-                             allowed_global=bool(acts & lockcheck.GLOBAL_ACTIONS) or ctx.order["kind"] == "request")
+                             allowed_global=bool(acts & lockcheck.GLOBAL_ACTIONS) or ctx.order["kind"] == "request",
+                             allowed_top={"cold_open"} if any(n.get("cold_open") for n in notes) else ())
     checked.append(f"lock check: {len(lk['pairs'])} untouched segment(s) identical in the plan, "
                    f"{len(set(lk['changed']))} changed, {len(lk['added'])} new")
     for i in lk["issues"]:
         (fails.append({"id": "lock", "text": i["text"], "t": None}) if i["sev"] == "HARD" else warns.append(i["text"]))
     rlk = None
-    br = it.get("base_render")
-    if br and Path(br).exists() and lk["pairs"]:
+    br = base_render(ctx)
+    if br and lk["pairs"]:
         try:
             rlk = lockcheck.render_lock(ctx.cfg, br, _resolve(ctx, base), video, _resolve(ctx, cand), lk["pairs"],
                                         ctx.pdir / "lock")
             checked.append(f"render lock: {len(rlk['rows'])} untouched segment(s) compared frame by frame "
                            f"(min PSNR {min([r['psnr'] for r in rlk['rows']] or [99]):.1f} dB)")
+            rlk["issues"] = lockcheck.excuse_global(rlk["issues"], lk.get("global_changed"),
+                                                    bool(acts & lockcheck.GLOBAL_ACTIONS) or ctx.order["kind"] == "request")
+            rlk["status"] = "fail" if any(i["sev"] == "HARD" for i in rlk["issues"]) else "pass"
             for i in rlk["issues"]:
                 (fails.append({"id": "lock_render", "text": i["text"], "t": i.get("t")}) if i["sev"] == "HARD"
                  else warns.append(i["text"]))
         except Exception as e:  # noqa: BLE001
             warns.append(f"render lock not measured: {e}")
-    # lint (lessons -> checks)
     tl = _resolve(ctx, cand)
+    # claims: every measurable number the editor / fixer wrote, measured on this render (and vs the base)
+    cl_rows = []
+    try:
+        btl = _resolve(ctx, base) if br else None
+        src = "fix" if round_ == 2 else "editor"
+        cl_rows = claims.check(ctx.cfg, claims.texts_of(notes, ledger, (ed or {}).get("summary"),
+                                                        (ed or {}).get("proofs") if round_ == 2 else (), src),
+                               video, tl, br, btl, rep)
+    except Exception as e:  # noqa: BLE001 - the claim check never stops QA
+        warns.append(f"claims not measured: {type(e).__name__}: {str(e)[:120]}")
+    bad = [r for r in cl_rows if r.get("ok") is False]
+    if cl_rows:
+        checked.append(f"claims: {len(cl_rows)} number(s) in the {'fix' if round_ == 2 else 'edit'} summary measured "
+                       f"on the render, {len(bad)} not shown by it")
+    # lint (lessons -> checks)
     lt = lint.run(ctx.cfg, cand, tl, rep, con=ctx.con)
     checked.append(f"lint: {len(lt)} learned check(s)" if lt else "lint: no learned checks yet")
     for x in lt:
@@ -560,6 +623,7 @@ def machine_qa(ctx, round_=1):
             "lock": {k: lk[k] for k in ("status", "issues", "changed", "added", "global_changed")},
             "render_lock": rlk, "lint": lt, "drift": drift, "link": link,
             "sheet": _rel(ctx, sheet) if rows else None, "spots": rows, "refcmp": refcmp, "fails": fails,
+            "claims": cl_rows, "claim_findings": claims.findings(cl_rows, prefix="K" if round_ == 1 else "KF"),
             "warns": warns, "checked": checked, "lessons_sha": lessons.lessons_sha(ctx.cfg)}
 
 
@@ -609,6 +673,7 @@ def critic(ctx):
     fs = [f for f in res.get("findings") or [] if isinstance(f, dict)]
     for i, f in enumerate(fs):
         f["id"] = f.get("id") or f"F{i + 1}"
+    fs += list(q.get("claim_findings") or [])      # numbers the editor claimed that the render does not show
     hard = [f for f in fs if f.get("sev") == "HARD"]
     ctx.progress(f"critic: {len(hard)} HARD, {len(fs) - len(hard)} SOFT")
     return {"findings": fs, "per_note": res.get("per_note") or [], "summary": res.get("summary"),
@@ -619,6 +684,8 @@ def fix(ctx):
     q = ctx.outs["qa"]
     cr = ctx.outs.get("critic") or {}
     hard = [f for f in cr.get("findings") or [] if f.get("sev") == "HARD"]
+    have = {f.get("id") for f in hard}
+    hard += [f for f in q.get("claim_findings") or [] if f["id"] not in have]     # critic skipped: still fix claims
     machine = q["fails"]
     if not hard and not machine:
         raise Skip("nothing to fix")
@@ -650,6 +717,86 @@ def fix(ctx):
             "summary": res.get("summary")}
 
 
+# ================================================================================================ verify
+def _hard_findings(ctx):
+    cr = ctx.outs.get("critic") or {}
+    q = ctx.outs.get("qa") or {}
+    hard = [f for f in cr.get("findings") or [] if f.get("sev") == "HARD"]
+    have = {f.get("id") for f in hard}
+    return hard + [f for f in q.get("claim_findings") or [] if f["id"] not in have]
+
+
+def _verify_claim(ctx, f, q2, fx):
+    """A false-claim finding closes when the claim now measures true on the fixed render, or the fix round no
+    longer makes it (the card then carries the measured number instead)."""
+    c = f.get("claim") or {}
+    it = _intake(ctx)
+    note = next((n for n in it["notes"] if n["id"] == c.get("note")), {})
+    video = Path(ctx.cfg.work) / "renders" / ctx.outs["render2"]["render"]
+    cand = _plan_load(_candidate(ctx))
+    br = base_render(ctx)
+    try:
+        rows = claims.check(ctx.cfg, [{"note": note, "source": "recheck", "text": c.get("text")}], video, _resolve(ctx, cand),
+                            br, _resolve(ctx, _plan_load(it["base_path"])) if br else None,
+                            bus.read_json(video.with_name(video.stem + ".qa.json"), {}))
+    except Exception as e:  # noqa: BLE001
+        rows = []
+        why = f"not re-measured: {e}"[:160]
+    same = [r for r in rows if r.get("qty") == c.get("qty") and r.get("kind") == c.get("kind")]
+    if same and all(r.get("ok") for r in same):
+        return True, "now measures true on the fixed render: " + claims.describe(same[0])
+    fix_text = " ".join([str((fx or {}).get("summary") or "")] + [str(r.get(k) or "") for r in (fx or {}).get("ledger") or []
+                                                                   for k in ("change", "proof")])
+    if c.get("text") and c["text"][:60] not in fix_text and not any(
+            r.get("ok") is False and r.get("qty") == c.get("qty") for r in q2.get("claims") or []):
+        return True, ("the fix round withdrew the claim; the card shows the measured number"
+                      + (f" ({claims.describe(same[0])})" if same else ""))
+    return False, ("still not shown by the fixed render: " + claims.describe(same[0])) if same else "still unproven"
+
+
+def verify(ctx):
+    """Re-judge every HARD finding against the FIXED render (the real run's findings could never close: the
+    gate only asked for a proof string and a clean re-render). Claim findings are re-measured by code; critic
+    findings get one short read-only verify run with the new render, its sheet and the fix proofs."""
+    fx = ctx.outs.get("fix") or {}
+    if fx.get("skipped") or "fix" not in ctx.outs:
+        raise Skip("no fix round")
+    hard = _hard_findings(ctx)
+    if not hard:
+        raise Skip("no HARD findings to re-judge")
+    q2 = ctx.outs.get("qa2") or {}
+    results = {}
+    for f in hard:
+        if f.get("source") == "claims":
+            ok, ev = _verify_claim(ctx, f, q2, fx)
+            results[f["id"]] = {"closed": ok, "evidence": ev, "by": "code"}
+    crit = [f for f in hard if f.get("source") != "claims"]
+    if crit:
+        rend = ctx.outs["render2"]
+        sheet = str(Path(ctx.cfg.work) / "renders" / q2["sheet"]) if q2.get("sheet") else None
+        proofs = {p.get("finding"): p.get("proof") for p in fx.get("proofs") or []}
+        sections = [("HARD findings to re-judge on the NEW render", "\n".join(
+                        f"- {f['id']} @ {card.mmss(f.get('t'))}: {f.get('text')}" for f in crit)),
+                    ("What the fix round says it did (claims to check, not facts)", "\n".join(
+                        f"- {f['id']}: {proofs.get(f['id']) or '(no proof given)'}" for f in crit)),
+                    ("The operator's notes (verbatim)", _note_lines(_intake(ctx)["notes"], with_pieces=False)),
+                    ("Machine QA on the fixed render", "\n".join([f"- FAIL {x['id']}: {x['text']}" for x in q2.get("fails") or []]
+                                                                  + [f"- {c}" for c in q2.get("checked") or []]))]
+        p = roles.build("verify", order=ctx.order, sections=sections, context={
+            "the FIXED render": str(Path(ctx.cfg.work) / "renders" / rend["render"]), "changed-spots sheet (open it)": sheet})
+        try:
+            r = ctx.role("verify", p, images=[x for x in [sheet] if x], budgeted=False)
+            for x in (r["result_json"] or {}).get("results") or []:
+                if isinstance(x, dict) and x.get("id") in {f["id"] for f in crit}:
+                    results[x["id"]] = {"closed": bool(x.get("closed")), "evidence": str(x.get("evidence") or "")[:400],
+                                        "by": "verify"}
+        except (Blocked, Requeue) as e:
+            ctx.progress(f"verify run failed ({str(e)[:120]}): findings stay open")
+    closed = [k for k, v in results.items() if v["closed"]]
+    ctx.progress(f"re-judged {len(results)} HARD finding(s) on the fixed render: {len(closed)} closed")
+    return {"results": results, "closed": closed}
+
+
 # ================================================================================================ integrate
 def versions_meta_write(cfg, slug, name, rec):
     """plans/.history/<slug>/versions.json (the studio's 'who saved it'), first writer wins, plus our fields."""
@@ -674,6 +821,14 @@ def versions_index_update(cfg, key, **fields):
         return d[key]
 
 
+def round_questions(pr, edit_out, fix_out=None):
+    """Producer questions + the editor's unplaced notes, minus the notes the fix round then placed (a
+    question the fix answered must not stay on the card or mark its comment needs_you)."""
+    placed = {r.get("note") for r in (fix_out or {}).get("ledger") or [] if r.get("change")}
+    unplaced = [q for q in (edit_out or {}).get("unplaced") or [] if not q.get("note") or q["note"] not in placed]
+    return list((pr or {}).get("questions") or []) + unplaced
+
+
 def integrate(ctx):
     from .. import studio as studiomod
     cfg, o = ctx.cfg, ctx.order
@@ -691,27 +846,45 @@ def integrate(ctx):
         not_passed.append(f"plan check: {errs[0]}")
     for f in fq["fails"]:
         not_passed.append(f"machine {f['id']}: {f['text'][:140]}")
-    questions = list(pr.get("questions") or []) + list((ctx.outs.get("edit") or {}).get("unplaced") or [])
+    questions = round_questions(pr, ctx.outs.get("edit"), ctx.outs.get("fix") if fixed else None)
     asked = {q.get("note") for q in questions if q.get("note")}
     done_notes = {r["note"] for r in ledger if r.get("change")}
     praise_only = {c.get("note") for c in pr.get("changes") or [] if c.get("action") == "none"}
     unresolved = [n for n in notes if n["id"] not in done_notes | asked | praise_only]
     for n in unresolved:
-        questions.append({"text": f"I couldn't do {n['id']} (\"{n['text'][:90]}\").", "options": [
+        questions.append({"text": f"I couldn't do {n['id']} (\"{card.cut_words(n['text'], 90)}\").", "options": [
             "try again with more detail from me", "leave it as it is"], "note": n["id"], "kind": "unresolved"})
     questions = card.clean_questions(questions)
-    # critic HARD findings: closed only with a proof AND a clean re-render
+    # HARD findings (critic + false claims): closed only when re-judged closed on the FIXED render (verify).
+    # Pre-existing QA fails (already in the base version) are warnings and never keep a finding open.
     cr = ctx.outs.get("critic") or {}
     proofs = {p.get("finding"): p.get("proof") for p in (ctx.outs.get("fix") or {}).get("proofs") or []}
+    ver = (ctx.outs.get("verify") or {}).get("results") or {}
     crit_rows = []
-    for f in cr.get("findings") or []:
-        row = dict(f)
+    hard_ids = set()
+    for f in list(cr.get("findings") or []) + [f for f in (ctx.outs.get("qa") or {}).get("claim_findings") or []
+                                               if f["id"] not in {x.get("id") for x in cr.get("findings") or []}]:
+        row = {k: v for k, v in f.items() if k != "claim"}
         if f.get("sev") == "HARD":
-            closed = fixed and f.get("id") in proofs and not fq["fails"]
-            row["fix"] = proofs.get(f.get("id")) if closed else None
+            hard_ids.add(f.get("id"))
+            v = ver.get(f.get("id"))
+            closed = bool(fixed and v and v.get("closed"))
+            row["fix"] = proofs.get(f.get("id")) if fixed else None
+            row["verified"] = v.get("evidence") if v else None
+            row["status"] = "closed" if closed else "open"
             if not closed:
-                not_passed.append(f"critic {f.get('id')}: {str(f.get('text'))[:120]}")
+                why = (" (re-judged on the fixed render: " + v["evidence"][:100] + ")") if v else \
+                    (" (no fix round)" if not fixed else " (not re-judged)")
+                not_passed.append(f"{'claim' if f.get('source') == 'claims' else 'critic'} {f.get('id')}: "
+                                  f"{str(f.get('text'))[:120]}{why}")
         crit_rows.append(row)
+    if fixed:                                   # numbers the FIX round wrote that the render does not show
+        for f in fq.get("claim_findings") or []:
+            row = {k: v for k, v in f.items() if k != "claim"}
+            row["status"] = "open"
+            crit_rows.append(row)
+            not_passed.append(f"claim {f['id']}: {f['text'][:140]}")
+    ledger = claims.annotate_ledger(ledger, fq.get("claims") or [])
     passed = not not_passed
     # ---- publish the version (integrate is the only writer of versions)
     name = f"{slug}_v{N}.json"
@@ -724,7 +897,7 @@ def integrate(ctx):
     bus.atomic_write(vp, json.dumps(cand, indent=1, ensure_ascii=False) + "\n")
     rend = ctx.outs.get("render2") if fixed and not (ctx.outs.get("render2") or {}).get("skipped") else ctx.outs["render"]
     caveats = ["audio is checked by measurement only (loudness, silence, music under speech), not by ear"]
-    if not it.get("base_render"):
+    if not base_render(ctx):
         caveats.append(f"no render of v{it.get('base_n')} existed, so every QA fail counts as new and the render "
                        "lock was skipped")
     cc = {"status": cr.get("status") or ("skipped" if (ctx.outs.get("critic") or {}).get("skipped") else None),
@@ -779,13 +952,21 @@ def integrate(ctx):
         if n.get("supersedes"):
             brain.add_decision(cfg, slug, f"segment {', '.join(n['segments'])}", n["text"], "comment",
                                supersedes=n["supersedes"], segments=n["keys"])
-    # ---- harvest for the learning loop (never blocks)
+    # ---- harvest for the learning loop (never blocks). Only the creator's words can become lessons; critic
+    # findings and machine fails go in as `unconfirmed` (a QA bug taught "never add a film look" in the real run).
     items = []
+    for n in notes:
+        if n.get("text") and n.get("comment"):
+            items.append({"source": f"comment:{n['comment']}", "kind": "note", "text": n["text"], "tags": [],
+                          "provenance": {"kind": "creator_note", "creator": True, "confirmed": True}})
     for f in cr.get("findings") or []:
         if f.get("sev") == "HARD":
-            items.append({"source": f"critic:{o['id']}", "kind": "critic_hard", "text": f.get("text"), "tags": []})
+            items.append({"source": f"critic:{o['id']}", "kind": "critic_hard", "text": f.get("text"), "tags": [],
+                          "provenance": {"kind": "critic", "creator": False, "confirmed": False,
+                                         "finding": f.get("id")}})
     for f in (ctx.outs.get("qa") or {}).get("fails") or []:
-        items.append({"source": f"qa:{o['id']}", "kind": "machine_fail", "text": f["text"], "tags": []})
+        items.append({"source": f"qa:{o['id']}", "kind": "machine_fail", "text": f["text"], "tags": [],
+                      "provenance": {"kind": "machine", "creator": False, "confirmed": False, "check": f.get("id")}})
     for n in notes:
         if "restore" in n["flags"]:
             items.append({"source": f"comment:{n.get('comment')}", "kind": "restore", "text": n["text"], "tags": ["process"]})
@@ -796,9 +977,9 @@ def integrate(ctx):
                           "text": f"noted again after v{it.get('base_n')}: {n['text']}", "tags": []})
     lessons.harvest(cfg, items, order=o["id"])
     state = "ready" if passed else "needs_you"
-    why = None if passed else "not passed: " + not_passed[0][:200]
+    why = None if passed else "not passed: " + card.cut_words(not_passed[0], 200)
     if not passed:
-        questions = card.clean_questions([{"text": f"v{N} did not pass ({not_passed[0][:120]}).",
+        questions = card.clean_questions([{"text": f"v{N} did not pass ({card.cut_words(not_passed[0], 120)}).",
                                            "options": ["I'll look at it as it is", "send it back for another round"],
                                            "kind": "notpassed"}]) + questions
     return {"state": state, "why": why, "version": N, "file": name, "passed": passed, "not_passed": not_passed,
@@ -806,9 +987,11 @@ def integrate(ctx):
 
 
 def lessons_phase(ctx):
-    items = lessons.inbox(ctx.cfg, order=ctx.order["id"])[:10]
+    items = lessons.inbox(ctx.cfg, order=ctx.order["id"])[:10]      # creator / creator-confirmed items only
     if not items:
-        raise Skip("nothing in this order's inbox")
+        raise Skip("nothing from the creator in this order's inbox" + (
+            f" ({len(lessons.unconfirmed(ctx.cfg, ctx.order['id']))} critic/machine item(s) wait for the creator "
+            "to confirm)" if lessons.unconfirmed(ctx.cfg, ctx.order["id"]) else ""))
     have = [x for x in lessons.load(ctx.cfg, "project")["lessons"] if x.get("status") == "active"]
     sections = [("This order's inbox", "\n".join(f"- {x['id']} [{x['kind']}] {x['text']}" for x in items)),
                 ("Project lessons already active", "\n".join(f"- {x['id']}: {x['rule']}" for x in have[-40:])),
@@ -941,7 +1124,7 @@ def approve_record(ctx):
 
 
 FUNCS = {"intake": intake, "producer": producer, "forensics": forensics, "extend": extend, "edit": edit,
-         "render": render, "qa": qa, "critic": critic, "fix": fix, "render2": render2, "qa2": qa2,
+         "render": render, "qa": qa, "critic": critic, "fix": fix, "render2": render2, "qa2": qa2, "verify": verify,
          "integrate": integrate, "lessons": lessons_phase, "variants_edit": variants_edit,
          "variants_render": variants_render, "variants_integrate": variants_integrate, "approve_intake": approve_intake,
          "render_final": render_final, "qa_final": qa_final, "approve_record": approve_record, "extend_stub": extend_stub}

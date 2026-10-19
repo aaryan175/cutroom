@@ -1670,6 +1670,47 @@ def load_analysis(cfg, rid) -> dict:
     return an
 
 
+INTRO_NAMES = ("cold open", "teaser", "intro", "opening", "hook")
+
+
+def intro_window(an) -> tuple:
+    """(t0, t1) of the reference's cold open: the first measured section (cutroom's section finder names
+    it 'cold open' / 'teaser' when it is one); falls back to structure.cold_open_s, then 10 s."""
+    s0 = (an.get("sections") or [{}])[0]
+    t1 = s0.get("end") or (an.get("structure") or {}).get("cold_open_s") or 10.0
+    return float(s0.get("start") or 0.0), float(t1)
+
+
+def intro_envelope(cfg, rid, t1=None, force=False) -> dict:
+    """The measured loudness envelope of the reference's cold open, the target the renderer's
+    `cold_open.dynamics: {"match": "reference"}` follows and QA `swing_vs_reference` compares with.
+    {id, t0, t1, I, TP, LRA, swing, M_p10, M_p95, M_max, curve: [[t, M], ...] every 0.1 s, short: [[t, S]...]}.
+    Computed lazily from the reference source (or proxy) and cached in refs/<id>/intro_envelope.json, keyed by
+    the window and the source's file signature, so analyses made before this existed need nothing re-run."""
+    from . import dynamics as D
+    rid = resolve_id(cfg, rid)
+    an = load_analysis(cfg, rid)
+    a, b = intro_window(an)
+    if t1:
+        b = float(t1)
+    src = source_path(cfg, rid) or (ref_dir(cfg, rid) / "proxy.mp4")
+    if not Path(src).exists():
+        raise KeyError(f"reference {rid}: no source file to measure")
+    sig = f"{file_sig(src)}:{a:.3f}:{b:.3f}"
+    cp = ref_dir(cfg, rid) / "intro_envelope.json"
+    c = _jload(cp)
+    if c and not force and c.get("sig") == sig:
+        return c
+    env = D.envelope(cfg, src, a, b)
+    st = D.window_stats(cfg, src, a, b)
+    out = {"id": rid, "sig": sig, "t0": a, "t1": b, **{k: st.get(k) for k in ("I", "TP", "LRA", "swing", "M_p10", "M_p95",
+                                                                               "M_max")},
+           "curve": [[t - a, m] for t, m in zip(env["t"], env["M"])],
+           "short": [[t - a, x] for t, x in zip(env["t"], env["S"])]}
+    _jsave(cp, out)
+    return out
+
+
 def pending(cfg) -> list:
     """Ids of references that still need (or failed) an analysis."""
     out = []

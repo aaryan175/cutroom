@@ -158,7 +158,7 @@ function drawScrub() {
   if (sctx.canvas.width !== Math.round(W * dpr)) { sctx.canvas.width = Math.round(W * dpr); sctx.canvas.height = Math.round(H * dpr); }
   const c = sctx; c.setTransform(dpr, 0, 0, dpr, 0, 0);
   c.clearRect(0, 0, W, H);
-  c.fillStyle = '#161618'; c.fillRect(0, 0, W, H);
+  c.fillStyle = '#0c0c0e'; c.fillRect(0, 0, W, H);
   const d = video.duration || (S.source.clip && S.source.clip.duration) || 0;
   if (!d) return;
   const X = (t) => (t / d) * W;
@@ -168,31 +168,32 @@ function drawScrub() {
     const x1 = X(w.t0), x2 = X(w.t1);
     const sh = +w.shake || 0;
     const a = clamp((sh - 2) / 8, 0, 1);
-    c.fillStyle = `hsl(${120 - a * 120}, 45%, ${30 + a * 10}%)`;
+    c.fillStyle = `hsl(${150 - a * 145}, ${38 + a * 20}%, ${34 + a * 10}%)`;
     c.fillRect(x1, H - 6, Math.max(1, x2 - x1 - 0.5), 3);
     const ex = +w.exposure; const eb = isFinite(ex) ? clamp(Math.abs(ex - 118) / 90, 0, 1) : 0;
-    c.fillStyle = `rgba(212,162,60,${eb})`;
+    c.fillStyle = `rgba(231,169,61,${eb * 0.9})`;
     c.fillRect(x1, H - 3, Math.max(1, x2 - x1 - 0.5), 3);
   }
   // shot boundaries
-  c.fillStyle = 'rgba(255,255,255,.18)';
+  c.fillStyle = 'rgba(255,255,255,.16)';
   for (const s of (S.source.detail && S.source.detail.shots) || []) { const st = Array.isArray(s) ? s[0] : s.start; if (st > 0.01) c.fillRect(Math.round(X(st)), 4, 1, H - 12); }
   // ticks
-  c.fillStyle = '#3a3a40';
+  c.fillStyle = '#34343a';
   const step = d > 120 ? 10 : d > 30 ? 5 : 1;
   for (let t = 0; t < d; t += step) c.fillRect(Math.round(X(t)), 0, 1, t % (step * 5) === 0 ? 6 : 3);
   // in/out
   const { in: a, out: b } = S.source;
   if (a !== null || b !== null) {
     const x1 = X(a ?? 0), x2 = X(b ?? d);
-    c.fillStyle = 'rgba(201,162,39,.2)'; c.fillRect(x1, 0, x2 - x1, H - 7);
-    c.fillStyle = '#c9a227';
+    c.fillStyle = 'rgba(241,192,79,.14)'; c.fillRect(x1, 0, x2 - x1, H - 7);
+    c.fillStyle = '#f1c04f';
     if (a !== null) { c.fillRect(x1, 0, 2, H - 7); c.fillRect(x1, 0, 6, 2); c.fillRect(x1, H - 9, 6, 2); }
     if (b !== null) { c.fillRect(x2 - 2, 0, 2, H - 7); c.fillRect(x2 - 6, 0, 6, 2); c.fillRect(x2 - 6, H - 9, 6, 2); }
   }
   // playhead
   const px = Math.round(X(video.currentTime || 0));
-  c.fillStyle = '#4c8dff'; c.fillRect(px - 0.5, 0, 2, H - 6);
+  c.fillStyle = 'rgba(107,151,255,.28)'; c.fillRect(px - 1.5, 0, 4, H - 6);
+  c.fillStyle = '#6b97ff'; c.fillRect(px - 0.5, 0, 2, H - 6);
   c.beginPath(); c.moveTo(px - 4.5, 0); c.lineTo(px + 5.5, 0); c.lineTo(px + 0.5, 5); c.fill();
 }
 function updateIO() {

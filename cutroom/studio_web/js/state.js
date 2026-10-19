@@ -40,9 +40,10 @@ export const S = {
 
 // ---------------------------------------------------------------- timeline normalisation
 export const KIND_COLOR = {
-  talk: '#3d7d84', broll: '#5f58a6', montage: '#8e5585', matchcut: '#a77a37',
-  title: '#7a6c4a', still: '#4c6f93', black: '#3a3a40', cutaway: '#5f58a6',
-  caption: '#5d5a3c', overlay: '#86633a', dialogue: '#3b7452', music: '#3f5f7d',
+  // one family: equal OKLCH lightness/chroma (L .52, C .075), hue carries the kind
+  talk: '#27767a', broll: '#646393', montage: '#82597e', matchcut: '#876038',
+  title: '#7a6733', still: '#426d91', black: '#3a3a3f', cutaway: '#646393',
+  caption: '#736a34', overlay: '#8c5c41', dialogue: '#437656', music: '#39708e',
 };
 
 function trackOf(p) {

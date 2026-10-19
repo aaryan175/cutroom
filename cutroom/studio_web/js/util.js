@@ -108,8 +108,8 @@ const P = {
   commit: '<circle cx="8" cy="8" r="2.5"/><path d="M1.5 8h4M10.5 8h4"/>',
   render: '<rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="M6.8 6v4l3.4-2z" fill="currentColor" stroke="none"/>',
   help: '<rect x="1.5" y="4" width="13" height="8.5" rx="1.5"/><path d="M4 7h1M7 7h1M10 7h2M4 9.8h8"/>',
-  play: '<path d="M5 3.2v9.6L12.5 8z" fill="currentColor" stroke="none"/>',
-  pause: '<path d="M4.5 3.5h2.3v9H4.5zM9.2 3.5h2.3v9H9.2z" fill="currentColor" stroke="none"/>',
+  play: '<path d="M5.2 3.6c0-.6.6-.9 1.1-.6l6.3 4.4c.4.3.4.9 0 1.2L6.3 13c-.5.3-1.1 0-1.1-.6z" fill="currentColor" stroke="none"/>',
+  pause: '<rect x="4.3" y="3.5" width="2.6" height="9" rx=".8" fill="currentColor" stroke="none"/><rect x="9.1" y="3.5" width="2.6" height="9" rx=".8" fill="currentColor" stroke="none"/>',
   stepb: '<path d="M11 4 6 8l5 4z" fill="currentColor" stroke="none"/><path d="M4.5 4v8"/>',
   stepf: '<path d="M5 4l5 4-5 4z" fill="currentColor" stroke="none"/><path d="M11.5 4v8"/>',
   markin: '<path d="M6 3H4.5v10H6"/><path d="M8 8h4"/>',
@@ -132,8 +132,8 @@ const P = {
   search: '<circle cx="7" cy="7" r="4.3"/><path d="M10.3 10.3 14 14"/>',
   x: '<path d="M4 4l8 8M12 4l-8 8"/>',
   plus: '<path d="M8 3v10M3 8h10"/>',
-  send: '<path d="M2.5 8 13.5 2.8 10.4 13.5 7.6 8.9z"/><path d="M7.6 8.9 13.5 2.8"/>',
-  stop: '<rect x="4" y="4" width="8" height="8" rx="1" fill="currentColor" stroke="none"/>',
+  send: '<path d="M8 13.2V3.2M3.6 7.4 8 3l4.4 4.4" stroke-width="1.8"/>',
+  stop: '<rect x="4.5" y="4.5" width="7" height="7" rx="1.5" fill="currentColor" stroke="none"/>',
   newchat: '<path d="M2.5 3.5h11v7.5h-6L4 13.5V11H2.5z"/><path d="M8 5.2v4M6 7.2h4"/>',
   speech: '<path d="M2.5 3.5h11v7.5h-6L4 13.5V11H2.5z"/>',
   person: '<circle cx="8" cy="5.5" r="2.6"/><path d="M3 14c.6-2.8 2.6-4.3 5-4.3s4.4 1.5 5 4.3"/>',
@@ -153,7 +153,7 @@ const P = {
   cal: '<rect x="2" y="3" width="12" height="11" rx="1.2"/><path d="M2 6.5h12M5 1.8v2.4M11 1.8v2.4"/>',
 };
 export function icon(name, size = 16) {
-  return `<svg class="ic" viewBox="0 0 16 16" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
+  return `<svg class="ic" viewBox="0 0 16 16" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
 }
 export function iconEl(name, size) {
   const s = document.createElement('span');

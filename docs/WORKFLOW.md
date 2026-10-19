@@ -42,6 +42,32 @@ off the machine, use any tunnel or VPN you trust (a Tailscale address, `cloudfla
 send the file). The creator leaves timestamped notes; `cutroom notes` prints them. Then follow the
 review-loop skill and make v2.
 
+## 6. Deliver
+```bash
+cutroom export renders/<slug>_vN.mp4 --preset all --thumbs        # every platform + captions + thumbnails
+cutroom export renders/<slug>_vN.mp4 --preset reels --cutdown 30   # a 30 s cut as a face-tracked 9:16
+cutroom cutdown plans/<slug>_vN.json --len 15,30,60                # just the cutdown plans, to refine first
+```
+Everything lands in `renders/exports/<render name>/`: one file per preset (`youtube`, `youtube_4k`,
+`reels`, `tiktok`, `shorts`, `square`, `feed`), `.srt` and `.vtt` at the exact heard times, a YouTube
+`chapters.txt` from the plan's sections, `thumbs/thumb_01..06.jpg` + `thumbs/sheet.jpg`, and `export.json`
+with the measured size, frame rate, duration and loudness of each file.
+- Export from the **final** render: a 9:16 crop of a 720p preview is upscaled about 2.7× (the manifest
+  warns). Thumbnails come from the masters when the sidecar can locate them, so they are full resolution
+  either way.
+- The vertical versions are reframed from the 16:9 edit: the crop follows the face in every shot
+  (static when the person barely moves, never cutting a detected head), follows the picture's detail when
+  nobody is in frame, and letterboxes title cards and shots with a graphic over a blurred copy. Captions
+  are re-set inside each platform's safe area from a caption-free render of the same plan.
+- Frame rates are kept (platforms take 24–60 fps); `--fps 30` forces a conform.
+- Cutdowns keep the cold open, pick the strongest lines (stakes words, highlight score, length) in story
+  order and end on the last line. **Look at the cutdown before sending it**: it is a first draft plan.
+- Nothing is uploaded anywhere. Look at the 9:16 frames and the thumbnail sheet before sending.
+
+## Big libraries
+Run `cutroom estimate` (or `cutroom estimate --tb 4`) before the first overnight run on a multi-TB
+library; see "Big libraries" in `docs/OVERNIGHT.md` for proxy, transcription and tagging settings.
+
 ## Hardware notes
 - **Proxies use the hardware encoder** (VideoToolbox on Mac, NVENC on NVIDIA). That keeps a 2 TB index
   to an evening rather than days.

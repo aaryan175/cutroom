@@ -57,6 +57,15 @@ INVISIBLE_CUT = 20.0           # rule 31: mean abs luma diff across a cut (0-255
 NEAR_DUP_CORR = 0.8            # rule 92
 REPEAT_WINDOW = 10.0           # rule 92
 MIN_MONTAGE_SHOT = 0.3
+FLOOR_STEP_MEDIAN, FLOOR_STEP_P90 = 3.0, 8.0   # room tone across talk joins (reference: 2.2 / 4.9 dB)
+TALK_MIN_WINDOW_DB = -55.0      # quietest 250 ms inside talk (reference -39; a gated cut sits at -65..-73)
+BLACK_P1_MILKY = 16.0           # median black point (p1 luma, 0-255): reference 10; > 16 reads milky
+BLACK_P1_SHOT = 24.0            # one shot's black point this high is visibly lifted
+DUP_RATE = 0.8                  # duplicated frames per second in a moving shot (24 -> 25 judder ~1/s)
+CAPTION_PCT = (3.3, 4.7)        # caption FONT px as % of frame height. Reference: 43 px at 1080 = 3.98 %
+                                # (its visible text height measures ~2.96 %; don't compare font size to text height)
+CAPTION_REF_PCT = 3.98
+SFX_TOL_S = 0.005               # transition sound transient vs the cut frame
 EMPTY_MOTION = 0.6             # px/frame camera motion below which a face-less shot may be an empty plate
 EMPTY_ACTIVITY = 1.5           # mean abs frame diff (64x36, 0-255) below which nothing moves in frame
 SHEET_COLS, SHEET_ROWS = 4, 6  # 24 tiles per sheet
@@ -295,7 +304,7 @@ class _VideoScan:
         w, h = self.w, self.h
         fs = w * h * 3
         stride = max(1, int(round(self.fps / SHAKE_FPS)))
-        g64, luma, mafd, sharp, vel, jpegs = [], [], [], [], [], []
+        g64, luma, mafd, sharp, vel, jpegs, p1 = [], [], [], [], [], [], []
         prev_g, prev_full, prev_shake = None, None, None
         i = 0
         while True:
@@ -307,6 +316,7 @@ class _VideoScan:
             small = cv2.resize(grey, (64, 36), interpolation=cv2.INTER_AREA)
             g64.append(small)
             luma.append(float(grey.mean()))
+            p1.append(float(np.percentile(grey[::3, ::3], 1)))
             mafd.append(float(np.abs(small.astype(np.int16) - prev_g).mean()) if prev_g is not None else 0.0)
             sharp.append(float(cv2.Laplacian(grey, cv2.CV_32F).var()) if i % 3 == 0 else np.nan)
             v = (np.nan, np.nan)
@@ -324,6 +334,7 @@ class _VideoScan:
         self.n = i
         self.g64 = np.array(g64, np.uint8) if g64 else np.zeros((0, 36, 64), np.uint8)
         self.luma = np.array(luma, np.float32)
+        self.p1 = np.array(p1, np.float32)
         self.mafd = np.array(mafd, np.float32)
         self.sharp = np.array(sharp, np.float32)
         self.vel = np.array(vel, np.float32).reshape(-1, 2)
@@ -551,6 +562,11 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
         old.unlink()
 
     side = load_sidecar(sidecar_path or video.with_suffix(".json"))
+    try:
+        raw_side = json.loads(Path(sidecar_path or video.with_suffix(".json")).read_text()) if side else {}
+        raw_side = raw_side if isinstance(raw_side, dict) else {}
+    except (OSError, ValueError):
+        raw_side = {}
     plan = None
     if plan_path:
         try:
@@ -782,6 +798,14 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
             value={"spans": [[round(a, 3), round(b, 3)] for a, b in frozen]})
 
     # ---------------------------------------------------------------- cuts
+    tr_frames = [int(t.get("frame", round(float(t["t"]) * fps))) for t in (raw_side.get("transitions") or [])]
+    teaser_t = [(x.get("start"), x.get("end")) for x in (raw_side.get("segments") or []) if x.get("teaser")]
+
+    def near_tr(f, r=4):
+        return any(abs(f - x) <= r for x in tr_frames)
+
+    def in_teaser(f):
+        return bool(teaser_t) and _within(f / fps, f / fps, teaser_t, pad=1 / fps)
     det = detect_cuts(vs.g64, vs.mafd)
     det_set = set(det)
     planned = []
@@ -799,6 +823,8 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
             if near:
                 off = min(near, key=lambda d: abs(d - f)) - f
                 sev = "warn" if abs(off) == 1 else "fail"
+                if in_teaser(f) or near_tr(f):
+                    continue          # micro-cuts 3 frames apart / a flash ramp: the detector can't separate them
                 iss_cut.append(rep.issue(sev, f"cut lands {off:+d} frame(s) from the planned frame {f} (rule 112)",
                                          t=f / fps, frames=[f - 1, f], tag="cut"))
             elif diff < INVISIBLE_CUT:
@@ -813,6 +839,8 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
                                                  f"dissolve or very similar shots?", t=f / fps, frames=[f - 1, f], tag="cut"))
         pset = set(planned)
         for d in det:
+            if near_tr(d) or in_teaser(d):
+                continue              # a flash's light ramp, or a cutaway switch inside a teaser line
             if not any(abs(d - p) <= 3 for p in pset):
                 iss_cut.append(rep.issue("warn", "unplanned cut inside a segment (cut in the source, or a timing slip)",
                                          t=d / fps, frames=[d - 1, d], tag="cut"))
@@ -846,13 +874,15 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
     iss = []
     for k, s in enumerate(shots):
         if s["f1"] - s["f0"] == 1 and 0 < s["f0"] and s["f1"] < n:
-            if s["kind"] in ("flash",):
+            if s["kind"] in ("flash",) or near_tr(s["f0"]):
                 continue
             iss.append(rep.issue("fail", "1-frame shot (flash frame)", t=s["f0"] / fps,
                                  frames=[s["f0"] - 1, s["f0"], s["f1"]], tag="flash"))
     # also catch detected 1-frame shots when the plan thinks the span is continuous
     if shots_plan:
         for a, b2 in zip(det, det[1:]):
+            if near_tr(a):
+                continue              # a planned flash: its light frames are not a 1-frame shot
             if b2 - a == 1 and not any(abs(a - x["f0"]) <= 0 and x["f1"] - x["f0"] == 1 for x in shots):
                 iss.append(rep.issue("fail", "1-frame flash on the delivered file", t=a / fps,
                                      frames=[a - 1, a, b2], tag="flash"))
@@ -992,6 +1022,8 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
                                                            b["sample_frames"][len(b['sample_frames']) // 2]], tag="dup"))
     # short montage shots
     for s in shots:
+        if teaser_t and _within(s["start"], s["end"], teaser_t, pad=1 / fps):
+            continue                  # cold-open micro-cuts are short on purpose (reference teaser: median 0.16 s)
         is_mont = s["kind"] in MONTAGE_KINDS or (not shots_plan)
         if is_mont and 1.0 / fps < (s["f1"] - s["f0"]) / fps < MIN_MONTAGE_SHOT and 0 < s["f0"] and s["f1"] < n:
             iss.append(shot_issue("warn", s, f"shorter than {MIN_MONTAGE_SHOT}s", "short"))
@@ -1032,6 +1064,10 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
     else:
         rep.add("text_vs_faces", "captions", "Captions and graphics clear of faces (rules 55, 64)", [], status="info",
                 detail="no caption/overlay timing (needs the render sidecar)")
+
+    # ---------------------------------------------------------------- craft checks (reference-measured)
+    _craft_checks(rep, vs, au, shots, real, fps, n, H, duration, raw_side, side, talk_spans, black_ok, still_spans,
+                  frozen, cfg)
 
     # ---------------------------------------------------------------- contact sheets
     issue_frames = {}
@@ -1077,6 +1113,224 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
     return report
 
 
+# ==================================================================================================
+# craft checks: room tone, black level, duplicate frames, flash + hit alignment, caption size
+# ==================================================================================================
+
+def _floor_db(rms10, t0, t1):
+    a, b = max(0, int(round(t0 * 100))), min(len(rms10), int(round(t1 * 100)))
+    if b - a < 5:
+        return None
+    return float(np.percentile(rms10[a:b], 10))
+
+
+def floor_steps(audio, sr, joins, win=0.6):
+    """Noise-floor step (dB) across each join: 10th percentile of 10 ms RMS in `win` s before vs after."""
+    h = int(sr * 0.01)
+    k = len(audio) // h
+    if k == 0:
+        return [], np.zeros(0)
+    rms10 = 20 * np.log10(np.sqrt(np.mean(audio[:k * h].astype(np.float64).reshape(k, h) ** 2, 1)) + 1e-12)
+    out = []
+    for t in joins:
+        f0, f1 = _floor_db(rms10, t - win, t - 0.02), _floor_db(rms10, t + 0.02, t + win)
+        if f0 is None or f1 is None:
+            continue
+        out.append({"t": round(float(t), 3), "before": round(f0, 1), "after": round(f1, 1), "step": round(f1 - f0, 1)})
+    return out, rms10
+
+
+def _env_1ms(x, sr):
+    """5 ms RMS envelope at a 1 ms hop."""
+    hop, w = max(1, sr // 1000), max(1, int(sr * 0.005))
+    sq = np.concatenate([[0.0], np.cumsum(x.astype(np.float64) ** 2)])
+    idx = np.arange(0, max(0, len(x) - w), hop)
+    return np.sqrt((sq[idx + w] - sq[idx]) / w)
+
+
+def sfx_offset(audio, sr, t_expected_start, sfx_wav, search=0.06):
+    """Where a sound effect actually starts in the mix relative to where it should: cross-correlate the
+    5 ms envelopes of the effect and of the mix (+-search s). Returns the offset in seconds, or None."""
+    import soundfile as sf
+    try:
+        x, xsr = sf.read(str(sfx_wav), dtype="float32", always_2d=True)
+    except Exception:  # noqa: BLE001
+        return None
+    x = x.mean(1)
+    if xsr != sr:
+        idx = np.arange(0, len(x), xsr / sr).astype(int)
+        x = x[idx[idx < len(x)]]
+    ex = _env_1ms(x, sr)[:150]
+    a0 = int((t_expected_start - search) * sr)
+    if a0 < 0 or a0 + int((2 * search + 0.2) * sr) > len(audio) or not len(ex):
+        return None
+    em = _env_1ms(audio[a0:a0 + int((2 * search + 0.2) * sr)], sr)
+    lags = np.arange(0, int(2 * search * 1000) + 1)
+    sc = [float(np.dot(em[l:l + len(ex)], ex)) if l + len(ex) <= len(em) else -1 for l in lags]
+    best = int(lags[int(np.argmax(sc))])
+    return round((best / 1000.0) - search, 4)
+
+
+def _craft_checks(rep, vs, au, shots, real, fps, n, H, duration, raw, side, talk_spans, black_ok, still_spans,
+                  frozen, cfg):
+    # ---- room tone continuity across talk -> talk joins
+    joins = raw.get("talk_joins")
+    if joins is None and side:
+        segs = side["segments"]
+        joins = [b["start"] for a, b in zip(segs, segs[1:]) if a["kind"] in TALK_KINDS and b["kind"] in TALK_KINDS
+                 and abs(a["end"] - b["start"]) < 1e-3]
+    if au and len(au.audio) and joins:
+        st, rms10 = floor_steps(au.audio, au.SR, joins)
+        iss = []
+        absd = [abs(x["step"]) for x in st]
+        med = float(np.median(absd)) if absd else None
+        p90 = float(np.percentile(absd, 90)) if absd else None
+        if med is not None and (med > FLOOR_STEP_MEDIAN or p90 > FLOOR_STEP_P90):
+            worst = max(st, key=lambda x: abs(x["step"]))
+            iss.append(rep.issue("warn", f"room tone steps at talk joins: median {med:.1f} dB, p90 {p90:.1f} dB "
+                                         f"(target <= {FLOOR_STEP_MEDIAN:g} / {FLOOR_STEP_P90:g}; reference 2.2 / 4.9). "
+                                         f"Worst {worst['step']:+.1f} dB", t=worst["t"],
+                                 frames=[int(worst["t"] * fps)], tag="tone"))
+        mins = []
+        for a, b in talk_spans:
+            i0, i1 = int(a * 100) + 3, int(b * 100) - 3
+            if i1 - i0 >= 25:
+                w = rms10[i0:i1]
+                k = len(w) // 25
+                w25 = 10 * np.log10(np.mean(10 ** (w[:k * 25].reshape(k, 25) / 10), 1) + 1e-12)
+                mins.append(float(w25.min()))
+        mn = min(mins) if mins else None
+        if mn is not None and mn < TALK_MIN_WINDOW_DB:
+            iss.append(rep.issue("warn", f"quietest 250 ms inside talk is {mn:.0f} dBFS (< {TALK_MIN_WINDOW_DB:g}): a hole "
+                                         "under the dialogue; room tone should fill it"))
+        rep.add("room_tone_steps", "audio", "Room tone continuous across talk joins", iss,
+                value={"joins": len(st), "median_abs_db": None if med is None else round(med, 1),
+                       "p90_abs_db": None if p90 is None else round(p90, 1),
+                       "over_6db": sum(1 for x in absd if x > 6), "min_250ms_talk_db": None if mn is None else round(mn, 1),
+                       "steps": st[:200], "room_tone_beds": len(raw.get("room_tone") or [])})
+    else:
+        rep.add("room_tone_steps", "audio", "Room tone continuous across talk joins", [], status="info",
+                detail="no talk-to-talk joins")
+
+    # ---- black level (milky blacks)
+    def is_black_ok(s):
+        return _within(s["start"], s["end"], black_ok + still_spans, pad=1 / fps)
+    iss, rows = [], []
+    for s in real:
+        if is_black_ok(s) or s["f1"] - s["f0"] < 3:
+            continue
+        a, b = s["f0"] + 1, s["f1"] - 1                  # skip boundary frames (flashes, dips)
+        p1 = float(np.median(vs.p1[a:b])) if b > a else float(vs.p1[s["f0"]])
+        s["black_p1"] = round(p1, 1)
+        night = s["luma"] < 50
+        rows.append((s, p1, night))
+        if not night and p1 > BLACK_P1_SHOT:
+            iss.append(rep.issue("warn", f"shot {s['idx'] + 1}: lifted blacks (p1 luma {p1:.0f}, reference ~10); "
+                                         "exposure belongs before the LUT, never a post-LUT brightness lift",
+                                 t=s["start"], t_end=s["end"], frames=[(s["f0"] + s["f1"]) // 2], tag="black"))
+    vals = [p for _, p, night in rows if not night]
+    med = float(np.median(vals)) if vals else None
+    if med is not None and med > BLACK_P1_MILKY:
+        iss.insert(0, rep.issue("warn", f"milky blacks: median black point p1 {med:.1f} (reference 10; > {BLACK_P1_MILKY:g})"))
+    rep.add("black_level", "picture", "Black level (p1 luma per shot; reference ~10)", iss[:40],
+            value={"median_p1": None if med is None else round(med, 1),
+                   "p10_p1": round(float(np.percentile(vals, 10)), 1) if vals else None,
+                   "p90_p1": round(float(np.percentile(vals, 90)), 1) if vals else None, "shots": len(vals),
+                   "reference_p1": 10.4})
+
+    # ---- duplicate frames (frame-rate judder from 23.976 / 29.97 sources)
+    iss, total_d, per = [], 0, []
+    fz = [(a, b) for a, b in frozen]
+    det = detect_cuts(vs.g64, vs.mafd)
+    trf = [int(t.get("frame", round(float(t["t"]) * fps))) for t in (raw.get("transitions") or [])]
+    for s in real:
+        if is_black_ok(s) or s["f1"] - s["f0"] < 6:
+            continue
+        # judge each continuous run separately: a cutaway switch inside the piece is a different picture
+        bounds = [s["f0"]] + [d for d in det if s["f0"] + 2 < d < s["f1"] - 2] + [s["f1"]]
+        idx = []
+        for a, b in zip(bounds, bounds[1:]):
+            m = vs.mafd[a + 1:b]
+            if len(m) < 5:
+                continue
+            med_m = float(np.median(m))
+            if med_m < 1.0:
+                continue                                 # (almost) static content: a repeat is invisible
+            idx += [a + 1 + i for i, v in enumerate(m) if v < 0.15 * med_m]
+        idx = [i for i in idx if not _overlaps(i / fps, (i + 1) / fps, fz) and not any(abs(i - x) <= 3 for x in trf)]
+        if not idx:
+            continue
+        rate = len(idx) / max(1e-6, s["dur"])
+        total_d += len(idx)
+        per.append({"shot": s["idx"] + 1, "dups": len(idx), "per_s": round(rate, 2), "clip": s.get("clip")})
+        if len(idx) >= 2 and rate >= DUP_RATE:
+            iss.append(rep.issue("warn", f"shot {s['idx'] + 1}: {len(idx)} duplicated frames ({rate:.1f}/s) - a "
+                                         "frame-rate mismatch (23.976 -> 25?) pushed through fps; conform it",
+                                 t=s["start"], t_end=s["end"], frames=idx[:2], tag="dup"))
+    rep.add("duplicate_frames", "picture", "Duplicated frames in moving shots (frame-rate conform)", iss,
+            value={"duplicates": total_d, "shots": per[:100]})
+
+    # ---- flash / transition peak on the cut frame, transition sound on the cut
+    trs = raw.get("transitions") or []
+    sfx_ev = {e.get("on"): e for e in (raw.get("sfx") or []) if e.get("on")}
+    iss, rows = [], []
+    for k, tr in enumerate(trs):
+        f = int(tr.get("frame", round(float(tr["t"]) * fps)))
+        row = {"t": tr["t"], "kind": tr["kind"]}
+        if tr["kind"] in ("flash", "dip_white") and 3 <= f < n - 3:
+            w = vs.luma[f - 3:f + 4]
+            pk = f - 3 + int(np.argmax(w))
+            row["peak_frame_offset"] = pk - f
+            row["luma"] = [round(float(x), 1) for x in w]
+            if abs(pk - f) > 1:
+                iss.append(rep.issue("fail", f"flash at {fmt_t(tr['t'])} peaks {pk - f:+d} frames off the cut",
+                                     t=tr["t"], frames=[f - 1, f, pk], tag="flash"))
+        elif tr["kind"] == "dip" and 3 <= f < n - 3:
+            w = vs.luma[f - 3:f + 4]
+            row["peak_frame_offset"] = int(np.argmin(w)) - 3
+        ev = sfx_ev.get(f"transition:{k}")
+        if ev and au and len(au.audio):
+            path = ev["name"]
+            if not os.path.exists(str(path)):
+                try:
+                    from . import music
+                    path = music.sfx(ev["name"], cfg)
+                except Exception:  # noqa: BLE001
+                    path = None
+            pk_s = float(ev.get("peak_s") or 0.0)
+            off = sfx_offset(au.audio, au.SR, float(ev["t"]) - pk_s, path) if path else None
+            row["sfx_offset_ms"] = None if off is None else round(off * 1000, 1)
+            if off is not None and abs(off) > SFX_TOL_S:
+                sev = "warn" if abs(off) <= 1.0 / fps else "fail"
+                iss.append(rep.issue(sev, f"{ev['name']} transient lands {off * 1000:+.0f} ms from the cut at "
+                                          f"{fmt_t(tr['t'])} (tolerance {SFX_TOL_S * 1000:.0f} ms)", t=tr["t"]))
+        rows.append(row)
+    orphans = [e for e in (raw.get("sfx") or []) if str(e.get("on", "")).startswith("transition:")
+               and int(str(e["on"]).split(":")[1]) >= len(trs)]
+    for e in orphans:
+        iss.append(rep.issue("fail", f"sound {e['name']} at {fmt_t(e['t'])} is bound to a transition that no longer exists "
+                                     "(rule 39)", t=e["t"]))
+    rep.add("flash_sfx_alignment", "picture", "Flash peak on the cut frame, hit transient on the cut (rules 39, 83)", iss,
+            value={"transitions": rows}, status=None if trs else "info")
+
+    # ---- caption size
+    cs = raw.get("captions_style") or {}
+    caps = [c for x in (raw.get("segments") or []) for c in (x.get("captions") or [])]
+    px = cs.get("px") or next((c.get("px") for c in caps if c.get("px")), None)
+    if px and H:
+        pct = 100.0 * float(px) / float(H)
+        iss = []
+        if not CAPTION_PCT[0] <= pct <= CAPTION_PCT[1]:
+            iss.append(rep.issue("warn", f"caption type {px} px = {pct:.2f}% of frame height ({pct * 10.8:.0f} px at 1080); "
+                                         f"reference {CAPTION_REF_PCT}% (~43 px at 1080)"))
+        rep.add("caption_size", "captions", "Caption size vs reference (~43 px at 1080)", iss,
+                value={"px": px, "pct_of_height": round(pct, 2), "px_at_1080": round(pct * 10.8, 1),
+                       "reference_pct": CAPTION_REF_PCT, "captions": len(caps)})
+    else:
+        rep.add("caption_size", "captions", "Caption size vs reference (~43 px at 1080)", [], status="info",
+                detail="no caption size in the sidecar")
+
+
 def _nanmed(xs):
     xs = [x for x in xs if x is not None]
     return round(float(np.median(xs)), 2) if xs else None
@@ -1101,7 +1355,7 @@ def _version_of(stem):
 # contact sheets + html
 # ==================================================================================================
 
-def _contact_sheets(vs, shots, fps, qa_dir, stem, issue_frames) -> list:
+def _contact_sheets(vs, shots, fps, qa_dir, stem, issue_frames, note="first | mid | last of each shot") -> list:
     """First / mid / last frame of every shot (so both sides of every cut), <= 24 tiles per sheet,
     timestamp + shot number on each tile, red/amber border where a check flagged the frame."""
     from PIL import Image, ImageDraw
@@ -1126,7 +1380,7 @@ def _contact_sheets(vs, shots, fps, qa_dir, stem, issue_frames) -> list:
         d = ImageDraw.Draw(img)
         a, b = chunk[0][0] / fps, chunk[-1][0] / fps
         d.text((10, 10), f"{stem}  ·  sheet {si // per + 1}/{math.ceil(len(tiles) / per)}  ·  {fmt_t(a)} - {fmt_t(b)}"
-                         f"  ·  first | mid | last of each shot", fill=(230, 230, 230), font=font)
+                         f"  ·  {note}", fill=(230, 230, 230), font=font)
         for k, (f, idx, role, s) in enumerate(chunk):
             x, y = 6 + (k % SHEET_COLS) * (tw + 6), hdr + (k // SHEET_COLS) * (th + 6)
             fr = vs.frame(f)

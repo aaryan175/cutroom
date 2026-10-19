@@ -4,6 +4,9 @@ export class ApiError extends Error {
   constructor(msg, status, body) { super(msg); this.status = status; this.body = body; }
 }
 
+/** hooks.planPayload(payload): called with every plan payload (GET/PUT /api/plan, ops, undo/redo). */
+export const hooks = { planPayload: null };
+
 async function req(method, path, body, opts = {}) {
   const init = { method, headers: {} , signal: opts.signal };
   if (body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
@@ -12,6 +15,7 @@ async function req(method, path, body, opts = {}) {
   catch (e) { if (e.name === 'AbortError') throw e; throw new ApiError(`Can't reach the studio server (${method} ${path})`, 0); }
   const ct = r.headers.get('content-type') || '';
   const data = ct.includes('json') ? await r.json().catch(() => null) : await r.text();
+  if (r.ok && data && data.slug && data.version_files && hooks.planPayload) { try { hooks.planPayload(data); } catch (e) { console.error(e); } }
   if (!r.ok) {
     const msg = (data && (data.error || (data.errors && data.errors.join('; ')) || data.message)) || `${r.status} ${r.statusText}`;
     throw new ApiError(typeof msg === 'string' ? msg : JSON.stringify(msg), r.status, data);
@@ -41,6 +45,7 @@ export const api = {
   newPlan: (title) => req('POST', '/api/plan/new', { title }),
   render: (plan_file, preview) => req('POST', '/api/render', { plan_file, preview }),
   qa: (video) => req('POST', '/api/qa', { video }),
+  exportRender: (body) => req('POST', '/api/export', body),
   jobs: () => req('GET', '/api/jobs'),
   markers: (plan) => req('GET', '/api/markers' + qs({ plan })),
   addMarker: (m) => req('POST', '/api/markers', m),
@@ -55,6 +60,15 @@ export const api = {
   bins: () => req('GET', '/api/bins'),
   days: () => req('GET', '/api/days'),
   overnight: (action) => req('POST', '/api/overnight', { action }),
+  refs: () => req('GET', '/api/refs'),
+  ref: (id) => req('GET', `/api/ref/${enc(id)}`),
+  addRef: (body) => req('POST', '/api/refs', body),
+  analyzeRef: (id, force) => req('POST', `/api/ref/${enc(id)}/analyze`, { force: !!force }),
+  refCompare: (id, plan) => req('GET', `/api/ref/${enc(id)}/compare` + qs({ plan })),
+  importInfo: () => req('GET', '/api/import'),
+  locate: (files, folder) => req('POST', '/api/import/locate', { files, folder }),
+  importFootage: (paths) => req('POST', '/api/import/footage', { paths }),
+  planVersion: (slug, file) => req('GET', `/api/plan/${enc(slug)}/version/${enc(file)}`),
   text: async (url) => { const r = await fetch(url); if (!r.ok) throw new ApiError(`${r.status} ${url}`, r.status); return r.text(); },
   json: async (url) => { const r = await fetch(url); if (!r.ok) throw new ApiError(`${r.status} ${url}`, r.status); return r.json(); },
 };
@@ -123,7 +137,7 @@ export async function chatStream(body, onEvent, signal) {
 /** Live /api/events with auto-reconnect and backoff. handlers: {name: fn(data)}, onState(state). */
 export function connectEvents(handlers, onState) {
   let es = null, retry = 1000, stopped = false, timer = null;
-  const names = ['hello', 'plan_changed', 'job', 'jobs', 'governor', 'render_done', 'qa_done', 'notes', 'markers', 'overnight', 'chat', 'bins_changed'];
+  const names = ['hello', 'plan_changed', 'job', 'jobs', 'governor', 'render_done', 'qa_done', 'notes', 'markers', 'overnight', 'chat', 'bins_changed', 'comments', 'ref', 'library_changed', 'export_done'];
   const dispatch = (name, raw) => {
     let d; try { d = JSON.parse(raw); } catch { d = { text: raw }; }
     const n = (name && name !== 'message') ? name : (d && d.type);

@@ -3,6 +3,8 @@ import { S, on, emit, op, selectedPieces, segmentOf, KIND_COLOR, fps, setPlayhea
 import { api, media } from './api.js';
 import { h, icon, tc, md, toast, eta, ago, LS, clamp } from './util.js';
 import { tabs } from './layout.js';
+import { renderComments } from './comments.js';
+import { renderLooks, lookField } from './looks.js';
 
 let body, current = 'inspector';
 const pane = () => { body.innerHTML = ''; const p = h('div.dock-pane'); body.appendChild(p); return p; };
@@ -53,6 +55,7 @@ function renderInspector() {
   const t = seg.type;
   if (seg.clip !== undefined) col1.appendChild(field('Clip', h('div.pair', inp(seg.clip, (v) => set({ clip: v }), { mono: true }),
     h('button.ib.sm', { title: 'Open in Source', html: icon('film', 13), on: { click: () => emit('loadSource', { id: pick.clip || seg.clip, in: seg.in ?? null, out: seg.out ?? null, t: seg.in ?? seg.t ?? 0 }) } }))));
+  if (t !== 'black' && t !== 'title') col1.appendChild(field('Look', lookField(seg.look, (v) => set({ look: v }), { inherit: true })));
   if (t === 'talk' || t === 'broll') {
     col1.appendChild(field('In / Out', h('div.pair', inp(seg.in, (v) => set({ in: v }), { type: 'number', step: 0.04 }), inp(seg.out, (v) => set({ out: v }), { type: 'number', step: 0.04 }))));
     col1.appendChild(field('Speed', inp(seg.speed ?? 1, (v) => set({ speed: v }), { type: 'number', step: 0.05 })));
@@ -156,6 +159,7 @@ function planStyle() {
     field('LUT', inp(gr.lut || '', (v) => setStyle({ grade: { ...gr, lut: v } }), { mono: false, placeholder: 'none' })),
     field('Exposure', chk(gr.normalize_exposure !== false, (v) => setStyle({ grade: { ...gr, normalize_exposure: v } }))),
     field('Saturation', inp(gr.saturation ?? 1, (v) => setStyle({ grade: { ...gr, saturation: v } }), { type: 'number', step: 0.05 })),
+    field('Look', lookField(gr.look, (v) => setStyle({ grade: { look: v } }))),
     field('Clean voice', chk(vo.clean !== false, (v) => setStyle({ voice: { ...vo, clean: v } }))));
   return h('div.insp', c1, c2, c3);
 }
@@ -403,12 +407,12 @@ export function lightbox(url) {
 }
 
 // ================================================================ init
-const RENDER = { inspector: renderInspector, story: renderStory, markers: renderMarkers, qa: renderQA, jobs: renderJobs, overnight: renderOvernight };
-function show(name) { current = name; RENDER[name](); }
+const RENDER = { inspector: renderInspector, story: renderStory, markers: renderMarkers, comments: () => renderComments(pane()), looks: () => renderLooks(pane()), qa: renderQA, jobs: renderJobs, overnight: renderOvernight };
+function show(name) { if (!RENDER[name]) name = 'inspector'; current = name; RENDER[name](); }
 export function initDock(el) {
   body = el;
   const t = tabs(document.getElementById('p-dock'), 'dock', show);
-  t.set(t.initial);
+  t.set(t.initial === 'markers' ? 'comments' : t.initial);
   const badges = () => {
     const om = S.markers.filter((m) => m.status !== 'done').length;
     const bm = document.getElementById('badge-markers'); bm.textContent = om || ''; bm.className = 'badge' + (om ? ' hot' : '');
@@ -429,9 +433,9 @@ export function initDock(el) {
   on('governor', () => { if (current === 'overnight') renderOvernight(); });
   on('overnight', () => { if (current === 'overnight') renderOvernight(); });
   on('project', () => { if (current === 'qa' && !S.qa) renderQA(); });
-  on('showDock', (n) => t.set(n));
+  on('showDock', (n) => t.set(n === 'markers' ? 'comments' : n));
   on('openQA', openQA);
-  on('addMarker', addMarker);
+  void addMarker; // M opens the comment composer (comments.js)
   on('markerEdit', editMarker);
   badges();
   void LS;

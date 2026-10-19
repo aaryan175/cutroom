@@ -184,6 +184,7 @@ ok("redo (Shift+Cmd+Z) re-applies it", S("S.tl.v1.length") == d1)
 
 # ---- marker
 m0 = S("S.markers.length")
+marker_ids0 = set(S("S.markers.map(m => m.id)") or [])
 p.key("m", code="KeyM", vk=77)
 time.sleep(1.0)
 ok("marker (M) is created", S("S.markers.length") == m0 + 1)
@@ -221,10 +222,10 @@ if not a.real:
 # ---- reference side by side
 p.eval("document.querySelector('#p-program .ptab[data-ptab=reference]').click()")
 time.sleep(1.5)
-ok("reference view opens side by side", p.eval("!!document.querySelector('#p-program .mon-split > div:not([hidden]) video')"))
+ok("reference workspace opens", p.eval("!!document.querySelector('#ref-ws:not([hidden]) video')"))
 shot("07_reference")
 p.eval("document.activeElement && document.activeElement.blur()")
-if S("(S.project.references || []).length"):
+if S("(S.project.references || []).length") or p.eval("!!(window.__studio.ref && window.__studio.ref.R.list.length)"):
     p.key("r", code="KeyR", vk=82)
     time.sleep(1.0)
     ok("R grabs a reference frame into chat", S("S.attachments.some(x => x.source === 'ref')"))
@@ -282,6 +283,13 @@ shot("12_overview_1280")
 p.size(1600, 1000)
 time.sleep(0.8)
 shot("13_final_1600")
+
+# ---- cleanup: delete the comments/markers this run created (the project may be shared)
+gone = p.eval(f"""(async () => {{ const before = new Set({json.dumps(sorted(marker_ids0))});
+  const r = await (await fetch('/api/markers')).json(); const mine = (r.markers || []).filter(m => !before.has(m.id));
+  for (const m of mine) await fetch('/api/markers/' + encodeURIComponent(m.id) + '?id=' + encodeURIComponent(m.id), {{method: 'DELETE'}});
+  return mine.length; }})()""")
+ok("removed the markers this run created", gone is not None, f"{gone} removed")
 
 p.drain(0.5)
 probs = [x for x in p.problems() if "favicon" not in x]

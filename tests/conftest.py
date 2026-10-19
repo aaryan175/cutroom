@@ -8,6 +8,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# Tests get their own governor lock dir: never share (or wait on) the real machine-wide slots.
+import tempfile  # noqa: E402
+os.environ.setdefault("CUTROOM_LOCK_DIR", tempfile.mkdtemp(prefix="cutroom-test-locks-"))
+
 FF = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
 X264 = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p"]
 AAC = ["-c:a", "aac", "-b:a", "64k", "-shortest"]

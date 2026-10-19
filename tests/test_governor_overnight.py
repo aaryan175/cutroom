@@ -368,3 +368,34 @@ def test_tagging_skipped_when_codex_not_logged_in(tmp_path, monkeypatch):
     cfg, con, ids = _tag_project(tmp_path, n=1)
     pipe = overnight.Pipeline(cfg, {"tag": True}, echo=False)
     assert pipe.agent_missing() == "codex not logged in"
+
+
+def test_stop_takes_effect_between_items_even_for_queued_work(tmp_path, monkeypatch):
+    """`overnight --stop` (the STOP file): items queued for a governor slot must not start afterwards;
+    only the one already running finishes."""
+    import threading
+    monkeypatch.setenv("CUTROOM_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setenv("CUTROOM_MIN_FREE_RAM_GB", "0.01")
+    cfg = init_project(tmp_path / "work", [])
+    cfg.heavy_slots, cfg.max_load, cfg.min_free_disk_gb = 1, 1000.0, 0.0
+    cfg.save()
+    pipe = overnight.Pipeline(cfg, {"run_id": "t"}, echo=False)
+    pipe.gov.poll_s = 0.05
+    pipe.gov.abort_check = pipe.stop_reason
+    started, lock = [], threading.Lock()
+
+    def fn(r):
+        with pipe.gov.slot("heavy", label=r["id"]):
+            with lock:
+                started.append(r["id"])
+            if r["id"] == "c0":
+                (pipe.dir / "STOP").touch()          # the user stops the night while c0 encodes
+                time.sleep(0.6)
+        return r["id"]
+    rows = [{"id": f"c{i}", "duration": 1.0, "rel": f"c{i}"} for i in range(5)]
+    pipe.stage_begin("proxies", total=len(rows))
+    with pytest.raises(overnight.Stopped):
+        pipe.run_items("proxies", rows, fn, lambda r, res: None, lambda r, e: None, workers=3)
+    pipe.gov.abort_check = None
+    assert started == ["c0"], started
+    assert pipe.stage_mem["proxies"]["done"] == 1 and not pipe.stage_mem["proxies"].get("errors")

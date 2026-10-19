@@ -53,6 +53,7 @@ import numpy as np
 from . import captions as CAP
 from . import db
 from . import governor
+from . import looks as LK
 from . import media
 from . import overlays as OV
 from . import plan as P
@@ -65,8 +66,11 @@ CODE_VERSION = hashlib.sha1(b"".join(Path(__file__).with_name(f).read_bytes() fo
 HOUSE_TAIL = "colorspace=ispace=gbr:iprimaries=bt709:itrc=bt709:irange=pc:all=bt709:range=tv:format=yuv420p:dither=fsb"
 GENERIC_LOG = "format=gbrp,curves=all='0.09/0 0.25/0.13 0.41/0.4 0.6/0.68 0.8/0.9 1/1',format=yuv420p,eq=saturation=1.35"
 LUMA_TARGET, LUMA_DEADBAND, EQ_BOUND = 118.0, 10.0, 0.08
+SLOG_STOP = 0.075                        # S-Log3 code-value offset per stop of exposure (log domain, pre-LUT)
 DIALOG_LUFS, NATURAL_LUFS, MIX_LUFS = -16.0, -20.0, -26.0
+NATURAL_UNDER_MUSIC_LUFS, MONTAGE_NATURAL_DB = -24.0, -6.0
 DEFAULT_MUSIC_GAIN = -8.0
+FLASH_K_OUT, FLASH_K_IN = (0.30, 0.70), (0.80, 0.15)        # mix-to-white schedule (reference burns, measured)
 JOIN_COVER_S = 1.5                       # auto_cover: joins where tighten removed more than this
 
 
@@ -179,11 +183,26 @@ class Ctx:
         w, h = int(s.get("width") or 0), int(s.get("height") or 0)
         if abs(int(s.get("rotation") or 0)) % 180 == 90:
             w, h = h, w
+        fr = v.get("avg_frame_rate") or v.get("r_frame_rate") or "0/1"
+        try:
+            from fractions import Fraction
+            fpsq = Fraction(fr) if Fraction(fr) > 0 else Fraction(v.get("r_frame_rate") or "0/1")
+        except (ValueError, ZeroDivisionError):
+            fpsq = None
         out = {"w": w, "h": h, "range": v.get("color_range") or "", "duration": s["duration"],
-               "has_audio": bool(s["has_audio"]), "pix_fmt": s.get("pix_fmt", "")}
+               "has_audio": bool(s["has_audio"]), "pix_fmt": s.get("pix_fmt", ""),
+               "fps_q": (fpsq.numerator, fpsq.denominator) if fpsq else None}
         with self.lock:
             self._info[path] = out
         return out
+
+    def src_fps(self, row, src):
+        """(num, den) frame rate of the file a piece is cut from, or None."""
+        q = self.info(src).get("fps_q")
+        if q and q[0] > 0:
+            return q
+        f = float(row.get("fps") or 0) if row else 0.0
+        return _fps_q(f) if f > 0 else None
 
     def pregraded(self, row, src):
         """True when a preview proxy already has the log->709 LUT baked in (ingest bakes cfg.lut into
@@ -211,28 +230,90 @@ def _range_of(info):
     return "full" if info.get("range") in ("pc", "jpeg") else "tv"
 
 
-def grade_chain(ctx, row, src, W, H):
+def _fps_q(f):
+    """Float frame rate -> exact (num, den) for the NTSC rates."""
+    for num, den in ((24000, 1001), (30000, 1001), (60000, 1001), (48000, 1001)):
+        if abs(f - num / den) < 0.005:
+            return (num, den)
+    from fractions import Fraction
+    q = Fraction(f).limit_denominator(1001)
+    return (q.numerator, q.denominator)
+
+
+def finish_chain(ctx):
+    """The house finishing curve: one fixed string for every shot (black point ~10/255, soft highlight
+    shoulder, gentle vibrance). Applied after the LUT; never per shot (rule 94)."""
+    fin = ctx.style["grade"].get("finish") or {}
+    if fin is False or not fin.get("enabled", True):
+        return []
+    b, sh = float(fin.get("black", 0.028)), float(fin.get("shoulder", 0.96))
+    out = [f"curves=master='0/0 0.06/{b:.4f} 0.18/0.15 0.5/0.5 0.82/0.84 0.94/0.925 1/{sh:.4f}'"]
+    v = float(fin.get("vibrance", 0.18) or 0)
+    if abs(v) > 1e-3:
+        out.append(f"vibrance=intensity={v:.3f}")
+    return out
+
+
+def log_exposure(stops, enable=None):
+    """Exposure in the LOG domain (before the LUT): an offset of SLOG_STOP code values per stop."""
+    o = SLOG_STOP * abs(float(stops))
+    en = f":enable='{enable}'" if enable else ""
+    if stops > 0:
+        return f"curves=all='0/{o:.4f} {1 - o:.4f}/1'{en}"
+    return f"curves=all='{o:.4f}/0 1/{1 - o:.4f}'{en}"
+
+
+def display_exposure(stops, enable=None):
+    """Exposure on display-referred (Rec.709) pictures: a gain with the black point pinned at 0
+    (never eq=brightness, which lifts blacks)."""
+    g = 2 ** (float(stops) / 2.4)
+    en = f":enable='{enable}'" if enable else ""
+    if g >= 1:
+        return f"curves=all='0/0 {min(1.0, 1 / g):.4f}/1'{en}"
+    return f"curves=all='0/0 1/{g:.4f}'{en}"
+
+
+def grade_chain(ctx, row, src, W, H, stops=0.0, pre_fx=(), probe=False):
     """Filters from a cropped picture to graded yuv420p WxH (scale is part of the chain: the LUT
-    always runs at output size). Same chain for every shot of the same kind - one house look."""
+    always runs at output size). House grade v2:
+        exposure (log domain, before the LUT; bounded, half the measured error) -> LUT -> finish curve
+    The finish is identical on every shot; a shot's only individual value is its exposure in stops.
+    `pre_fx` = [(frame, stops)] extra exposure pushes on single frames (flash transitions).
+    probe=True gives the LUT-only chain the exposure is measured on."""
     info = ctx.info(src)
     rng = _range_of(info)
     sat = float(ctx.style["grade"].get("saturation", 1.0) or 1.0)
     is_log = bool(row.get("is_log")) if row else False
     pre = ctx.pregraded(row, src) if row else False
-    if is_log and ctx.lut and not pre:
-        f = [f"scale={W}:{H}:flags=lanczos:in_range={rng}:out_range=full:in_color_matrix=bt709",
-             "format=gbrpf32le", f"lut3d=file='{ctx.lut}':interp=tetrahedral", "format=gbrp16le", HOUSE_TAIL]
-        tag = "lut"
-    else:
+    log_domain = is_log and not pre
+    expo = log_exposure if log_domain else display_exposure
+    ops = []
+    if not probe:
+        if abs(float(stops)) > 0.01:
+            ops.append(expo(stops))
+        ops += [expo(st, f"eq(n,{int(fr)})") for fr, st in (pre_fx or ())]
+    if log_domain and not ctx.lut:
+        ctx.warn("log footage without a LUT: using a generic log->709 curve (set config lut or style.grade.lut)",
+                 once_key="nolut")
         f = [f"scale={W}:{H}:flags=lanczos:in_range={rng}:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709",
-             "format=yuv420p"]
-        tag = "pregraded" if pre else "rec709"
-        if is_log and not pre:
-            f.append(GENERIC_LOG)
-            tag = "generic-log"
-            ctx.warn("log footage without a LUT: using a generic log->709 curve (set config lut or style.grade.lut)",
-                     once_key="nolut")
-    if abs(sat - 1.0) > 1e-3:
+             "format=yuv420p"] + (["format=gbrp"] + ops if ops else []) + [GENERIC_LOG]
+        if not probe:
+            fin = finish_chain(ctx)
+            if fin:
+                f += ["format=gbrp"] + fin + ["format=yuv420p"]
+        tag = "generic-log"
+    else:
+        # every other path runs in full-range RGB with an explicit BT.709 matrix both ways
+        f = [f"scale={W}:{H}:flags=lanczos:in_range={rng}:out_range=full:in_color_matrix=bt709", "format=gbrp16le"] + ops
+        if log_domain:
+            f += ["format=gbrpf32le", f"lut3d=file='{ctx.lut}':interp=tetrahedral"]
+            tag = "lut"
+        else:
+            tag = "pregraded" if pre else "rec709"
+        if not probe:
+            f += finish_chain(ctx)
+        f += ["format=gbrp16le", HOUSE_TAIL]
+    if abs(sat - 1.0) > 1e-3 and not probe:
         f.append(f"eq=saturation={sat:.3f}")
     return f, tag
 
@@ -276,26 +357,56 @@ def _crop_px(rect, info):
     return f"crop={cw}:{ch}:{cx}:{cy}"
 
 
-def picture(ctx, row, src, W, H, rect, eq=None, fit="cover", stabilize=False, label="p"):
+def look_chain(ctx, look):
+    """Filters of a look (cutroom/looks.py) to append after the base grade; [] for none."""
+    if not look:
+        return []
+    return LK.chain(ctx.cfg, look)
+
+
+def push_chain(push, W, H):
+    """Slow digital push-in / pull-out (a slider stand-in) as a sub-pixel `perspective` warp evaluated per
+    frame - the smoothest of the measured methods (zoompan rounds to whole pixels and jitters; scale+crop
+    stair-steps). push = {"to", "ease", "x", "y", "off_f", "tot_f"}: zoom follows the SEGMENT's time, so a
+    push runs continuously across the jump cuts inside a talk segment."""
+    if not push:
+        return []
+    to = float(push.get("to", 1.06))
+    off, tot = int(push.get("off_f", 0)), max(1, int(push.get("tot_f", 1)) - 1)
+    P_ = f"clip(({off}+in)/{tot},0,1)"
+    ease = push.get("ease", "inout")
+    E = {"linear": P_, "in": f"pow({P_},2)", "out": f"(1-pow(1-{P_},2))"}.get(ease, f"(pow({P_},2)*(3-2*{P_}))")
+    z0, z1 = (1.0, to) if to >= 1 else (1.0 / to, 1.0)
+    Z = f"({z0:.6f}+{z1 - z0:.6f}*{E})"
+    fx, fy = float(push.get("x", 0.5)), float(push.get("y", 0.5))
+    X0, Y0 = f"(W-W/{Z})*{fx:.4f}", f"(H-H/{Z})*{fy:.4f}"
+    X1, Y1 = f"({X0}+W/{Z})", f"({Y0}+H/{Z})"
+    return ["format=gbrp", f"perspective=x0='{X0}':y0='{Y0}':x1='{X1}':y1='{Y0}':x2='{X0}':y2='{Y1}':x3='{X1}':y3='{Y1}'"
+            ":interpolation=cubic:eval=frame", "format=yuv420p"]
+
+
+def picture(ctx, row, src, W, H, rect, stops=0.0, fit="cover", stabilize=False, label="p", look=None,
+            pre_fx=(), push=None):
     """Filtergraph fragment list turning an already-timed input into graded WxH yuv420p.
-    Returns (list_of_chains_with_IN_and_OUT_placeholders)."""
+    The chain is: crop -> grade_chain (log exposure -> LUT -> house finish / saturation) -> look
+    (style.grade.look or segment.look) -> stabilise -> push-in. Everything is part of the filter text, so
+    it is in the atom's cache key. Returns (list_of_chains_with_IN_and_OUT_placeholders)."""
     info = ctx.info(src)
-    g, _ = grade_chain(ctx, row, src, W, H)
-    eqs = []
-    if eq and (abs(eq.get("brightness", 0)) > 1e-3 or abs(eq.get("gamma", 1) - 1) > 1e-3):
-        eqs = [f"eq=brightness={eq['brightness']:.4f}:gamma={eq['gamma']:.4f}"]
+    g, _ = grade_chain(ctx, row, src, W, H, stops, pre_fx)
+    eqs = look_chain(ctx, look)
     stab = []
     if stabilize:
         stab = [f"deshake=rx=48:ry=48:edge=mirror", f"scale={int(W * 1.06) // 2 * 2}:-2", f"crop={W}:{H}"]
+    mv = push_chain(push, W, H)
     vertical = info["h"] > info["w"] and W > H
     if fit == "blur" and vertical:
         fw = int(round(H * info["w"] / info["h"] / 2)) * 2
-        g_fg, _ = grade_chain(ctx, row, src, fw, H)
+        g_fg, _ = grade_chain(ctx, row, src, fw, H, stops, pre_fx)
         return [f"[IN]split[{label}a][{label}b]",
                 f"[{label}a]{','.join(g_fg + eqs)}[{label}f]",
                 f"[{label}b]{','.join(g + eqs)},gblur=sigma={36 * ctx.s:.1f},eq=brightness=-0.08:saturation=0.9[{label}g]",
-                f"[{label}g][{label}f]overlay=(W-w)/2:0{(',' + ','.join(stab)) if stab else ''},setsar=1,format=yuv420p[OUT]"]
-    return [f"[IN]{_crop_px(rect, info)},{','.join(g + eqs + stab)},setsar=1,format=yuv420p[OUT]"]
+                f"[{label}g][{label}f]overlay=(W-w)/2:0{(',' + ','.join(stab + mv)) if stab or mv else ''},setsar=1,format=yuv420p[OUT]"]
+    return [f"[IN]{_crop_px(rect, info)},{','.join(g + eqs + stab + mv)},setsar=1,format=yuv420p[OUT]"]
 
 
 # ============================================================================== probes
@@ -318,7 +429,7 @@ def probe_unit(ctx, row, src, t0, t1):
     info = ctx.info(src)
     pw = 640
     ph = max(2, int(round(pw * info["h"] / max(1, info["w"]) / 2)) * 2)
-    gf, tag = grade_chain(ctx, row, src, pw, ph)
+    gf, tag = grade_chain(ctx, row, src, pw, ph, probe=True)
     span = max(0.0, t1 - t0)
     times = [t0 + span * f for f in (0.15, 0.5, 0.85)]
     key = _sha(["probe2", _file_id(src), [round(t, 3) for t in times], gf, CODE_VERSION])
@@ -357,6 +468,37 @@ def luma_in(probe, rect):
         y0, y1 = int(y * 36), max(int(y * 36) + 1, int((y + h) * 36))
         vals.append(float(g[y0:y1, x0:x1].mean()))
     return float(np.mean(vals))
+
+
+def luma_median_in(probe, rect):
+    """Median luma (0-255) of the probe frames inside a crop rect (LUT-only chain)."""
+    if not probe or not probe.get("grids"):
+        return None
+    x, y, w, h = rect
+    vals = []
+    for gr in probe["grids"]:
+        g = np.asarray(gr)
+        x0, x1 = int(x * 64), max(int(x * 64) + 1, int((x + w) * 64))
+        y0, y1 = int(y * 36), max(int(y * 36) + 1, int((y + h) * 36))
+        vals.append(g[y0:y1, x0:x1].ravel())
+    return float(np.median(np.concatenate(vals)))
+
+
+def exposure_stops(med, ex=None):
+    """Bounded exposure correction in stops from the median luma measured through the LUT only:
+    error = log2 of the display-light ratio to the target (gamma 2.4), corrected by `strength` (half) of
+    it, clamped to +-max_stops, 0 inside the deadband. Night scenes aim lower so night stays night."""
+    if med is None:
+        return 0.0
+    ex = ex or {}
+    target = float(ex.get("target_luma", LUMA_TARGET))
+    if med < float(ex.get("night_luma", 60.0)):
+        target = float(ex.get("night_target", 70.0))
+    err = 2.4 * math.log2(target / max(1.0, float(med)))
+    if abs(err) < float(ex.get("deadband_stops", 0.33)):
+        return 0.0
+    mx = float(ex.get("max_stops", 1.0))
+    return round(max(-mx, min(mx, float(ex.get("strength", 0.5)) * err)), 3)
 
 
 def exposure_eq(mean):
@@ -419,6 +561,264 @@ def song(ctx, ref):
         return {"path": str(p), "title": p.stem, **d}
 
 
+# ============================================================================== cold open (teaser template)
+_STAKES = re.compile(r"\b(\d[\d,.]*|biggest|best|worst|insane|crazy|craziest|never|first|last|million|millions|"
+                     r"thousand|money|dollars?|free|secret|why|wow|literally|most|only|dream|finally|everything|"
+                     r"nobody|everyone|impossible|huge|massive|incredible|unbelievable)\b", re.I)
+
+
+def _find_section(plan, ref):
+    """'<section index or name>/<segment index>' -> (section dict, segment index or None)."""
+    sp, _, gp = str(ref).partition("/")
+    sp = sp.strip().lower()
+    secs = plan.get("sections", [])
+    sec = secs[int(sp)] if sp.isdigit() and int(sp) < len(secs) else \
+        next((s for s in secs if str(s.get("name", "")).strip().lower() == sp), None)
+    if sec is None:
+        raise P.PlanError(f"cold_open line: no section {ref!r}")
+    return sec, (int(gp) if gp.strip().isdigit() else None)
+
+
+def teaser_candidates(words, a, b, lo=0.8, hi=2.6):
+    """Teaser-line candidates inside [a, b]: [(score, t0, t1, text)], best first. Short claim-like lines
+    (numbers, superlatives, stakes words) that start and end on word boundaries, ideally on punctuation."""
+    ws = [w for w in words if a <= w[0] and w[1] <= b]
+    out = []
+    for i in range(len(ws)):
+        for j in range(i, len(ws)):
+            t0, t1 = ws[i][0], ws[j][1]
+            if t1 - t0 > hi:
+                break
+            if t1 - t0 < lo:
+                continue
+            if j + 1 < len(ws) and ws[j + 1][0] - t1 < 0.12 and not re.search(r"[.!?,;]$", ws[j][2]):
+                continue                       # would cut mid-phrase
+            if i > 0 and t0 - ws[i - 1][1] < 0.12 and not re.search(r"[.!?,;]$", ws[i - 1][2]):
+                continue
+            text = " ".join(w[2] for w in ws[i:j + 1])
+            sc = 2.0 * len(_STAKES.findall(text)) + (1.0 if re.search(r"[.!?]$", ws[j][2]) else 0.0) \
+                - 0.6 * abs((t1 - t0) - 1.8)
+            out.append((round(sc, 3), t0, t1, text))
+    out.sort(key=lambda x: -x[0])
+    return out
+
+
+def _resolve_line(ctx, plan, ln):
+    if isinstance(ln, str):
+        ln = {"from": ln}
+    if ln.get("from") is None:
+        return ctx.clip(ln["clip"]), float(ln["in"]), float(ln["out"]), ln.get("text", "")
+    sec, gi = _find_section(plan, ln["from"])
+    segs = sec.get("segments", [])
+    cands = [segs[gi]] if gi is not None and gi < len(segs) else [s for s in segs if s.get("type") == "talk"]
+    for seg in cands:
+        src = seg if seg.get("type") == "talk" else (seg.get("voiceover") or {})
+        if not src.get("clip"):
+            continue
+        row = ctx.clip(src["clip"])
+        a = float(ln.get("in", src["in"]))
+        b = float(ln.get("out", src["out"]))
+        if ln.get("in") is not None and ln.get("out") is not None:
+            return row, a, b, ""
+        cs = teaser_candidates(_words(ctx, row["id"]), a, b)
+        if cs:
+            _, t0, t1, text = cs[0]
+            return row, max(0.0, t0 - 0.06), t1 + 0.12, text
+        return row, a, min(b, a + 2.0), ""
+    raise P.PlanError(f"cold_open line {ln.get('from')!r}: no talk segment there")
+
+
+def _co_rhythm(ctx, co, total, song, offset):
+    """Cut times (seconds from the start of the cold open) and the target time of the first word."""
+    fps = ctx.fps
+    if co.get("from_reference"):
+        from . import reference as R
+        an = R.load_analysis(ctx.cfg, co["from_reference"])
+        s0 = (an.get("sections") or [{}])[0]
+        end0 = float(s0.get("end") or 10.0)
+        shots = [s for s in an.get("shots", []) if float(s["start"]) < end0 - 1e-6]
+        cuts = [float(s["start"]) for s in shots[1:]]
+        asl = float(s0.get("asl") or 0.45)
+        t = cuts[-1] if cuts else 0.0
+        while t + asl < total - 1e-6 and end0 < total:      # longer than the reference: continue its ASL
+            t += asl
+            if t > end0:
+                cuts.append(t)
+        cuts = [c for c in cuts if c < total - 1.5 / fps]
+        fw = (an.get("structure") or {}).get("time_to_first_word_s") or 1.4
+        basis = f"reference {co['from_reference']} cold open ({len(shots)} shots in {end0:.2f}s)"
+    else:
+        asl = float(co.get("asl", 0.45))
+        pat = (0.9, 1.15, 0.75, 1.3, 1.0, 0.8, 1.2, 0.95)       # varied, never metronomic
+        cuts, t, k = [], 0.0, 0
+        while True:
+            t += asl * pat[k % len(pat)]
+            k += 1
+            if t >= total - 0.2:
+                break
+            cuts.append(t)
+        beats = np.asarray(song.get("beats") or [], float) if song else np.asarray([])
+        if len(beats) > 3:                          # pull cuts onto the half-beat grid when one is close
+            half = np.sort(np.concatenate([beats, (beats[1:] + beats[:-1]) / 2])) - offset
+            cuts = [float(half[np.argmin(np.abs(half - c))]) if np.min(np.abs(half - c)) < 0.08 else c for c in cuts]
+        fw = float(co.get("first_word", 1.4))
+        basis = f"auto rhythm ASL {asl:.2f}s" + (" snapped to half beats" if len(beats) > 3 else "")
+    cuts = sorted({round(round(c * fps) / fps, 4) for c in cuts if 2.5 / fps < c < total - 2.5 / fps})
+    out = []
+    for c in cuts:                                   # never a shot shorter than 3 frames
+        if not out or c - out[-1] >= 3 / fps - 1e-6:
+            out.append(c)
+    return out, float(fw), basis
+
+
+def build_cold_open(ctx, plan):
+    """plan.cold_open -> a generated section (index -1) rebuilt from the reference template: teaser lines
+    taken from later in the edit, dense micro-cuts between and under them (rhythm from the reference
+    cut map or ~0.45 s auto), the music running UNDER the voice (not ducked), a flash into the second
+    line and out of the cold open."""
+    co = plan.get("cold_open")
+    if not co:
+        return None
+    fps = ctx.fps
+    total = float(co.get("dur", 10.0))
+    m = dict(co.get("music") or {})
+    if not m.get("song"):
+        src = next((s.get("music") for s in plan.get("sections", []) if (s.get("music") or {}).get("song")), None)
+        if src:
+            m = {"song": src["song"], "offset": float(src.get("offset", 0.0))}
+    song = ctx.song(m["song"]) if m.get("song") else None
+    if m:
+        m = {**P.MUSIC_DEFAULTS, "gain_db": -8.0, **m, "mode": m.get("mode", "under")}
+    if co.get("from_reference") and co.get("dur") is None:
+        from . import reference as R
+        an = R.load_analysis(ctx.cfg, co["from_reference"])
+        total = float(((an.get("sections") or [{}])[0]).get("end") or total)
+    cuts, first_word, basis = _co_rhythm(ctx, co, total, song, float(m.get("offset", 0.0)) if m else 0.0)
+    lines = [_resolve_line(ctx, plan, ln) for ln in (co.get("lines") or [])]
+    # ---- shot pool: windows of the edit's own b-roll that the edit does NOT use later
+    used = {}
+
+    def mark(cid, a, b):
+        used.setdefault(cid, []).append((a, b))
+    cand = []
+    for sec in plan.get("sections", []):
+        for seg in sec.get("segments", []):
+            t = seg.get("type")
+            if t == "talk":
+                mark(ctx.clip(seg["clip"])["id"], float(seg["in"]), float(seg["out"]))
+                for c in (seg.get("cutaways") or []) + [x for x in (seg.get("cover") or []) if isinstance(x, dict)]:
+                    cand.append((c["clip"], c.get("in")))
+            elif t == "broll":
+                cand.append((seg["clip"], seg.get("in")))
+                r = ctx.clip(seg["clip"])
+                mark(r["id"], float(seg["in"]), float(seg["out"]))
+            elif t == "montage":
+                for sh in seg.get("shots", []):
+                    cand.append((sh["clip"], sh.get("in")))
+                    if sh.get("in") is not None:
+                        mark(ctx.clip(sh["clip"])["id"], float(sh["in"]), float(sh["in"]) + float(seg.get("max_shot", 1.6)))
+            elif t == "still":
+                mark(ctx.clip(seg["clip"])["id"], float(seg["t"]) - 1.0, float(seg["t"]) + 1.0)
+            elif t == "title" and str(seg.get("bg", "")).startswith("blur:"):
+                ref, _, tt = str(seg["bg"])[5:].rpartition("@")
+                mark(ctx.clip(ref)["id"], float(tt or 0) - 1.0, float(tt or 0) + 1.0)
+            elif t == "matchcut":
+                for side in ("a", "b"):
+                    cand.append((seg[side]["clip"], seg[side].get("t")))
+                    mark(ctx.clip(seg[side]["clip"])["id"], float(seg[side]["t"]) - 1.5, float(seg[side]["t"]) + 1.5)
+    if isinstance(co.get("shots"), list) and co["shots"]:
+        cand = [(x["clip"], x.get("in")) for x in co["shots"]]
+        used = {}
+    for row, a, b, _ in lines:
+        mark(row["id"], a, b)
+    seen, pool = set(), []
+    for ref, a in cand:
+        r = ctx.clip(ref)
+        if r["id"] in seen or r["id"] in {ln[0]["id"] for ln in lines}:
+            continue
+        seen.add(r["id"])
+        pool.append({"ref": ref, "row": r, "next": float(a) if a is not None else 0.15 * float(r["duration"] or 1)})
+    if not pool:
+        raise P.PlanError("cold_open: no b-roll to cut the teaser from (add broll/montage segments or cold_open.shots)")
+    state = {"k": 0, "last": None}
+
+    def take(dur):
+        """Next pool clip (never the same one twice in a row) at a window not used elsewhere in the edit."""
+        for _ in range(len(pool)):
+            p = pool[state["k"] % len(pool)]
+            state["k"] += 1
+            if p["row"]["id"] != state["last"] or len(pool) == 1:
+                break
+        D = float(p["row"]["duration"] or 0)
+        t = p["next"]
+        for _ in range(200):
+            if t + dur > D - 0.05:
+                t = 0.1
+            if not any(t < b2 + 0.2 and t + dur > a2 - 0.2 for a2, b2 in used.get(p["row"]["id"], [])):
+                break
+            t += 0.5
+        mark(p["row"]["id"], t, t + dur)
+        p["next"] = t + dur + 0.4
+        state["last"] = p["row"]["id"]
+        return {"clip": p["ref"], "in": round(t, 3)}
+
+    def pieces(a, b):
+        bounds = [a] + [c for c in cuts if a + 2.5 / fps < c < b - 2.5 / fps] + [b]
+        return [(x, y) for x, y in zip(bounds, bounds[1:]) if y - x > 0.5 / fps]
+
+    def snap(t):
+        near = [c for c in cuts if abs(c - t) < 0.35]
+        return min(near, key=lambda c: abs(c - t)) if near else round(t * fps) / fps
+    segs = []
+    sum_lines = sum(b - a for _, a, b, _ in lines)
+    pos = 0.0
+    first_end = snap(min(first_word, max(0.4, total - sum_lines)))
+    k = len(lines)
+    rest = max(0.0, total - first_end - sum_lines)
+    gap = rest / max(1, k) if k else rest
+    t = first_end
+    order = []
+    for i, (row, a, b, text) in enumerate(lines):
+        order.append(("line", i, t, t + (b - a)))
+        t += b - a
+        if i < k - 1 and gap >= 3 / fps:
+            e = snap(t + gap)
+            if e > t + 2.5 / fps:
+                order.append(("block", i + 1, t, e))
+                t = e
+    if total - t > 2.5 / fps:
+        order.append(("block", k, t, total))
+    if first_end > 2.5 / fps:
+        order.insert(0, ("block", 0, 0.0, first_end))
+    flash_next = False
+    for kind, i, a, b in order:
+        if kind == "block":
+            shots = [{**take(y - x), "dur": round(y - x, 4)} for x, y in pieces(a, b)]
+            if not shots:
+                continue
+            seg = {"type": "montage", "beat_sync": False, "min_shot": 0.04, "max_shot": 30, "audio": "music",
+                   "shots": shots, "teaser": True, "note": "cold-open micro-cuts"}
+            if flash_next or (i == 1 and co.get("flashes", "auto") == "auto"):
+                seg["transition"] = {"kind": "flash", "frames": 4}
+                flash_next = False
+            segs.append(seg)
+        else:
+            row, la, lb, text = lines[i]
+            face_s = float(co.get("face_s", 0.8))
+            cut = [{**take(y - x), "at": round(x - a, 4), "dur": round(y - x, 4)}
+                   for x, y in pieces(a, b) if x >= a + face_s - 1e-6]
+            segs.append({"type": "talk", "clip": row["id"], "in": round(la, 3), "out": round(lb, 3), "tighten": False,
+                         "lead_in": 0, "tail": 0, "captions": True, "room_tone": False, "cutaways": cut,
+                         "crop": co.get("crop", "center"), "teaser": True, "note": f"teaser line: {text}"[:120]})
+    sec = {"name": co.get("name", "cold open"), "segments": segs, "_generated": "cold_open",
+           "_basis": basis, "_cuts": cuts, "_dur": total}
+    if m:
+        sec["music"] = m
+    if co.get("end_flash", True):
+        sec["_end_transition"] = {"kind": "flash", "frames": 4}
+    return sec
+
+
 # ============================================================================== expansion
 class Timeline:
     def __init__(self, fps):
@@ -461,21 +861,85 @@ def _base_atom(ctx, sec_i, sec, seg_i, seg, kind, row=None):
           "kind": kind, "clip": row, "src": ctx.source(row) if row else None, "a": 0.0, "speed": 1.0,
           "crop": seg.get("crop", "center"), "zoom": seg.get("zoom", 1.0), "fit": seg.get("fit", "cover"),
           "align": None, "stabilize": bool(seg.get("stabilize")), "audio": {"mode": "none"},
-          "captions": [], "overlays": [], "cutaways": [], "unit": None}
+          "captions": [], "overlays": [], "cutaways": [], "unit": None,
+          "look": LK.effective(ctx.style["grade"].get("look"), seg.get("look")),
+          "exposure_stops": seg.get("exposure_stops"), "conform": "none"}
     return at
+
+
+def _conform(ctx, row, src, seg, sync):
+    """Frame-rate conform for a source that is not at the output rate: (mode, speed factor).
+    auto: within 5 % of the output rate, b-roll is sped up (23.976 -> 25 = +4.3 %, every source frame
+    shown once; natural audio is atempo'd, pitch kept) and sync talk is frame-blended (lip-sync holds);
+    anything else goes through fps (50 -> 25 drops every other frame, no duplicates)."""
+    mode = (seg or {}).get("conform") or ctx.style.get("conform") or "auto"
+    q = ctx.src_fps(row, src) if row else None
+    if not q:
+        return "none", 1.0
+    f = q[0] / q[1]
+    if abs(f - ctx.fps) < 1e-3:
+        return "none", 1.0
+    if mode == "auto":
+        mode = ("blend" if sync else "speed") if abs(f - ctx.fps) / ctx.fps < 0.05 else "dup"
+    if mode == "speed":
+        return "speed", ctx.fps * q[1] / q[0]
+    return mode, 1.0
+
+
+def _pace_durations(pace, n, base_asl=None):
+    """Planned shot lengths for a montage from section.pace: ASL, alternating fast / slow blocks."""
+    asl = float(pace.get("asl") or base_asl or 0.8)
+    if pace.get("alternate", True):
+        pat = np.array([0.7, 0.7, 0.7, 1.45, 1.45])
+        pat = pat / pat.mean()
+        d = [asl * pat[k % len(pat)] for k in range(n)]
+    else:
+        d = [asl] * n
+    mh = pace.get("max_hold")
+    return [min(x, float(mh)) if mh else x for x in d]
+
+
+def _push_spec(seg, ctx, kind):
+    pu = seg.get("push")
+    if pu is None and kind == "talk" and ctx.style.get("auto_push"):
+        ap = ctx.style["auto_push"]
+        return {"to": float(ap.get("to", 1.04)), "ease": "inout", "auto": True, "min_hold": float(ap.get("min_hold", 4.0))}
+    if not pu:
+        return None
+    if not isinstance(pu, dict):
+        pu = {"to": float(pu)}
+    return {"to": float(pu.get("to", 1.06)), "ease": pu.get("ease", "inout"),
+            **({"x": float(pu["x"])} if pu.get("x") is not None else {}),
+            **({"y": float(pu["y"])} if pu.get("y") is not None else {})}
+
+
+def _seg_transition(sec, gi, seg):
+    tr = seg.get("transition")
+    if tr is None and gi == 0:
+        tr = sec.get("transition")
+    sp = P.transition_spec(tr)
+    return sp if sp and sp["kind"] != "cut" and sp["frames_out"] + sp["frames_in"] > 0 else None
+
+
+VISUAL_PREV = ("broll", "montage", "matchcut", "still")
 
 
 def expand(ctx, sections):
     """Flat atom list on the frame grid + per-segment mapping info + section spans."""
     tl = Timeline(ctx.fps)
+    fps = ctx.fps
     segs, secs = [], []
     cs = ctx.style["captions"]
+    aud = ctx.style.get("audio") or {}
+    ctx.transitions = []
     for si, sec in sections:
         s_start = tl.t
         mus = sec.get("music") or {}
         sng = ctx.song(mus["song"]) if mus.get("song") else None
         off = float(mus.get("offset", 0.0) or 0.0)
         beats = np.asarray(sng["beats"], float) if sng else np.asarray([])
+        pace = sec.get("pace") or {}
+        teaser_sec = sec.get("_generated") == "cold_open"
 
         def song_t(t):                      # timeline -> song time inside this section
             return off + (t - s_start)
@@ -483,30 +947,63 @@ def expand(ctx, sections):
         def tl_t(st):
             return s_start + (st - off)
         sec_rec = {"index": si, "name": sec.get("name", f"section {si}"), "start": s_start, "music": None,
-                   "montage_cuts": [], "beats_tl": [float(tl_t(b)) for b in beats] if sng else []}
-        for gi, seg in enumerate(sec.get("segments", [])):
+                   "montage_cuts": [], "beats_tl": [float(tl_t(b)) for b in beats] if sng else [],
+                   "generated": sec.get("_generated")}
+        seglist = sec.get("segments", [])
+        for gi, seg in enumerate(seglist):
             t = seg["type"]
-            rec = {"sec": si, "seg": gi, "type": t, "spec": seg, "atoms": [], "src_map": []}
+            rec = {"sec": si, "seg": gi, "type": t, "spec": seg, "atoms": [], "src_map": [],
+                   "transition": _seg_transition(sec, gi, seg), "teaser": bool(seg.get("teaser") or teaser_sec),
+                   "sec_pace": pace}
+            prev_rec = segs[-1] if segs else None
             T0 = tl.t
+            F0 = tl.F
             if t == "talk":
                 row = ctx.clip(seg["clip"])
                 pieces = _tighten(ctx, row["id"], float(seg["in"]), float(seg["out"]), float(seg.get("gap", 0.35))) \
                     if seg.get("tighten", True) else [(float(seg["in"]), float(seg["out"]))]
                 unit = ("talk", si, gi)
-                for a, b in pieces:
+                cmode, _ = _conform(ctx, row, ctx.source(row), seg, sync=True)
+                # J / L cuts: the voice starts under the previous shot / runs on under the next one
+                lead = seg.get("lead_in")
+                if lead is None:
+                    ok = (prev_rec is not None and prev_rec["type"] in VISUAL_PREV and not rec["teaser"]
+                          and not prev_rec.get("teaser") and rec["transition"] is None)
+                    lead = float(aud.get("auto_lead_in", 0.3)) if ok else 0.0
+                tail = seg.get("tail")
+                if tail is None:
+                    nxt = seglist[gi + 1] if gi + 1 < len(seglist) else None
+                    ok = nxt is not None and nxt.get("type") in ("broll", "montage", "matchcut") and not rec["teaser"] \
+                        and _seg_transition(sec, gi + 1, nxt) is None
+                    tail = float(aud.get("auto_tail", 0.0)) if ok else 0.0
+                if tl.atoms == []:
+                    lead = 0.0
+                # the picture never moves: the voice's audio window reaches `lead` s before the piece into
+                # the source (it plays under the previous shot) and `tail` s past its end (under the next)
+                prev_n = tl.atoms[-1]["n"] / fps if tl.atoms else 0.0
+                lead = round(max(0.0, min(float(lead), pieces[0][0], max(0.0, prev_n - 2.0 / fps))) * fps) / fps
+                tail = round(max(0.0, min(float(tail), 2.0)) * fps) / fps
+                rec["lead_in"], rec["tail"] = lead, tail
+                for k, (a, b) in enumerate(pieces):
+                    pre = lead if k == 0 else 0.0
+                    post = tail if k == len(pieces) - 1 else 0.0
                     at = _base_atom(ctx, si, sec, gi, seg, "clip", row)
-                    at.update(a=a, unit=unit, audio={"mode": "voice", "clip": row, "a": a})
+                    at.update(a=a, unit=unit, conform=cmode,
+                              audio={"mode": "voice", "clip": row, "a": a, "pre": pre, "post": post,
+                                     "fi": 0.05 if pre else 0.012, "fo": 0.08 if post else 0.015})
                     tl.add(at, dur=b - a)
-                    rec["src_map"].append((a, a + at["n"] / ctx.fps, at["f0"] / ctx.fps))
+                    rec["src_map"].append((a, a + at["n"] / fps, at["f0"] / fps))
                     rec["atoms"].append(at["i"])
                     if cs.get("enabled", True) and seg.get("captions", True):
-                        at["cue_src"] = (row["id"], a, a + at["n"] / ctx.fps)
+                        at["cue_src"] = (row["id"], a - pre, b + post)
+                        at["cue_shift"] = pre
             elif t == "broll":
                 row = ctx.clip(seg["clip"])
                 at = _base_atom(ctx, si, sec, gi, seg, "clip", row)
                 sp = float(seg.get("speed", 1.0) or 1.0)
                 d = (float(seg["out"]) - float(seg["in"])) / sp
                 vo = seg.get("voiceover")
+                cmode, cf = _conform(ctx, row, ctx.source(row), seg, sync=False)
                 if vo:
                     vrow = ctx.clip(vo["clip"])
                     vd = float(vo["out"]) - float(vo["in"])
@@ -516,12 +1013,17 @@ def expand(ctx, sections):
                     at["audio"] = {"mode": "voice", "clip": vrow, "a": float(vo["in"])}
                     if cs.get("enabled", True) and seg.get("captions", True):
                         at["cue_src"] = (vrow["id"], float(vo["in"]), float(vo["out"]))
+                        at["cue_shift"] = 0.0
                     at["vo_unit"] = ("vo", si, gi)
+                    sp *= cf
                 else:
-                    mode = seg.get("audio", "music")
+                    sp *= cf
+                    mode = seg.get("audio", "natural")
                     at["audio"] = {"mode": mode if mode in ("natural", "mix") else "none", "clip": row,
                                    "a": float(seg["in"]), "speed": sp}
-                at.update(a=float(seg["in"]), speed=sp, unit=("seg", si, gi))
+                at.update(a=float(seg["in"]), speed=sp, unit=("seg", si, gi), conform=cmode)
+                if seg.get("ramp"):
+                    at["ramp"] = {"to": float(seg["ramp"]["to"]), "over": float(seg["ramp"].get("over", 0.4))}
                 tl.add(at, dur=d)
                 rec["atoms"].append(at["i"])
             elif t == "montage":
@@ -531,26 +1033,38 @@ def expand(ctx, sections):
                 if seg.get("beat_sync", True) and not use_beats:
                     ctx.warn(f"section '{sec_rec['name']}' montage {gi}: beat_sync needs section music with beats; "
                              "using planned shot lengths")
+                pc = {**pace, **(seg.get("pace") or {})}
                 ends = None
                 if use_beats:
                     from . import music
-                    step = float(np.median(np.diff(beats)))
-                    bpc = max(1, int(seg.get("beats_per_cut", 1) or 1))
-                    while step * bpc < float(seg.get("min_shot", 0.4)) - 1e-6:
-                        bpc += 1
-                    durs = music.montage_grid(beats, song_t(tl.t), len(shots), bpc)
+                    if pc.get("asl"):
+                        durs = music.snap_cuts(beats, song_t(tl.t), _pace_durations(pc, len(shots)),
+                                               min_shot=float(seg.get("min_shot", 0.4)),
+                                               max_shot=float(pc.get("max_hold") or seg.get("max_shot") or 0) or None)
+                    else:
+                        step = float(np.median(np.diff(beats)))
+                        bpc = max(1, int(seg.get("beats_per_cut", 1) or 1))
+                        while step * bpc < float(seg.get("min_shot", 0.4)) - 1e-6:
+                            bpc += 1
+                        durs = music.montage_grid(beats, song_t(tl.t), len(shots), bpc)
                     acc, ends = song_t(tl.t), []
                     for d in durs:
                         acc += d
                         ends.append(tl_t(acc))
+                paced = _pace_durations(pc, len(shots)) if (pc.get("asl") and not use_beats) else None
                 for k, sh in enumerate(shots):
                     row = ctx.clip(sh["clip"])
                     at = _base_atom(ctx, si, sec, gi, {**seg, **{x: sh[x] for x in ("crop", "zoom", "fit", "stabilize") if x in sh}}, "clip", row)
                     want = (ends[k] - tl.t) if ends else None
                     if want is None:
-                        avail = (float(sh["out"]) - float(sh["in"])) if sh.get("out") is not None and sh.get("in") is not None \
-                            else float(seg.get("max_shot", 1.6))
-                        want = min(max(avail, float(seg.get("min_shot", 0.4))), float(seg.get("max_shot", 1.6)))
+                        if sh.get("dur") is not None:
+                            want = float(sh["dur"])
+                        elif paced:
+                            want = paced[k]
+                        else:
+                            avail = (float(sh["out"]) - float(sh["in"])) if sh.get("out") is not None and sh.get("in") is not None \
+                                else float(seg.get("max_shot", 1.6))
+                            want = min(max(avail, float(seg.get("min_shot", 0.4))), float(seg.get("max_shot", 1.6)))
                     a = sh.get("in")
                     if a is None:
                         from . import analyze
@@ -559,13 +1073,21 @@ def expand(ctx, sections):
                     out = float(sh["out"]) if sh.get("out") is not None else float(row["duration"] or a + want)
                     avail = max(0.04, out - a)
                     sp = float(sh.get("speed", 1.0) or 1.0)
-                    if avail < want * sp:
-                        sp = max(0.5, avail / want)
-                    at.update(a=a, speed=sp, unit=("shot", si, gi, k),
+                    cmode, cf = _conform(ctx, row, ctx.source(row), {**seg, **sh}, sync=False)
+                    if avail < want * sp * cf:
+                        sp = max(0.5, avail / want / cf)
+                    sp *= cf
+                    at.update(a=a, speed=sp, unit=("shot", si, gi, k), conform=cmode,
                               audio={"mode": mode if mode in ("natural", "mix") else "none", "clip": row, "a": a, "speed": sp})
+                    rp = sh.get("ramp") or seg.get("ramp")
+                    if rp:
+                        at["ramp"] = {"to": float(rp["to"]), "over": float(rp.get("over", 0.4))}
+                    pu = _push_spec(sh, ctx, "shot") or _push_spec(seg, ctx, "montage")
+                    if pu:
+                        at["push_spec"] = pu
                     if ends:
                         tl.add(at, end_t=ends[k])
-                        sec_rec["montage_cuts"].append(round(at["f1"] / ctx.fps, 4))
+                        sec_rec["montage_cuts"].append(round(at["f1"] / fps, 4))
                     else:
                         tl.add(at, dur=want)
                     rec["atoms"].append(at["i"])
@@ -577,19 +1099,21 @@ def expand(ctx, sections):
                     from . import music
                     pre, post = music.snap_cuts(beats, song_t(tl.t), [pre, post], min_shot=0.4)
                 pre = min(pre, float(A["t"]))
-                n_pre = max(1, int(round(pre * ctx.fps)))
+                n_pre = max(1, int(round(pre * fps)))
                 mode = seg.get("audio", "music")
                 aa = _base_atom(ctx, si, sec, gi, {**seg, **{x: A[x] for x in ("crop", "zoom") if x in A}}, "clip", ra)
-                a_in = float(A["t"]) - n_pre / ctx.fps                 # lock end: last frame is the match frame
-                aa.update(a=a_in, unit=("mcA", si, gi),
+                a_in = float(A["t"]) - n_pre / fps                 # lock end: last frame is the match frame
+                ca, _ = _conform(ctx, ra, ctx.source(ra), seg, sync=True)    # blend keeps the match frame exact
+                aa.update(a=a_in, unit=("mcA", si, gi), conform=ca,
                           audio={"mode": mode if mode in ("natural", "mix") else "none", "clip": ra, "a": a_in})
-                tl.add(aa, dur=n_pre / ctx.fps)
+                tl.add(aa, dur=n_pre / fps)
                 bb = _base_atom(ctx, si, sec, gi, {**seg, **{x: B[x] for x in ("crop", "zoom") if x in B}}, "clip", rb)
-                bb.update(a=float(B["t"]), align=B.get("align"), unit=("mcB", si, gi),   # lock start
+                cb, _ = _conform(ctx, rb, ctx.source(rb), seg, sync=True)
+                bb.update(a=float(B["t"]), align=B.get("align"), unit=("mcB", si, gi), conform=cb,   # lock start
                           audio={"mode": mode if mode in ("natural", "mix") else "none", "clip": rb, "a": float(B["t"])})
                 tl.add(bb, dur=post)
                 rec["atoms"] += [aa["i"], bb["i"]]
-                rec["match_t"] = round(bb["f0"] / ctx.fps, 4)
+                rec["match_t"] = round(bb["f0"] / fps, 4)
             elif t == "title":
                 at = _base_atom(ctx, si, sec, gi, seg, "title")
                 bg = seg.get("bg", "black") or "black"
@@ -611,6 +1135,20 @@ def expand(ctx, sections):
                 tl.add(at, dur=float(seg.get("dur", 2.0)))
                 rec["atoms"].append(at["i"])
             rec["t0"], rec["t1"] = T0, tl.t
+            rec["f0"], rec["f1"] = F0, tl.F
+            # push-in: continuous across the whole segment on talk / broll (montage shots push one by one)
+            pu = _push_spec(seg, ctx, t) if t in ("talk", "broll") else None
+            if pu and pu.get("auto") and (rec["t1"] - rec["t0"]) < pu["min_hold"]:
+                pu = None
+            for i in rec["atoms"]:
+                at = tl.atoms[i]
+                ps = pu or at.pop("push_spec", None)
+                if ps:
+                    whole = pu is not None
+                    at["push"] = {**ps, "off_f": (at["f0"] - F0) if whole else 0,
+                                  "tot_f": (tl.F - F0) if whole else at["n"]}
+            for i in rec["atoms"]:
+                tl.atoms[i]["teaser"] = rec["teaser"]
             segs.append(rec)
         sec_rec["end"] = tl.t
         if sng:
@@ -618,10 +1156,90 @@ def expand(ctx, sections):
                                 "gain_db": float(mus.get("gain_db", DEFAULT_MUSIC_GAIN)),
                                 "duck_db": float(mus.get("duck_db", -18)),
                                 "mode": mus.get("mode") or ctx.style.get("music_under_speech", "mute"),
+                                "start": mus.get("start", "cut"), "end": mus.get("end", "cut"),
+                                "montage_gain_db": float(mus.get("montage_gain_db", P.MUSIC_DEFAULTS["montage_gain_db"])),
+                                "natural_duck_db": float(mus.get("natural_duck_db", 0.0) or 0.0),
+                                "under_db": float(mus.get("under_db", -5.0)),
+                                "breaks": list(mus.get("breaks") or []),
                                 "fade_in": float(mus.get("fade_in", 0.3)), "fade_out": float(mus.get("fade_out", 0.6))}
+            for r in segs:
+                if r["sec"] == si:
+                    for i in r["atoms"]:
+                        tl.atoms[i]["under_music"] = True
+        if sec.get("_end_transition"):
+            sec_rec["end_transition"] = P.transition_spec(sec["_end_transition"])
         secs.append(sec_rec)
+    _finish_expand(ctx, tl, segs, secs)
     return tl, segs, secs
 
+
+def _finish_expand(ctx, tl, segs, secs):
+    """Post-pass over the finished frame grid: transitions on cut frames, crossfade handles at every
+    audio join, music breaks before flashes."""
+    fps = ctx.fps
+    aud = ctx.style.get("audio") or {}
+    # a generated cold open hands its closing flash to whatever comes next
+    for k, r in enumerate(segs):
+        if k and r["transition"] is None:
+            prev_sec = next((s for s in secs if s["index"] == segs[k - 1]["sec"]), None)
+            if prev_sec and prev_sec.get("end_transition") and r["sec"] != segs[k - 1]["sec"]:
+                r["transition"] = prev_sec["end_transition"]
+    for r in segs:
+        sp = r["transition"]
+        if not sp or not r["atoms"]:
+            continue
+        first = tl.atoms[r["atoms"][0]]
+        if first["i"] == 0:
+            continue
+        prev = tl.atoms[first["i"] - 1]
+        sp = dict(sp)
+        sp["frames_out"] = min(sp["frames_out"], max(0, prev["n"] - 1))
+        sp["frames_in"] = min(sp["frames_in"], max(0, first["n"] - 1))
+        first["tr_in"], prev["tr_out"] = sp, sp
+        ctx.transitions.append({**sp, "t": round(first["f0"] / fps, 4), "frame": first["f0"], "sec": r["sec"], "seg": r["seg"]})
+    # equal-power crossfade handles wherever two pieces of the same kind of sound meet
+    h = max(0.0, float(aud.get("join_xfade_s", 0.02))) / 2
+
+    def fam(at):
+        m = at["audio"]["mode"]
+        return "voice" if m == "voice" else ("amb" if m in ("natural", "mix") else None)
+    ctx.talk_joins = []
+    for A, B in zip(tl.atoms, tl.atoms[1:]):
+        fa, fb = fam(A), fam(B)
+        if not fa or fa != fb:
+            continue
+        if fa == "voice" and A["type"] == "talk" and B["type"] == "talk":
+            ctx.talk_joins.append(round(B["f0"] / fps, 4))
+        if h <= 0:
+            continue
+        ua, ub = A["audio"], B["audio"]
+        if not ua.get("post"):
+            ua["post"], ua["fo"], ua["curve_out"] = h, 2 * h, "qsin"
+        hb = min(h, max(0.0, float(ub["a"]) / float(ub.get("speed", 1.0) or 1.0)))
+        if not ub.get("pre") and hb > 0:
+            ub["pre"], ub["fi"], ub["curve_in"] = hb, 2 * hb, "qsin"
+    # music breaks: silence before a flash / whip so the hit lands into nothing
+    for tr in ctx.transitions:
+        if tr["break"] <= 0:
+            continue
+        for s in secs:
+            if s["music"] and s["start"] + 1e-6 < tr["t"] <= s["end"] + 1e-6:
+                s["music"].setdefault("_breaks", []).append((tr["t"], tr["break"]))
+    for s in secs:
+        m = s["music"]
+        if not m:
+            continue
+        for b in m.get("breaks") or []:
+            if b.get("at") is not None:
+                t = s["start"] + float(b["at"])
+            else:
+                ref = str(b["before"])
+                gi = int(ref.split(":")[-1]) if ref.split(":")[-1].isdigit() else None
+                r = next((x for x in segs if x["sec"] == s["index"] and x["seg"] == gi), None)
+                if r is None:
+                    continue
+                t = r["t0"]
+            m.setdefault("_breaks", []).append((round(t, 4), float(b.get("dur", 0.3))))
 
 # ============================================================================== layers on atoms
 def src_to_out(rec, s):
@@ -678,7 +1296,7 @@ def apply_layers(ctx, tl, segs):
             for i, a0, a1, off in parts:
                 tl.atoms[i]["overlays"].append({"spec": sid, "t0": a0, "t1": a1, "offset": off})
         cut = [dict(c) for c in seg.get("cutaways", []) or []]
-        if talk and seg.get("auto_cover") and len(rec["src_map"]) > 1:
+        if talk and seg.get("auto_cover") and rec["src_map"]:
             pool = list(seg.get("cover") or [])
             if not pool:
                 ctx.warn(f"talk segment {rec['sec']}/{rec['seg']}: auto_cover needs a 'cover' list of clips; skipped")
@@ -700,6 +1318,36 @@ def apply_layers(ctx, tl, segs):
                 cin = float(cin) + used.get(row["id"], 0.0)
                 used[row["id"]] = used.get(row["id"], 0.0) + pre + post + 0.5
                 cut.append({"clip": ref, "in": cin, "_T0": J - pre, "_T1": J + post, "auto": True})
+            # pacing: cap how long the face is held with no visual change (section.pace.max_hold)
+            mh = (seg.get("pace") or {}).get("max_hold") or (rec.get("sec_pace") or {}).get("max_hold")
+            if mh and pool:
+                mh = float(mh)
+                dur_c = min(1.8, max(0.8, 0.35 * mh))
+                for _ in range(64):
+                    spans = sorted([(c["_T0"], c["_T1"]) for c in cut if "_T0" in c] +
+                                   [(src_to_out(rec, seg_in + float(c["at"])), src_to_out(rec, seg_in + float(c["at"])) + float(c["dur"]))
+                                    for c in cut if "_T0" not in c])
+                    free, last = [], S0
+                    for a, b in spans:
+                        if a > last:
+                            free.append((last, a))
+                        last = max(last, b)
+                    free.append((last, S1))
+                    long = [(a, b) for a, b in free if b - a > mh + 0.3]
+                    if not long:
+                        break
+                    a, b = long[0]
+                    J = a + mh * 0.6 if (b - a) > 2 * mh else (a + b) / 2 - dur_c / 2
+                    c = pool[len(used) % len(pool)]
+                    ref = c["clip"] if isinstance(c, dict) else c
+                    row = ctx.clip(ref)
+                    cin = c.get("in") if isinstance(c, dict) else None
+                    if cin is None:
+                        from . import analyze
+                        cin = analyze.steadiest_window(ctx.con, row["id"], dur_c)[0]
+                    cin = float(cin) + used.get(row["id"], 0.0)
+                    used[row["id"]] = used.get(row["id"], 0.0) + dur_c + 0.5
+                    cut.append({"clip": ref, "in": cin, "_T0": J, "_T1": min(S1, J + dur_c), "auto": True, "pace": True})
         for c in cut:
             if "_T0" in c:
                 T0, T1 = c["_T0"], c["_T1"]
@@ -715,7 +1363,18 @@ def apply_layers(ctx, tl, segs):
                                                 "crop": c.get("crop", "center"), "zoom": c.get("zoom", 1.0),
                                                 "unit": ("cut", row["id"], round(float(c["in"]) + off, 2))})
         for e in seg.get("sfx", []) or []:
-            sfx.append({"name": e["name"], "t": S0 + float(e.get("at", 0.0)), "gain_db": float(e.get("gain_db", -6))})
+            if e.get("on") in ("cut", "transition"):
+                sfx.append({"name": e["name"], "t": S0, "gain_db": float(e.get("gain_db", -6)), "align": "peak",
+                            "on": f"cut:{rec['sec']}/{rec['seg']}"})
+            elif e.get("on") == "end":
+                sfx.append({"name": e["name"], "t": S1, "gain_db": float(e.get("gain_db", -6)), "align": "peak",
+                            "on": f"end:{rec['sec']}/{rec['seg']}"})
+            else:
+                sfx.append({"name": e["name"], "t": S0 + float(e.get("at", 0.0)), "gain_db": float(e.get("gain_db", -6))})
+    # transition sounds: the transient PEAK lands on the cut frame
+    for k, tr in enumerate(getattr(ctx, "transitions", []) or []):
+        if tr.get("sfx"):
+            sfx.append({"name": tr["sfx"], "t": tr["t"], "gain_db": tr["gain_db"], "align": "peak", "on": f"transition:{k}"})
     return specs, sfx
 
 
@@ -733,6 +1392,7 @@ def prepare(ctx, tl, segs, specs, pool):
         for c in at["cutaways"]:
             units.setdefault(c["unit"], {"row": c["clip"], "src": c["src"], "t0": c["a"], "t1": c["a"] + (c["t1"] - c["t0"])})
     keys = list(units)
+    import cv2  # noqa: F401  - import once here: a first import racing in worker threads leaves cv2 half-initialised
     futs = [pool.submit(probe_unit, ctx, units[k]["row"], units[k]["src"], units[k]["t0"], units[k]["t1"]) for k in keys]
     probes = {k: f.result() for k, f in zip(keys, futs)}
 
@@ -744,9 +1404,13 @@ def prepare(ctx, tl, segs, specs, pool):
         if au["mode"] == "none" or not au.get("clip") or not au["clip"].get("has_audio"):
             continue
         key = at.get("vo_unit") or at["unit"]
-        lj = loud_jobs.setdefault((key, au["mode"]), {"row": au["clip"], "t0": au["a"], "t1": au["a"], "mode": au["mode"]})
-        lj["t0"] = min(lj["t0"], au["a"])
-        lj["t1"] = max(lj["t1"], au["a"] + at["n"] / ctx.fps * float(au.get("speed", 1.0)))
+        asp = float(au.get("speed", 1.0) or 1.0)
+        a0 = au["a"] - float(au.get("pre", 0.0)) * asp
+        lj = loud_jobs.setdefault((key, au["mode"]), {"row": au["clip"], "t0": a0, "t1": a0, "mode": au["mode"],
+                                                      "under_music": bool(at.get("under_music")),
+                                                      "montage": at["type"] == "montage"})
+        lj["t0"] = min(lj["t0"], a0)
+        lj["t1"] = max(lj["t1"], au["a"] + (at["n"] / ctx.fps + float(au.get("post", 0.0))) * asp)
     voice_src = {}
     for (key, mode), lj in loud_jobs.items():
         row = lj["row"]
@@ -762,9 +1426,20 @@ def prepare(ctx, tl, segs, specs, pool):
     for k, f in zip(lkeys, lfuts):
         I = f.result()
         target = {"voice": DIALOG_LUFS, "natural": NATURAL_LUFS, "mix": MIX_LUFS}[k[1]]
+        if k[1] != "voice" and loud_jobs[k]["under_music"]:
+            target = min(target, NATURAL_UNDER_MUSIC_LUFS)      # ambience sits under the music, never on top
+        if k[1] != "voice" and loud_jobs[k]["montage"]:
+            target += MONTAGE_NATURAL_DB
+        loud_jobs[k]["target"] = target
         loud_jobs[k]["gain_db"] = 0.0 if I is None else max(-20.0, min(20.0, target - I))
 
     norm = bool(ctx.style["grade"].get("normalize_exposure", True))
+    ex = ctx.style["grade"].get("exposure") or {}
+
+    def stops_for(at_or_c, pr, rect):
+        if at_or_c.get("exposure_stops") is not None:
+            return float(at_or_c["exposure_stops"])
+        return exposure_stops(luma_median_in(pr, rect), ex) if norm else 0.0
     cs = ctx.style["captions"]
     fixes = [tuple(f) for f in cs.get("fixes", []) or []]
     cap_dir = ctx.cache / "captions"
@@ -774,40 +1449,81 @@ def prepare(ctx, tl, segs, specs, pool):
         if at["clip"] and at["kind"] in ("clip", "still", "title"):
             info = ctx.info(at["src"])
             at["rect"] = crop_rect(info["w"], info["h"], ctx.W, ctx.H, at["crop"], at["zoom"], faces, at["align"])
-            at["eq"] = exposure_eq(luma_in(pr, at["rect"])) if norm else None
+            at["stops"] = stops_for(at, pr, at["rect"])
+            at["luma_lut"] = luma_median_in(pr, at["rect"])
             at["grade"] = pr["grade"] if pr else ""
             at["faces_out"] = faces_out(faces, at["rect"], ctx.W, ctx.H)
+            # a flash is light, not an overlay: a small log-domain push on its frames (never past ~+1 stop:
+            # through the LUT a bigger push turns magenta) + the mix to white at the end of the atom graph
+            pfx = []
+            if at["kind"] == "clip" and at["grade"] in ("lut", "generic-log"):
+                tr = at.get("tr_out")
+                if tr and tr["kind"] == "flash" and tr["frames_out"]:
+                    fo = tr["frames_out"]
+                    pfx += [(at["n"] - fo + j, 1.0 * (j + 1) / fo) for j in range(fo)]
+                tr = at.get("tr_in")
+                if tr and tr["kind"] == "flash" and tr["frames_in"]:
+                    fi = tr["frames_in"]
+                    pfx += [(j, 1.0 * (fi - j) / fi) for j in range(fi)]
+            at["pre_fx"] = pfx
+            if at.get("push") and at["push"].get("x") is None and at["faces_out"] and at["crop"] == "face":
+                fx, fy, fw, fh = max(at["faces_out"], key=lambda f: f[2] * f[3])
+                at["push"]["x"] = round(min(1.0, max(0.0, (fx + fw / 2) / ctx.W)), 3)
+                at["push"]["y"] = round(min(1.0, max(0.0, (fy + fh / 2) / ctx.H)), 3)
         else:
             at["faces_out"] = []
         for c in at["cutaways"]:
             cp = probes.get(c["unit"])
             ci = ctx.info(c["src"])
             c["rect"] = crop_rect(ci["w"], ci["h"], ctx.W, ctx.H, c["crop"], c["zoom"], cp["faces"] if cp else [])
-            c["eq"] = exposure_eq(luma_in(cp, c["rect"])) if norm else None
+            c["stops"] = exposure_stops(luma_median_in(cp, c["rect"]), ex) if norm else 0.0
         au = at["audio"]
         if au["mode"] != "none" and au.get("clip") and au["clip"].get("has_audio"):
             lj = loud_jobs[(at.get("vo_unit") or at["unit"], au["mode"])]
             au.update(path=lj["path"], chain=lj["chain"], gain_db=round(lj["gain_db"], 2))
+            lj = loud_jobs[(at.get("vo_unit") or at["unit"], au["mode"])]
+            au["target"] = lj["target"]
         elif au["mode"] != "none":
             au["mode"] = "none"
-        # captions
-        if at.get("cue_src"):
-            cid, a, b = at["cue_src"]
-            dur = at["n"] / ctx.fps
-            for t0, t1, text in asr.cues(_words(ctx, cid), a, b, max_words=int(cs.get("max_words", 5)),
-                                         max_chars=int(cs.get("max_chars", 30)), fixes=fixes):
-                t1 = min(t1, dur)
-                if t1 - t0 < 0.1:
-                    continue
-                png, w, h = CAP.cue_png(cap_dir, text, ctx.W, ctx.H, ctx.font_pi, int(cs.get("size", 54)), cs.get("case", "sentence"))
-                pos = cs.get("position", "bottom")
-                x, y = CAP.place(pos, w, h, ctx.W, ctx.H)
-                busy = at["faces_out"] if not at["cutaways"] else []
-                if pos != "top" and CAP.overlaps_face(x, y, w, h, busy):
-                    pos = "top"
-                    x, y = CAP.place(pos, w, h, ctx.W, ctx.H)
-                at["captions"].append({"t0": round(t0, 3), "t1": round(t1, 3), "text": text, "png": png,
-                                       "x": x, "y": y, "position": pos})
+    # captions follow the HEARD audio (rule 57): with a J/L cut, a cue spoken under the neighbouring
+    # shot is drawn on that shot, so text and voice stay together
+    size = int(cs.get("size", P.CAPTION_SIZE_1080))
+    px = max(10, int(round(size * ctx.H / 1080.0)))
+
+    def put(at, t0, t1, text):
+        dur = at["n"] / ctx.fps
+        t0, t1 = max(0.0, t0), min(t1, dur)
+        if t1 - t0 < 0.1:
+            return
+        png, w, h = CAP.cue_png(cap_dir, text, ctx.W, ctx.H, ctx.font_pi, size, cs.get("case", "sentence"))
+        pos = cs.get("position", "bottom")
+        x, y = CAP.place(pos, w, h, ctx.W, ctx.H)
+        busy = at["faces_out"] if not at["cutaways"] else []
+        if pos != "top" and CAP.overlaps_face(x, y, w, h, busy):
+            pos = "top"
+            x, y = CAP.place(pos, w, h, ctx.W, ctx.H)
+        pad = int(px * 0.9)                      # captions.render_cue pads the PNG for the shadow
+        at["captions"].append({"t0": round(t0, 3), "t1": round(t1, 3), "text": text, "png": png,
+                               "x": x, "y": y, "position": pos, "px": px, "box_w": w, "box_h": h, "pad": pad})
+    for at in tl.atoms:
+        if not at.get("cue_src"):
+            continue
+        cid, a, b = at["cue_src"]
+        shift = float(at.get("cue_shift", 0.0))
+        dur = at["n"] / ctx.fps
+        i = at["i"]
+        for t0, t1, text in asr.cues(_words(ctx, cid), a, b, max_words=int(cs.get("max_words", 5)),
+                                     max_chars=int(cs.get("max_chars", 30)), fixes=fixes):
+            t0, t1 = t0 - shift, t1 - shift
+            if t0 < 0 and i > 0:
+                pv = tl.atoms[i - 1]
+                pd = pv["n"] / ctx.fps
+                put(pv, pd + t0, pd + min(t1, 0.0), text)
+            if t1 > dur and i + 1 < len(tl.atoms):
+                put(tl.atoms[i + 1], max(0.0, t0 - dur), t1 - dur, text)
+            put(at, t0, t1, text)
+    for at in tl.atoms:
+        at["captions"].sort(key=lambda c: c["t0"])
     # overlay placement: auto -> corner away from faces of the first atom it appears on
     cap_bottom = cs.get("position", "bottom") != "top"
     for sp in specs:
@@ -841,6 +1557,80 @@ def _atempo(speed):
     return out
 
 
+def _rate_filter(conform, fpsr):
+    """Frame-rate stage of a clip head: plain fps (identical rates, speed conform, or far-off rates) or a
+    frame blend for sync sources within 5 % of the output rate (no duplicated frames, lip-sync kept)."""
+    if conform == "blend":
+        return f"framerate=fps={fpsr}:interp_start=0:interp_end=255:scene=8"
+    return f"fps={fpsr}"
+
+
+def ramp_params(at, fps):
+    """Speed ramp into the cut on a b-roll / montage piece: base speed until u1, then a linear rise to
+    `to` x over the last `over` seconds. Returns the setpts expression (source time -> output time),
+    the source seconds consumed and where the motion blur fades in, or None."""
+    rp = at.get("ramp")
+    if not rp:
+        return None
+    d = at["n"] / fps
+    sp = float(at["speed"] or 1.0)
+    over = max(2.0 / fps, min(float(rp.get("over", 0.4)), 0.8 * d))
+    to = float(rp["to"])
+    u1 = d - over
+    k = sp * (to - 1.0) / over
+    s1 = sp * u1
+    expr = f"if(lt(T,{s1:.6f}),T/{sp:.6f},{u1:.6f}+(-{sp:.6f}+sqrt({sp * sp:.6f}+2*{k:.6f}*(T-{s1:.6f})))/{k:.6f})/TB"
+    q = 0.25 * over
+    return {"u1": u1, "over": over, "to": to, "k": k, "expr": expr, "src_need": s1 + sp * over + k * over * over / 2,
+            "t_blur": s1 + sp * q + k * q * q / 2}
+
+
+def _k_out(fo, lo, hi):
+    return [round(float(x), 3) for x in (np.linspace(lo, hi, fo) if fo > 1 else [0.5 * (lo + hi) + 0.1])]
+
+
+def _k_in(fi, hi, lo):
+    if fi <= 1:
+        return [round(0.5 * (hi + lo) + 0.25, 3)]
+    return [round(float(hi * (lo / hi) ** (j / (fi - 1))), 3) for j in range(fi)]
+
+
+def transition_filters(at, n, s=1.0):
+    """Light events on an atom's boundary frames, built from the footage itself (never an overlay asset):
+    flash = mix toward white (in Y'CbCr, so no colour cast) on the last/first frames, dip = through black,
+    dip_white = through white, whip = a temporal mix + horizontal smear on the frames either side of the
+    cut. Frame indices are the atom's own (0 = first frame)."""
+    out, whip_en = [], []
+
+    def mix(f, K, white):
+        y = 235 if white else 16
+        return (f"lutyuv=y='val+({y}-val)*{K:.3f}':u='val+(128-val)*{K:.3f}':v='val+(128-val)*{K:.3f}'"
+                f":enable='eq(n,{int(f)})'")
+    for side in ("tr_out", "tr_in"):
+        tr = at.get(side)
+        if not tr:
+            continue
+        kind = tr["kind"]
+        fr = tr["frames_out"] if side == "tr_out" else tr["frames_in"]
+        if fr <= 0:
+            continue
+        if kind == "whip":
+            whip_en.append(f"gte(n,{n - fr})" if side == "tr_out" else f"lt(n,{fr})")
+            continue
+        if kind == "flash":
+            ks = _k_out(fr, *FLASH_K_OUT) if side == "tr_out" else _k_in(fr, *FLASH_K_IN)
+        else:
+            ks = _k_out(fr, 0.5, 1.0) if side == "tr_out" else list(reversed(_k_out(fr, 0.5, 1.0)))
+        frames = range(n - fr, n) if side == "tr_out" else range(fr)
+        out += [mix(f, K, kind in ("flash", "dip_white")) for f, K in zip(frames, ks)]
+    if whip_en:
+        en = "+".join(whip_en)
+        bx = max(4, int(round(24 * s)))
+        out = [f"split[ws][wt]", f"[wt]tmix=frames=3,avgblur=sizeX={bx}:sizeY=1[wb]",
+               f"[ws][wb]overlay=0:0:enable='{en}'" + "".join("," + x for x in out) + "[v]"]
+    return out
+
+
 def build_atom_cmd(ctx, at, gfx):
     """ffmpeg args (without output) for one atom, plus the list of input files to fingerprint."""
     fps, W, H = ctx.fps, ctx.W, ctx.H
@@ -862,7 +1652,7 @@ def build_atom_cmd(ctx, at, gfx):
     elif kind == "title":
         i0 = inp("-ss", f"{at['a']:.3f}", "-i", at["src"])
         files.append(at["src"])
-        ch = picture(ctx, at["clip"], at["src"], W, H, at["rect"], at.get("eq"), label="t")
+        ch = picture(ctx, at["clip"], at["src"], W, H, at["rect"], at.get("stops", 0.0), label="t", look=at.get("look"))
         fc += [c.replace("[IN]", f"[{i0}:v]trim=end_frame=1,setpts=PTS-STARTPTS,").replace("[OUT]", "[tp]") for c in ch]
         fc.append(f"[tp]gblur=sigma={30 * ctx.s:.1f},eq=brightness=-0.12:saturation=0.85,loop=loop={n + 2}:size=1:start=0,"
                   f"setpts=N/({fpsr}*TB),fps={fpsr}[b0]")
@@ -870,7 +1660,7 @@ def build_atom_cmd(ctx, at, gfx):
         i0 = inp("-ss", f"{at['a']:.3f}", "-i", at["src"])
         files.append(at["src"])
         W2, H2 = W * 2, H * 2
-        ch = picture(ctx, at["clip"], at["src"], W2, H2, at["rect"], at.get("eq"), label="s")
+        ch = picture(ctx, at["clip"], at["src"], W2, H2, at["rect"], at.get("stops", 0.0), label="s", look=at.get("look"))
         fc += [c.replace("[IN]", f"[{i0}:v]trim=end_frame=1,setpts=PTS-STARTPTS,").replace("[OUT]", "[sp]") for c in ch]
         z = max(1.0, float(at.get("still_zoom", 1.08)))
         fc.append(f"[sp]loop=loop={n + 2}:size=1:start=0,setpts=N/({fpsr}*TB),"
@@ -878,11 +1668,22 @@ def build_atom_cmd(ctx, at, gfx):
                   f"setsar=1,format=yuv420p[b0]")
     else:
         sp = float(at["speed"] or 1.0)
-        i0 = inp("-ss", f"{max(0.0, at['a']):.3f}", "-t", f"{d * sp + 0.5:.3f}", "-i", at["src"])
+        rp = ramp_params(at, fps)
+        need = rp["src_need"] if rp else d * sp
+        i0 = inp("-ss", f"{max(0.0, at['a']):.3f}", "-t", f"{need + 0.5:.3f}", "-i", at["src"])
         files.append(at["src"])
-        ch = picture(ctx, at["clip"], at["src"], W, H, at["rect"], at.get("eq"), at.get("fit", "cover"),
-                     at.get("stabilize"), label="m")
-        head = f"[{i0}:v]setpts=(PTS-STARTPTS)/{sp:.5f},fps={fpsr},"
+        ch = picture(ctx, at["clip"], at["src"], W, H, at["rect"], at.get("stops", 0.0), at.get("fit", "cover"),
+                     at.get("stabilize"), label="m", look=at.get("look"), pre_fx=at.get("pre_fx") or (),
+                     push=at.get("push"))
+        rate = _rate_filter(at.get("conform"), fpsr)
+        if rp:
+            # speed ramp into the cut: output time -> source time follows a linear speed rise; a 4-frame
+            # temporal mix fades in as the speed climbs (motion blur), keyed on SOURCE time (blend's T)
+            head = (f"[{i0}:v]setpts=PTS-STARTPTS,split[rs][rt];[rt]tmix=frames=4[rm];"
+                    f"[rs][rm]blend=all_expr='A*(1-clip((T-{rp['t_blur']:.4f})/0.3,0,1))+B*clip((T-{rp['t_blur']:.4f})/0.3,0,1)',"
+                    f"setpts='{rp['expr']}',{rate},")
+        else:
+            head = f"[{i0}:v]setpts=(PTS-STARTPTS)/{sp:.8f},{rate},"
         fc += [c.replace("[IN]", head).replace("[OUT]", "[b0]") for c in ch]
     last = "b0"
     k = 0
@@ -892,8 +1693,9 @@ def build_atom_cmd(ctx, at, gfx):
         cd = c["t1"] - c["t0"]
         ci = inp("-ss", f"{max(0.0, c['a']):.3f}", "-t", f"{cd + 0.5:.3f}", "-i", c["src"])
         files.append(c["src"])
-        ch = picture(ctx, c["clip"], c["src"], W, H, c["rect"], c.get("eq"), label=f"c{k}")
-        fc += [x.replace("[IN]", f"[{ci}:v]setpts=PTS-STARTPTS,fps={fpsr},")
+        ch = picture(ctx, c["clip"], c["src"], W, H, c["rect"], c.get("stops", 0.0), label=f"c{k}", look=at.get("look"))
+        cmode, _ = _conform(ctx, c["clip"], c["src"], None, sync=True)
+        fc += [x.replace("[IN]", f"[{ci}:v]setpts=PTS-STARTPTS,{_rate_filter(cmode, fpsr)},")
                 .replace("[OUT]", f"[cx{k}]") for x in ch]
         fc.append(f"[cx{k}]tpad=stop_mode=clone:stop_duration=1,setpts=PTS+{c['t0']:.4f}/TB[cv{k}]")
         fc.append(f"[{last}][cv{k}]overlay=eof_action=pass:enable='between(t,{c['t0']:.4f},{c['t1'] - 0.5 / fps:.4f})'[x{k}]")
@@ -949,7 +1751,14 @@ def build_atom_cmd(ctx, at, gfx):
         files.append(c["png"])
         fc.append(f"[{last}][{pi}:v]overlay={c['x']}:{c['y']}:eof_action=repeat:enable='between(t,{c['t0']:.4f},{c['t1']:.4f})'[y{k}]")
         last = f"y{k}"
-    fc.append(f"[{last}]format=yuv420p,tpad=stop_mode=clone:stop_duration={d + 1:.3f},trim=end_frame={n},setpts=PTS-STARTPTS[v]")
+    trx = transition_filters(at, n, ctx.s)
+    if trx and trx[0].startswith("split"):
+        fc.append(f"[{last}]format=yuv420p,tpad=stop_mode=clone:stop_duration={d + 1:.3f},trim=end_frame={n},setpts=PTS-STARTPTS,"
+                  f"{trx[0]}")
+        fc += trx[1:]
+    else:
+        fc.append(f"[{last}]format=yuv420p,tpad=stop_mode=clone:stop_duration={d + 1:.3f},trim=end_frame={n},setpts=PTS-STARTPTS"
+                  f"{''.join(',' + x for x in trx)}[v]")
     return args, fc, files
 
 
@@ -959,24 +1768,45 @@ def atom_samples(at, fps):
     return s0, int(round(at["f1"] * SR / fps)) - s0
 
 
+def audio_span(at, fps):
+    """(pre_samples, total_samples) of an atom's audio: its frame-exact span plus the handle / J-cut lead
+    before it and the handle / L-cut tail after it (those parts overlap the neighbours on the bus)."""
+    _, S = atom_samples(at, fps)
+    au = at["audio"]
+    pre = int(round(float(au.get("pre", 0.0) or 0.0) * SR))
+    post = int(round(float(au.get("post", 0.0) or 0.0) * SR))
+    return pre, S + pre + post
+
+
 def build_audio_cmd(ctx, at):
     """ffmpeg args for an atom's dialogue/natural audio (None when the atom is silent). Audio runs in
     its own process: an audio output in the same graph as the overlay compositing deadlocks
-    ffmpeg 8's scheduler intermittently (measured ~15% of runs)."""
+    ffmpeg 8's scheduler intermittently (measured ~15% of runs).
+    The window runs from `pre` seconds before the atom to `post` after it. Joins between two pieces of
+    the same sound get equal-power (quarter-sine) crossfades over the handles; a J-cut lead fades in
+    under the previous shot and an L-cut tail fades out under the next one."""
     au = at["audio"]
     if au["mode"] == "none":
         return None, []
-    d = at["n"] / ctx.fps
-    _, S = atom_samples(at, ctx.fps)
+    fps = ctx.fps
+    d = at["n"] / fps
+    pre_n, S_tot = audio_span(at, fps)
+    pre, post = pre_n / SR, float(au.get("post", 0.0) or 0.0)
+    tot = S_tot / SR
     asp = float(au.get("speed", 1.0) or 1.0)
     chain = [f"aresample={SR}", "aformat=sample_fmts=fltp:channel_layouts=stereo"] + _atempo(asp)
     if au.get("chain"):
         chain.append(au["chain"])
     chain.append(f"volume={au.get('gain_db', 0.0):.2f}dB")
-    fo = 0.015                                   # short de-click fades: jump cuts stay tight
-    chain += ["afade=t=in:d=0.012", f"afade=t=out:st={max(0.0, d - fo):.4f}:d={fo}",
-              f"apad=whole_len={S}", f"atrim=end_sample={S}", "asetpts=N/SR/TB"]
-    args = ["-ss", f"{max(0.0, au['a']):.3f}", "-t", f"{d * asp + 0.5:.3f}", "-i", au["path"], "-vn",
+    fi, fo = float(au.get("fi", 0.012)), float(au.get("fo", 0.015))
+    ci, co = au.get("curve_in", "qsin" if pre else "tri"), au.get("curve_out", "qsin" if post else "tri")
+    chain += [f"afade=t=in:d={fi:.4f}:curve={ci}", f"afade=t=out:st={max(0.0, tot - fo):.4f}:d={fo:.4f}:curve={co}"]
+    rp = ramp_params(at, fps)
+    if rp:                                       # no sync sound on a ramped piece: the ambience leaves with the ramp
+        chain.append(f"afade=t=out:st={pre + max(0.0, rp['u1'] - 0.05):.4f}:d={rp['over']:.4f}")
+    chain += [f"apad=whole_len={S_tot}", f"atrim=end_sample={S_tot}", "asetpts=N/SR/TB"]
+    a0 = au["a"] - pre * asp
+    args = ["-ss", f"{max(0.0, a0):.3f}", "-t", f"{tot * asp + 0.5:.3f}", "-i", au["path"], "-vn",
             "-af", ",".join(chain), "-c:a", "pcm_s16le", "-ar", str(SR), "-ac", "2"]
     return args, [au["path"]]
 
@@ -1090,7 +1920,12 @@ def sfx_track(ctx, events, n):
             continue
         if x.shape[1] == 1:
             x = np.repeat(x, 2, axis=1)
-        s = int(round(e["t"] * SR))
+        t = float(e["t"])
+        if e.get("align") == "peak":
+            pk = music.sfx_peak(p)
+            e["peak_s"] = round(pk, 4)
+            t -= pk                                    # the transient, not the file start, lands on the frame
+        s = int(round(t * SR))
         if s >= n:
             continue
         m = min(len(x), n - max(0, s))
@@ -1151,12 +1986,15 @@ def normalize_mix(ctx, mix_wav, out_wav, n, target):
 
 
 # ============================================================================== main entry
-def _select_sections(plan, only):
-    secs = list(enumerate(plan["sections"]))
+def _select_sections(plan, only, cold_open=None):
+    secs = ([(-1, cold_open)] if cold_open else []) + list(enumerate(plan["sections"]))
     if not only:
         return secs
     o = str(only).strip().lower()
-    hit = [(i, s) for i, s in secs if str(i) == o or s.get("name", "").lower() == o or slugify(s.get("name", "")) == slugify(o)]
+    hit = [(i, s) for i, s in secs if str(i) == o or s.get("name", "").lower() == o or slugify(s.get("name", "")) == slugify(o)
+           or (i == -1 and o in ("cold_open", "cold-open", "teaser"))]
+    if len(hit) > 1:
+        hit = [h for h in hit if h[0] != -1] or hit
     if not hit:
         raise P.PlanError(f"--only {only!r} matches no section; sections: {[s.get('name') for _, s in secs]}")
     return hit
@@ -1165,6 +2003,7 @@ def _select_sections(plan, only):
 def extra_validate(plan, con, cfg):
     errs = []
     from . import music
+    errs += LK.check_files(cfg, ((plan.get("style") or {}).get("grade") or {}).get("look"), "style.grade.look")
     for si, sec in enumerate(plan.get("sections", [])):
         w0 = f"section {si} ({sec.get('name', '')})"
         mus = sec.get("music") or {}
@@ -1180,6 +2019,8 @@ def extra_validate(plan, con, cfg):
         for gi, s in enumerate(sec.get("segments", [])):
             w = f"{w0} segment {gi}"
             t = s.get("type")
+            if s.get("look") is not None:
+                errs += LK.check_files(cfg, s["look"], f"{w} look")
             if s.get("fit", "cover") not in ("cover", "blur"):
                 errs.append(f"{w}: fit must be 'cover' or 'blur'")
             c = s.get("crop", "center")
@@ -1218,10 +2059,166 @@ def extra_validate(plan, con, cfg):
                     errs.append(f"{w} overlay {k}: text is empty")
                 if float(o.get("dur", 2.5)) <= 0:
                     errs.append(f"{w} overlay {k}: dur must be > 0")
+            tr = P.transition_spec(s.get("transition")) if not P._validate_transition("", s.get("transition")) else None
+            if tr and tr.get("sfx") and tr["sfx"] not in music.SFX and not os.path.exists(str(tr["sfx"])):
+                errs.append(f"{w} transition: unknown sound {tr['sfx']!r} (built-ins: {sorted(music.SFX)} or a wav path)")
             for k, e in enumerate(s.get("sfx", []) or []):
                 if e.get("name") not in music.SFX and not os.path.exists(str(e.get("name"))):
                     errs.append(f"{w} sfx {k}: unknown sound {e.get('name')!r} (built-ins: {sorted(music.SFX)} or a wav path)")
     return errs
+
+
+def _rms_db(x, win):
+    k = len(x) // win
+    if k <= 0:
+        return np.zeros(0)
+    return 20 * np.log10(np.sqrt((x[:k * win].reshape(k, win).astype(np.float64) ** 2).mean(axis=1)) + 1e-9)
+
+
+def room_tone_bed(ctx, rec, tl, voice_bus, spans):
+    """Room tone under a whole talk segment: the clip's own quietest steady patch (from the CLEANED
+    dialogue), looped with equal-power crossfades, laid from bed_fade before the first word-audio to
+    bed_fade after the last, at max(the segment's floor, voice - 32 dB) (reference: ambience 30-36 dB under
+    the voice, never a digital hole). Returns (start_sample, stereo array, info) or None."""
+    from . import voice
+    import soundfile as sf
+    aud = ctx.style.get("audio") or {}
+    first = tl.atoms[rec["atoms"][0]]
+    au = first["audio"]
+    if au["mode"] != "voice" or not au.get("path"):
+        return None
+    a, b = spans
+    fade = float(aud.get("bed_fade_s", 0.3))
+    i0, i1 = int(round(a * SR)), int(round(b * SR))
+    seg = voice_bus[i0:i1].mean(axis=1)
+    r = _rms_db(seg, int(0.01 * SR))
+    r = r[r > -90]
+    if len(r) < 20:
+        return None
+    loud = r[r >= np.percentile(r, 50)]
+    voice_db = float(10 * np.log10(np.mean(10 ** (loud / 10))))
+    start = max(0.0, a - fade)
+    dur = (b + fade) - start
+    try:
+        path = voice.room_tone(ctx.cfg, au["clip"]["id"], round(dur, 2), src=au["path"])
+    except Exception as e:  # noqa: BLE001
+        ctx.warn(f"room tone for {au['clip'].get('rel')}: {e}")
+        return None
+    x, sr = sf.read(path, dtype="float32", always_2d=True)
+    if sr != SR or not len(x):
+        return None
+    x = x[:, :2] if x.shape[1] >= 2 else np.repeat(x, 2, axis=1)
+    # measured with the same meter as the floors (20th percentile of 10 ms RMS), so the bed's audible
+    # floor - not its average - matches the loudest piece's floor
+    rb = _rms_db(x.mean(axis=1), int(0.01 * SR))
+    rb = rb[rb > -100]
+    if len(rb) < 10:
+        return None
+    cur = float(np.percentile(rb, 20))
+    # the clip's own floor = its quietest steady patch at the gain the dialogue gets on the bus; the bed
+    # fills up to max(that floor, voice - 32 dB) and never comes closer than 12 dB to the voice
+    # the loudest piece floor sets the bed, so quieter (gated) pieces are filled up to it: no step
+    floors = []
+    for i in rec["atoms"]:
+        at = tl.atoms[i]
+        s0, S = atom_samples(at, ctx.fps)
+        rr = _rms_db(voice_bus[s0:s0 + S].mean(axis=1), int(0.01 * SR))
+        rr = rr[rr > -90]
+        if len(rr) >= 30:
+            floors.append(float(np.percentile(rr, 20)))    # p20: the floor you hear between words
+    floor = max([cur + float(au.get("gain_db", 0.0) or 0.0)] + floors)
+    target = min(max(floor, voice_db + float(aud.get("room_tone_under_voice_db", -32.0))), voice_db - 12.0)
+    x = x * (10 ** ((target - cur) / 20))
+    m = min(len(x), int(round(fade * SR)))
+    if m > 1:
+        ramp = np.sin(np.linspace(0, np.pi / 2, m, dtype=np.float32))[:, None]
+        if start > 0:
+            x[:m] *= ramp
+        x[-m:] *= ramp[::-1]
+    return int(round(start * SR)), x.astype(np.float32), {"t0": round(start, 3), "t1": round(start + len(x) / SR, 3),
+                                                           "level_db": round(target, 1), "floor_db": round(floor, 1),
+                                                           "voice_db": round(voice_db, 1), "clip": au["clip"]["id"]}
+
+
+def _add(bus, s0, x):
+    n = len(bus)
+    a, b = max(0, s0), min(n, s0 + len(x))
+    if b > a:
+        bus[a:b] += x[a - s0:b - s0]
+
+
+def build_buses(ctx, cfg, con, tl, segs, secs, parts, n_samples):
+    """Dialogue / ambience / room-tone buses and the music bed, sample-exact on the frame grid.
+    Pieces are ADDED (they overlap by their crossfade handles and J/L leads), ambience ducks under a
+    J/L-cut voice, room tone runs under every talk segment, and only real dialogue ducks the music."""
+    from . import music
+    fps = ctx.fps
+    aud = ctx.style.get("audio") or {}
+    voice_bus = np.zeros((n_samples, 2), np.float32)
+    nat_bus = np.zeros((n_samples, 2), np.float32)
+    voice_spans, nat_spans = [], []
+    for at, (_, wav) in zip(tl.atoms, parts):
+        if not wav:
+            continue
+        s0, _ = atom_samples(at, fps)
+        pre, tot = audio_span(at, fps)
+        x = _read_wav(wav, tot)
+        st = s0 - pre
+        if at["audio"]["mode"] == "voice":
+            _add(voice_bus, st, x)
+            voice_spans.append((st / SR, (st + tot) / SR))
+        else:
+            _add(nat_bus, st, x)
+            nat_spans.append((st / SR, (st + tot) / SR))
+    vs = music._merge_spans(voice_spans, join=0.05)
+    if vs and nat_spans:
+        env = music.duck_envelope(n_samples, vs, 10 ** (float(aud.get("jl_duck_db", -12.0)) / 20), ramp=0.3)
+        nat_bus *= env[:, None]
+    beds = []
+    bed_bus = np.zeros((n_samples, 2), np.float32)
+    if aud.get("room_tone", True):
+        for rec in segs:
+            if rec["type"] not in ("talk", "broll") or not rec["atoms"] or rec["spec"].get("room_tone") is False:
+                continue
+            if rec["type"] == "broll" and not rec["spec"].get("voiceover"):
+                continue
+            ats = [tl.atoms[i] for i in rec["atoms"]]
+            sp_ = [(at["f0"] / fps - float(at["audio"].get("pre", 0) or 0), at["f1"] / fps + float(at["audio"].get("post", 0) or 0))
+                   for at in ats if at["audio"]["mode"] == "voice"]
+            if not sp_:
+                continue
+            res = room_tone_bed(ctx, rec, tl, voice_bus, (min(a for a, _ in sp_), max(b for _, b in sp_)))
+            if res:
+                st, x, info = res
+                _add(bed_bus, st, x)
+                beds.append(info)
+    dialog = voice_bus + nat_bus + bed_bus
+    # music
+    speech = [(a, b) for a, b in vs]
+    bed_secs = []
+    for s in secs:
+        m = s["music"]
+        e = {"song": m["song"] if m else None, "offset": m["offset"] if m else 0.0, "start": s["start"],
+             "dur": s["end"] - s["start"], "gain_db": m["gain_db"] if m else 0.0,
+             "speech": [(a, b) for a, b in speech if b > s["start"] and a < s["end"]],
+             "mode": m["mode"] if m else "full", "duck_db": m["duck_db"] if m else -18}
+        if m:
+            e.update(start_edge=m.get("start", "cut"), end_edge=m.get("end", "cut"),
+                     lift_db=0.0 if m["mode"] == "under" else m.get("montage_gain_db", 0.0),
+                     breaks=m.get("_breaks", []), under_db=m.get("under_db", -5.0), voice_lufs=DIALOG_LUFS,
+                     natural=[(a, b) for a, b in nat_spans if b > s["start"] and a < s["end"]],
+                     natural_duck_db=m.get("natural_duck_db", 0.0))
+        bed_secs.append(e)
+    mus = np.zeros((n_samples, 2), np.float32)
+    if any(e["song"] for e in bed_secs):
+        run_dir = ctx.cache / "runs"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        bed = run_dir / f"music_{_sha([time.time(), id(ctx)], 8)}.wav"
+        music.music_bed(cfg, con, bed_secs, bed)
+        mus = _read_wav(bed, n_samples)
+        bed.unlink(missing_ok=True)
+    return dialog, mus, {"room_tone": beds, "voice_spans": [[round(a, 3), round(b, 3)] for a, b in vs],
+                         "music": [{k: v for k, v in e.items() if k not in ("speech", "natural")} for e in bed_secs if e["song"]]}
 
 
 def render_plan(cfg, con, plan_path, preview=False, out=None, only=None):
@@ -1232,7 +2229,8 @@ def render_plan(cfg, con, plan_path, preview=False, out=None, only=None):
     if errs:
         raise P.PlanError("plan has problems:\n  " + "\n  ".join(errs))
     ctx = Ctx(cfg, con, plan, preview)
-    sections = _select_sections(plan, only)
+    co = build_cold_open(ctx, plan) if plan.get("cold_open") else None
+    sections = _select_sections(plan, only, co)
     jobs = _jobs(cfg)
     print(f"render '{plan['title']}' v{plan['version']} · {ctx.W}x{ctx.H}@{ctx.fps:g} · "
           f"{'preview' if preview else 'final'} · {jobs} jobs · code {CODE_VERSION}", flush=True)
@@ -1272,32 +2270,9 @@ def render_plan(cfg, con, plan_path, preview=False, out=None, only=None):
     lst = run_dir / "list.txt"
     lst.write_text("".join(f"file '{v}'\n" for v, _ in parts))
     n_samples = int(round(total_f * SR / ctx.fps))
-    dialog = np.zeros((n_samples, 2), np.float32)       # dialogue / natural bus, sample-exact placement
-    for at, (_, wav) in zip(tl.atoms, parts):
-        if wav:
-            s0, S = atom_samples(at, ctx.fps)
-            dialog[s0:s0 + S] = _read_wav(wav, S)
-
-    from . import music
-    speech = [(tl.atoms[i]["f0"] / ctx.fps, tl.atoms[i]["f1"] / ctx.fps) for i in range(len(tl.atoms))
-              if tl.atoms[i]["audio"]["mode"] in ("voice", "natural")]
-    bed_secs = []
-    for s in secs:
-        m = s["music"]
-        e = {"song": m["song"] if m else None, "offset": m["offset"] if m else 0.0, "start": s["start"],
-             "dur": s["end"] - s["start"], "gain_db": m["gain_db"] if m else 0.0,
-             "speech": [(a, b) for a, b in speech if b > s["start"] and a < s["end"]],
-             "mode": m["mode"] if m else "full", "duck_db": m["duck_db"] if m else -18}
-        if m:
-            e.update(fade_in=m["fade_in"], fade_out=m["fade_out"])
-        bed_secs.append(e)
-    bed = run_dir / "music.wav"
-    if any(e["song"] for e in bed_secs):
-        music.music_bed(cfg, con, bed_secs, bed)
-        mus = _read_wav(bed, n_samples)
-    else:
-        mus = np.zeros((n_samples, 2), np.float32)
+    dialog, mus, bus_info = build_buses(ctx, cfg, con, tl, segs, secs, parts, n_samples)
     mix = dialog + mus + sfx_track(ctx, sfx, n_samples)
+    ctx.bus_info = bus_info
     import soundfile as sf
     mix_wav = run_dir / "mix.wav"
     sf.write(str(mix_wav), mix, SR, subtype="FLOAT")
@@ -1323,8 +2298,11 @@ def render_plan(cfg, con, plan_path, preview=False, out=None, only=None):
                            "-c:a", "aac", "-b:a", "192k", "-ar", str(SR), "-movflags", "+faststart", tmp_out],
                      timeout=7200)
     loud = _ebur128(cfg, tmp_out)
-    if loud["TP"] is not None and loud["TP"] > target["TP"]:
-        fix = target["TP"] - loud["TP"] - 0.1
+    fix = 0.0
+    for _ in range(3):                  # AAC overshoot on sharp transients (hits) can need more than one pass
+        if loud["TP"] is None or loud["TP"] <= target["TP"]:
+            break
+        fix += target["TP"] - loud["TP"] - 0.1
         ctx.warn(f"true peak {loud['TP']} dBTP after encode; lowering programme by {-fix:.2f} dB")
         tmp2 = out.with_name(f".{out.stem}.tmp2.mp4")
         media.ffmpeg(cfg, ["-i", tmp_out, "-i", norm_wav, "-map", "0:v", "-map", "1:a", "-c:v", "copy",
@@ -1355,10 +2333,19 @@ def sidecar(ctx, plan, plan_path, tl, segs, secs, specs, gfx, sfx, total_f, loud
              "out": round(at["a"] + at["n"] / fps * at["speed"], 4) if at.get("clip") else None,
              "speed": round(at["speed"], 4), "audio": at["audio"]["mode"],
              "audio_gain_db": at["audio"].get("gain_db"),
-             "grade": {"chain": at.get("grade"), "eq": at.get("eq")} if at.get("clip") else None,
+             "audio_pre": round(float(at["audio"].get("pre", 0) or 0), 4),
+             "audio_post": round(float(at["audio"].get("post", 0) or 0), 4),
+             "grade": {"chain": at.get("grade"), "stops": at.get("stops"), "luma_lut": at.get("luma_lut"),
+                       "finish": ",".join(finish_chain(ctx)), "look": at.get("look")} if at.get("clip") else None,
+             "conform": at.get("conform"), "push": at.get("push"), "ramp": at.get("ramp"),
+             "transition_in": at.get("tr_in"), "teaser": bool(at.get("teaser")),
              "crop": [round(v, 4) for v in at["rect"]] if at.get("rect") else None,
              "captions": [{"t0": round(t0 + c["t0"], 3), "t1": round(t0 + c["t1"], 3), "text": c["text"],
-                           "position": c["position"]} for c in at["captions"]],
+                           "position": c["position"], "px": c.get("px"),
+                           "box": [round((c["x"] + c.get("pad", 0)) / ctx.W, 4), round((c["y"] + c.get("pad", 0)) / ctx.H, 4),
+                                   round(max(1, c.get("box_w", 0) - 2 * c.get("pad", 0)) / ctx.W, 4),
+                                   round(max(1, c.get("box_h", 0) - 2 * c.get("pad", 0)) / ctx.H, 4)]}
+                          for c in at["captions"]],
              "overlays": [{"kind": specs[o["spec"]]["kind"], "text": specs[o["spec"]]["text"],
                            "position": specs[o["spec"]]["position"], "t0": round(t0 + o["t0"], 3),
                            "t1": round(t0 + o["t1"], 3), "renderer": gfx[o["spec"]]["renderer"]} for o in at["overlays"]],
@@ -1375,7 +2362,16 @@ def sidecar(ctx, plan, plan_path, tl, segs, secs, specs, gfx, sfx, total_f, loud
             "code_version": CODE_VERSION, "render_seconds": round(secs_taken, 1),
             "font": ctx.font_pi[0], "lut": ctx.lut,
             "sections": [{"name": s["name"], "index": s["index"], "start": round(s["start"], 4), "end": round(s["end"], 4),
-                          "music": s["music"], "montage_cuts": s["montage_cuts"]} for s in secs],
+                          "music": {k: v for k, v in s["music"].items() if not k.startswith("_")} if s["music"] else None,
+                          "music_breaks": (s["music"] or {}).get("_breaks", []),
+                          "montage_cuts": s["montage_cuts"], "generated": s.get("generated")} for s in secs],
+            "transitions": getattr(ctx, "transitions", []), "talk_joins": getattr(ctx, "talk_joins", []),
+            "room_tone": (getattr(ctx, "bus_info", None) or {}).get("room_tone", []),
+            "voice_spans": (getattr(ctx, "bus_info", None) or {}).get("voice_spans", []),
+            "music_bed": (getattr(ctx, "bus_info", None) or {}).get("music", []),
+            "captions_style": {"size": int(ctx.style["captions"].get("size", P.CAPTION_SIZE_1080)),
+                               "px": max(10, int(round(int(ctx.style["captions"].get("size", P.CAPTION_SIZE_1080)) * ctx.H / 1080.0))),
+                               "position": ctx.style["captions"].get("position", "bottom")},
             "matchcuts": [{"section": r["sec"], "seg": r["seg"], "cut_at": r.get("match_t")} for r in segs if r["type"] == "matchcut"],
             "segments": rows, "sfx": sfx,
             "loudness": {"target": target, "measured_before": measured, "final": loud},
@@ -1433,6 +2429,10 @@ class _ResolveCtx(Ctx):
         if k not in self._warned:
             self._warned.add(k)
             self.warnings.append(msg)
+
+    def src_fps(self, row, src):                        # no ffprobe here: the library row's rate
+        f = float(row.get("fps") or 0) if row else 0.0
+        return _fps_q(f) if f > 0 else None
 
     def clip(self, ref):
         row = _cached_clip(self.cfg, self.con, ref)
@@ -1497,13 +2497,25 @@ def _invalid_placeholder(seg, err):
 def _expand_safe(ctx, plan):
     """expand + apply_layers; segments that cannot be expanded (missing clip, bad times) become
     placeholders of their estimated length so the rest of the timeline still resolves."""
-    sections = list(enumerate(plan["sections"]))
+    co = None
+    if plan.get("cold_open"):
+        try:
+            co = build_cold_open(ctx, plan)
+        except Exception as e:  # noqa: BLE001
+            ctx.warn(f"cold_open: {type(e).__name__}: {e}")
+    sections = ([(-1, co)] if co else []) + list(enumerate(plan["sections"]))
     try:
         tl, segs, secs = expand(ctx, sections)
         specs, sfx = apply_layers(ctx, tl, segs)
         return tl, segs, secs, specs, sfx
     except Exception:  # noqa: BLE001  - find the culprits one segment at a time
         pass
+    if co:
+        try:
+            expand(ctx, [(-1, co)])
+        except Exception as e:  # noqa: BLE001
+            ctx.warn(f"cold_open: {type(e).__name__}: {e}")
+            co = None
     fixed = json.loads(json.dumps(plan))
     for si, sec in enumerate(fixed["sections"]):
         mus = sec.get("music") or {}
@@ -1521,7 +2533,7 @@ def _expand_safe(ctx, plan):
             except Exception as e:  # noqa: BLE001
                 ctx.warn(f"section {si} segment {gi}: {type(e).__name__}: {e}")
                 sec["segments"][gi] = _invalid_placeholder(seg, e)
-    sections = list(enumerate(fixed["sections"]))
+    sections = ([(-1, co)] if co else []) + list(enumerate(fixed["sections"]))
     tl, segs, secs = expand(ctx, sections)
     specs, sfx = apply_layers(ctx, tl, segs)
     return tl, segs, secs, specs, sfx
@@ -1570,7 +2582,11 @@ def resolve_timeline(cfg, con, plan_dict, preview=True):
              "clip": row["id"] if row else None, "clip_rel": row["rel"] if row else None,
              "in": round(at["a"], 4) if row else None,
              "out": round(at["a"] + at["n"] / fps * at["speed"], 4) if row else None,
-             "speed": round(float(at["speed"] or 1.0), 4), "label": _seg_label(spec), "captions": [], "overlays": []}
+             "speed": round(float(at["speed"] or 1.0), 4), "label": _seg_label(spec), "captions": [], "overlays": [],
+             "look": at.get("look"), "transition_in": at.get("tr_in"), "push": at.get("push"), "ramp": at.get("ramp"),
+             "conform": at.get("conform"), "teaser": bool(at.get("teaser"))}
+        if at["sec"] == -1:
+            p["generated"] = "cold_open"
         if spec.get("_invalid"):
             p.update(kind="invalid", label=f"invalid: {spec['_invalid']}"[:160])
         if at["kind"] == "title":
@@ -1580,10 +2596,10 @@ def resolve_timeline(cfg, con, plan_dict, preview=True):
             p["out"] = p["in"]
         if at.get("cue_src") and cs.get("enabled", True):
             cid, a, b = at["cue_src"]
-            dur = at["n"] / fps
+            shift = float(at.get("cue_shift", 0.0))
             for c0, c1, text in asr.cues(asr.words(cfg, cid), a, b, max_words=int(cs.get("max_words", 5)),
                                          max_chars=int(cs.get("max_chars", 30)), fixes=fixes):
-                c1 = min(c1, dur)
+                c0, c1 = c0 - shift, c1 - shift          # heard time (J/L cuts can move a cue onto a neighbour)
                 if c1 - c0 >= 0.1:
                     p["captions"].append({"t0": round(t0 + c0, 3), "t1": round(t0 + c1, 3), "text": text})
         for o in at["overlays"]:
@@ -1596,11 +2612,15 @@ def resolve_timeline(cfg, con, plan_dict, preview=True):
         arow = au.get("clip")
         if au["mode"] != "none" and arow and arow.get("has_audio"):
             asp = float(au.get("speed", 1.0) or 1.0)
+            pre, post = float(au.get("pre", 0) or 0), float(au.get("post", 0) or 0)
             pieces.append({"id": f"A1:{seg_key[k]}.{sub}", "sec": at["sec"], "seg": at["seg"], "sub": sub,
-                           "type": at["type"], "kind": au["mode"], "track": "A1", "start": round(t0, 4),
-                           "end": round(t1, 4), "clip": arow["id"], "clip_rel": arow["rel"], "in": round(au["a"], 4),
-                           "out": round(au["a"] + at["n"] / fps * asp, 4), "speed": round(asp, 4),
-                           "label": Path(arow["rel"] or "").stem, "captions": [], "overlays": []})
+                           "type": at["type"], "kind": au["mode"], "track": "A1", "start": round(t0 - pre, 4),
+                           "end": round(t1 + post, 4), "clip": arow["id"], "clip_rel": arow["rel"],
+                           "in": round(au["a"] - pre * asp, 4),
+                           "out": round(au["a"] + (at["n"] / fps + post) * asp, 4), "speed": round(asp, 4),
+                           "lead_in": round(pre, 4) if pre > 0.03 else 0.0, "tail": round(post, 4) if post > 0.03 else 0.0,
+                           "label": Path(arow["rel"] or "").stem, "captions": [], "overlays": [],
+                           **({"generated": "cold_open"} if at["sec"] == -1 else {})})
     # V2: cutaways, merged back into one piece per cutaway where the atoms split it
     v2 = []
     for at in tl.atoms:
@@ -1617,7 +2637,8 @@ def resolve_timeline(cfg, con, plan_dict, preview=True):
                        "kind": "auto_cover" if c["auto"] else "cutaway", "track": "V2", "start": round(s0, 4),
                        "end": round(s1, 4), "clip": c["clip"]["id"], "clip_rel": c["clip"]["rel"],
                        "in": round(c["a"], 4), "out": round(c["a"] + (c["t1"] - c["t0"]), 4), "speed": 1.0,
-                       "label": Path(c["clip"]["rel"] or "").stem, "captions": [], "overlays": [], "auto": c["auto"]})
+                       "label": Path(c["clip"]["rel"] or "").stem, "captions": [], "overlays": [], "auto": c["auto"],
+                       "look": at.get("look"), **({"generated": "cold_open"} if at["sec"] == -1 else {})})
     count = {}
     for p in v2:
         k = (p["sec"], p["seg"])
@@ -1643,12 +2664,16 @@ def resolve_timeline(cfg, con, plan_dict, preview=True):
         m = s["music"]
         band = {"i": s["index"], "index": s["index"], "name": s["name"], "start": round(s["start"], 4),
                 "end": round(s["end"], 4), "music": None, "beats": []}
+        if s.get("generated"):
+            band["generated"] = s["generated"]
         if m:
             bs = [round(b, 4) for b in s["beats_tl"] if s["start"] - 1e-6 <= b <= s["end"] + 1e-6]
-            sng = ctx._songs.get((plan["sections"][s["index"]].get("music") or {}).get("song"), {})
+            msrc = (plan["sections"][s["index"]].get("music") or {}) if s["index"] >= 0 else {"song": m["song"]}
+            sng = ctx._songs.get(msrc.get("song"), {}) or next((v for v in ctx._songs.values() if v.get("path") == m["song"]), {})
             band["music"] = {"song": sng.get("id") or m["song"], "path": m["song"], "title": m.get("title"),
                              "offset": m["offset"], "gain_db": m["gain_db"], "mode": m["mode"],
-                             "beats_in_section": bs}
+                             "start": m.get("start"), "end": m.get("end"), "montage_gain_db": m.get("montage_gain_db"),
+                             "breaks": m.get("_breaks", []), "beats_in_section": bs}
             band["beats"] = bs
             beats_all += bs
             if s["end"] > s["start"]:
@@ -1673,8 +2698,11 @@ def resolve_timeline(cfg, con, plan_dict, preview=True):
         segrows.append(row)
     res = {"pieces": pieces, "segments": segrows, "sections": sections, "beats": beats_all,
            "duration": round(tl.F / fps, 4), "frames": tl.F, "fps": fps, "width": ctx.W, "height": ctx.H,
-           "sfx": [{"name": e["name"], "t": round(e["t"], 3), "gain_db": e["gain_db"]} for e in sfx],
-           "warnings": ctx.warnings, "hash": key}
+           "sfx": [{"name": e["name"], "t": round(e["t"], 3), "gain_db": e["gain_db"], "align": e.get("align", "start"),
+                    "on": e.get("on")} for e in sfx],
+           "transitions": getattr(ctx, "transitions", []), "talk_joins": getattr(ctx, "talk_joins", []),
+           "warnings": ctx.warnings, "hash": key,
+           "look": LK.effective(ctx.style["grade"].get("look"), None)}
     with _RESOLVE_LOCK:
         if len(_RESOLVE_CACHE) >= _RESOLVE_MAX:
             _RESOLVE_CACHE.pop(next(iter(_RESOLVE_CACHE)))

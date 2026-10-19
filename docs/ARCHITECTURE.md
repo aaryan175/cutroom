@@ -12,6 +12,7 @@ footage (read-only)
    │  asr.py      word-timestamp transcripts (+ tighten, cues)      │  governor.py (slots, memory caps,
    │  music.py    beats/drops, music bed with ducking, sfx          │  disk floor) and media.py (ffmpeg)
    │  matchcuts.py match-cut candidates                             │
+   │  reference.py reference videos measured frame by frame         │
    │  overnight.py runs all of the above + AI tagging, supervised  ─┘
    ▼
 library.db (db.py schema) ── tags.py search/describe ── agent.py (Claude Code / Codex bridge)
@@ -34,13 +35,18 @@ board.py (simple phone review page)
 | `db.py` | SQLite schema, `TAG_FIELDS` | new per-clip data (add a table or column with `CREATE ... IF NOT EXISTS` / guarded `ALTER`) |
 | `media.py` | every ffmpeg/ffprobe call, hardware encoder choice | never call ffmpeg directly elsewhere; use `media.ffmpeg()` so the governor and logs apply |
 | `governor.py` | resource safety (slots, memory caps, disk floor, throttling) | new heavy work: wrap it in `gov.slot("heavy")` or run it via `gov.run()` |
-| `ingest.py` / `analyze.py` | indexing stages | new per-clip analysis (add a stage, make it resumable via a status/column) |
+| `ingest.py` / `analyze.py` | indexing stages; analyze.py also holds the scale detectors (duplicates, highlights, shoots/places, best takes, the tagging gate) in their own tables | new per-clip analysis (add a stage, make it resumable via a status/column) |
 | `asr.py` | transcripts, `tighten`, caption `cues`, director-cue/repeat finders | caption splitting, new speech heuristics |
 | `music.py` | beats, drops, beat-snapping, music bed, built-in SFX | new music behaviour (e.g. stems, crossfades) |
 | `plan.py` | plan schema, defaults, validation | **any new edit feature starts here**: add the field or segment type, default and validation |
 | `render.py` | plan → video; `resolve_timeline` for the UI | implementing a new segment type, effect or transition |
 | `captions.py` / `overlays.py` | caption and card rendering | new caption styles or graphic cards (keep them minimal; see EDITING_RULES) |
 | `qa.py` | automated checks on renders | every new failure the creator catches should become a check here |
+| `looks.py` | colour looks: built-in filter chains scaled by intensity, user `.cube` LUTs (blended with identity), frame previews, colour stats + reference matching | a new look (add a BUILTIN entry: curves / colour balance / eq / vignette + a CSS approximation) |
+| `reference.py` | reference videos: cut map, pacing, sections, beat sync, captions, loudness; `compare` against a render | a new thing creators match by (measure it in `assemble`, add a row + gap in `compare_analyses`) |
+| `export.py` | deliverables: platform presets, face-tracked reframes (9:16 / 4:5 / 1:1), .srt/.vtt, chapters, thumbnail candidates, cutdown plans | a new platform (add a PRESETS entry: size, rate, loudness, safe area) or a new deliverable |
+| `estimate.py` | `cutroom estimate`: time and disk projection from measured stage speeds (`overnight/rates.json`) | a new overnight stage (add a row in `project()`) |
+| `imports.py` | Studio Import: streaming uploads, finding dropped files on disk, linking footage folders into the library | a new kind of thing creators drop in (add a kind + its follow-up job) |
 | `studio.py` | Studio HTTP API, plan ops, jobs, SSE, chat bridge | new UI actions (add an op or route, document it in `docs/STUDIO.md`) |
 | `agent.py` | Claude Code / Codex CLI bridge | a new AI agent CLI |
 | `studio_web/` | the editor UI (no build step) | UI features; keep the plain ES modules and no CDNs |

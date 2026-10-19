@@ -335,7 +335,8 @@ function renderDaysNow() {
     const isOpen = days.open.has(k);
     const sec = h('div.day' + (isOpen ? '.open' : ''));
     const head = h('button.day-h', h('span.chev', { html: icon('chev', 12) }), h('span.t', dayLabel(k)),
-      h('span.n', `${count} clip${count !== 1 ? 's' : ''} · ${dur(total)}`));
+      h('span.n', `${count} clip${count !== 1 ? 's' : ''} · ${dur(total)}` + (m && m.sessions && m.sessions.length > 1 ? ` · ${m.sessions.length} shoots` : '')));
+    if (m && m.sessions && m.sessions.length > 1) head.title = m.sessions.map((x) => `shoot ${x.session}: ${x.start}–${x.end} · ${x.clips} clips${x.place ? ` · place ${x.place}` : ''}`).join('\n');
     head.onclick = () => { if (days.open.has(k)) days.open.delete(k); else { days.open.add(k); loadDay(k); } LS.set('daysOpen', [...days.open].slice(-50)); renderDaysNow(); };
     sec.appendChild(head);
     if (isOpen) {
@@ -415,7 +416,7 @@ let playingSong = null;
 function buildSongs(pane) {
   const songs = (S.project && S.project.songs) || [];
   const list = h('div.list-plain');
-  if (!songs.length) list.appendChild(h('div.empty', h('span', { html: icon('music') }), h('h4', 'No songs indexed'), h('p', 'Point the project at a music folder and run cutroom songs index.')));
+  if (!songs.length) list.appendChild(h('div.empty', h('span', { html: icon('music') }), h('h4', 'No songs indexed'), h('p', 'Drop a song anywhere in the window (or Import → Song). Its tempo and beats are found for you.')));
   for (const s of songs) {
     const btn = h('button.ib', { title: 'Preview', html: icon(playingSong === s.id ? 'pause' : 'play') });
     btn.onclick = () => {
@@ -461,7 +462,7 @@ function buildPlans(pane) {
 function buildRenders(pane) {
   const rs = ((S.project && S.project.renders) || []).slice().sort((a, b) => (b.created || 0) - (a.created || 0));
   const list = h('div.list-plain');
-  if (!rs.length) list.appendChild(h('div.empty', h('span', { html: icon('render') }), h('h4', 'No renders yet'), h('p', 'Commit a version (⌘S), then Render preview in the toolbar.')));
+  if (!rs.length) list.appendChild(h('div.empty', h('span', { html: icon('render') }), h('h4', 'No renders yet'), h('p', 'Save a version (⌘S), then Render preview in the toolbar.')));
   for (const r of rs) {
     const qa = r.qa_status || (r.qa ? 'qa' : null);
     list.appendChild(h('div.lrow',
@@ -504,5 +505,6 @@ export function initProject(el) {
   on('bins', () => { if (current === 'picks') showTab('picks'); });
   on('openBin', (name) => { pendingBin = name; t.set('picks'); });
   on('binsChanged', loadBins);
+  on('libraryChanged', () => { if (scroller) resetLib(); });    // an Import finished indexing
   loadBins();
 }

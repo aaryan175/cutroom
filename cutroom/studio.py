@@ -7,8 +7,10 @@ stdlib only (ThreadingHTTPServer). What lives where:
   <work>/plans/<slug>_v<N>.json         committed versions (render always renders one of these)
   <work>/plans/.history/<slug>/         undo/redo snapshots + index.json
   <work>/studio/context.json            pointing state posted by the frontend (+ draft_path)
-  <work>/studio/markers.json            markers  [{id, plan, t, text, frame_url, status, kind, ...}]
-  <work>/studio/grabs/  markers/        frame grabs (chat attachments) and marker frames
+  <work>/studio/markers.json            review comments (a.k.a. markers) [{id, plan, t, t_end?, text, frame_url,
+                                        frame_raw_url?, drawing?, status, kind, author, thread[]}]
+  <work>/studio/grabs/  markers/        frame grabs (chat attachments, annotated comment frames) and marker frames
+  <work>/frames/looks/                  look previews (one frame in each look, cached)
   <work>/studio/chat.json               Claude session id; chat_history.jsonl the transcript
   <work>/frames/thumbs/ frames/studio/  cached thumbnails (from proxies) and full-res frames
 
@@ -22,6 +24,7 @@ import contextlib
 import copy
 import fcntl
 import json
+import math
 import mimetypes
 import os
 import queue
@@ -295,15 +298,104 @@ def markers_update(cfg, fn):
         return res
 
 
-def marker_set_status(cfg, mid, status="done"):
+COMMENT_STATUSES = ("open", "working", "done", "needs_you")
+DRAW_TOOLS = ("arrow", "box", "circle", "pen")
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def marker_set_status(cfg, mid, status="done", reply=None, author="ai"):
+    """Set a comment's status (open / working / done / needs_you); `reply` is appended to its thread."""
+    if status not in COMMENT_STATUSES:
+        raise ValueError(f"status must be one of {', '.join(COMMENT_STATUSES)}")
+
     def f(data):
         for m in data:
             if m.get("id") == mid:
                 m["status"] = status
                 m["updated"] = time.time()
+                if reply and str(reply).strip():
+                    m.setdefault("thread", []).append({"author": author, "text": str(reply).strip()[:4000],
+                                                       "ts": time.time(), "status": status})
                 return m
-        raise KeyError(f"no marker {mid!r}")
+        raise KeyError(f"no comment {mid!r}")
     return markers_update(cfg, f)
+
+
+def clean_drawing(drawing):
+    """Validate the strokes drawn on a comment's frame: [{tool, points: [[x, y], ...] (0-1), color}]."""
+    if drawing in (None, ""):
+        return []
+    if not isinstance(drawing, list) or len(drawing) > 60:
+        raise ApiError(400, "drawing must be a list of at most 60 strokes")
+    out = []
+    for st in drawing:
+        if not isinstance(st, dict) or st.get("tool") not in DRAW_TOOLS:
+            raise ApiError(400, f"each stroke needs tool: {'/'.join(DRAW_TOOLS)}")
+        pts = st.get("points")
+        if not isinstance(pts, list) or not pts or len(pts) > 4000:
+            raise ApiError(400, "each stroke needs 1-4000 points")
+        try:
+            pts = [[round(min(1.0, max(0.0, float(x))), 4), round(min(1.0, max(0.0, float(y))), 4)] for x, y in pts]
+        except (TypeError, ValueError):
+            raise ApiError(400, "points must be [x, y] pairs from 0 to 1") from None
+        if st["tool"] != "pen" and len(pts) < 2:
+            raise ApiError(400, f"a {st['tool']} needs a start and an end point")
+        col = str(st.get("color") or "#ff3b30")
+        out.append({"tool": st["tool"], "points": pts if st["tool"] == "pen" else [pts[0], pts[-1]],
+                    "color": col if HEX_RE.match(col) else "#ff3b30"})
+    return out
+
+
+def annotate_frame(src, drawing, out):
+    """Composite the comment's drawing onto its frame (what the AI looks at). Returns out."""
+    from PIL import Image, ImageDraw
+    im = Image.open(src).convert("RGB")
+    W, H = im.size
+    lw = max(3, int(round(W * 0.0055)))
+    d = ImageDraw.Draw(im)
+
+    def rgb(c):
+        return tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+    for st in drawing:
+        P = [(x * W, y * H) for x, y in st["points"]]
+        col = rgb(st["color"])
+        for w, c in ((lw + 4, (0, 0, 0)), (lw, col)):              # dark halo, then the colour
+            if st["tool"] == "pen":
+                if len(P) == 1:
+                    r = w / 2
+                    d.ellipse([P[0][0] - r, P[0][1] - r, P[0][0] + r, P[0][1] + r], fill=c)
+                else:
+                    d.line(P, fill=c, width=w, joint="curve")
+            elif st["tool"] in ("box", "circle"):
+                (x0, y0), (x1, y1) = P[0], P[-1]
+                box = [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+                (d.rectangle if st["tool"] == "box" else d.ellipse)(box, outline=c, width=w)
+            else:                                                      # arrow: shaft + filled head at the end
+                (x0, y0), (x1, y1) = P[0], P[-1]
+                ang = math.atan2(y1 - y0, x1 - x0)
+                head = max(lw * 4.5, 14)
+                bx, by = x1 - math.cos(ang) * head * 0.8, y1 - math.sin(ang) * head * 0.8
+                d.line([(x0, y0), (bx, by)], fill=c, width=w)
+                pts = [(x1, y1), (x1 - head * math.cos(ang - 0.45), y1 - head * math.sin(ang - 0.45)),
+                       (x1 - head * math.cos(ang + 0.45), y1 - head * math.sin(ang + 0.45))]
+                if w > lw:
+                    cx, cy = sum(p[0] for p in pts) / 3, sum(p[1] for p in pts) / 3
+                    pts = [(cx + (px - cx) * 1.25, cy + (py - cy) * 1.25) for px, py in pts]
+                d.polygon(pts, fill=c)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(out).with_name(f".{Path(out).stem}.{threading.get_ident()}.tmp.jpg")
+    im.save(tmp, "JPEG", quality=90)
+    os.replace(tmp, out)
+    return Path(out)
+
+
+def drawing_words(drawing):
+    """'a circle and an arrow' for the prompt."""
+    names = {"arrow": "an arrow", "box": "a box", "circle": "a circle", "pen": "a pen mark"}
+    ws = [names[s["tool"]] for s in drawing or []]
+    if not ws:
+        return ""
+    return ws[0] if len(ws) == 1 else ", ".join(ws[:-1]) + " and " + ws[-1]
 
 
 # ================================================================================================ project CLAUDE.md
@@ -321,8 +413,9 @@ def ensure_project_claude(cfg):
              "- `studio/context.json` says what the creator is pointing at (playhead, selection, source In/Out) and\n"
              "  `draft_path`, the plan draft open in the editor. Edit that draft file in place; the studio reloads\n"
              "  it on save and keeps your edit undoable. Do not create `_vN.json` files unless asked to commit.\n"
-             "- Markers are in `studio/markers.json`. \"Fix all open markers\" = read every open marker for the plan,\n"
-             "  make each change in the draft, then `cutroom markers done <id>` for each one you handled.\n"
+             "- Review comments are in `studio/markers.json`: one change per comment, then\n"
+             "  `cutroom comments done <id> --reply \"<what changed, with a [[t:<seconds>]] chip>\"`, or\n"
+             "  `cutroom comments needs <id> --reply \"Needs you: <question>\"` when it is ambiguous.\n"
              "- Use the `cutroom` CLI for everything (search, say, frames, plan check, render, qa).\n")
     try:
         text = md.read_text() if md.exists() else ""
@@ -382,7 +475,7 @@ def agents_md_block(repo=None, studio_note=True):
              f"Read `{repo / 'CLAUDE.md'}` and the skills in `{repo / '.claude/skills'}/*/SKILL.md` before acting. "
              "`CLAUDE.md` is the operating manual for this edit room; it applies to you exactly as written, even "
              "where it says \"Claude\". Load the skill that matches the step you are on (indexing, tagging, "
-             "planning, render-and-qa, review-loop).",
+             "planning, render-and-qa, review-loop, reference-matching).",
              f"When the creator asks for something the tool cannot do yet, extend cutroom itself: follow "
              f"`{repo / 'docs/ARCHITECTURE.md'}` and the `extending-cutroom` skill "
              f"(`{repo / '.claude/skills/extending-cutroom/SKILL.md'}`).",
@@ -527,6 +620,8 @@ class PlanStore:
 
     def version_files(self, slug):
         out = []
+        saved_by = _read_json(self.hist_dir(slug) / "versions.json", {}) if slug and SLUG_RE.match(slug) else {}
+        saved_by = saved_by if isinstance(saved_by, dict) else {}
         for e in os.scandir(self.dir):
             c = self.classify(e.name)
             if not c or c[0] != slug or c[1] == "draft" or not e.is_file():
@@ -536,7 +631,7 @@ class PlanStore:
                 d = _read_json(e.path, {})
                 v = d.get("version") if isinstance(d, dict) else None
             out.append({"file": e.name, "path": f"plans/{e.name}", "version": v, "kind": c[1],
-                        "mtime": e.stat().st_mtime})
+                        "mtime": e.stat().st_mtime, "by": (saved_by.get(e.name) or {}).get("by")})
         out.sort(key=lambda x: (x["version"] if isinstance(x["version"], (int, float)) else -1, x["mtime"]))
         return out
 
@@ -631,7 +726,28 @@ class PlanStore:
             st = out.stat()
             self.own[str(out)] = (st.st_mtime_ns, st.st_size)
             self.write_draft(slug, plan)
+            self.note_version(slug, name, "you")                                # "Save version" = the creator
             return name, plan
+
+    def note_version(self, slug, name, by):
+        """Remember who saved a version file (versions.json next to the undo history); first writer wins."""
+        if not SLUG_RE.match(slug or ""):
+            return
+        with self.lock(slug):
+            log = _read_json(self.hist_dir(slug) / "versions.json", {})
+            log = log if isinstance(log, dict) else {}
+            if name not in log:
+                log[name] = {"by": by, "t": time.time()}
+                _atomic_write(self.hist_dir(slug) / "versions.json", json.dumps(log))
+
+    def saved_state(self, slug, plan):
+        """{latest, version, dirty}: is the draft different from the newest saved version (ignoring `version`)?"""
+        vs = [v for v in self.version_files(slug) if v["kind"] == "version"]
+        if not vs:
+            return {"latest": None, "version": None, "dirty": True}
+        d = _read_json(self.dir / vs[-1]["file"], {})
+        bare = lambda x: {k: v for k, v in x.items() if k != "version"} if isinstance(x, dict) else x   # noqa: E731
+        return {"latest": vs[-1]["file"], "version": vs[-1]["version"], "dirty": _canon(bare(d)) != _canon(bare(plan))}
 
     # -- history ----------------------------------------------------------------------------------
     def _hidx(self, slug):
@@ -695,6 +811,26 @@ class PlanStore:
             self._hsave(slug, idx)
             self.write_draft(slug, plan, push=False)
             return plan
+
+    def squash_since(self, slug, pos0):
+        """Record the draft as it is now and fold every history step after `pos0` into one (so one review
+        comment's edits are one undo step). Returns True when the draft changed."""
+        with self.lock(slug):
+            self.sync(slug)
+            idx = self._hidx(slug)
+            if idx["pos"] <= pos0:
+                return False
+            hd = self.hist_dir(slug)
+            keep = idx["ids"][idx["pos"]]
+            drop = [i for i in idx["ids"][pos0 + 1:idx["pos"]]]
+            for i in drop:
+                (hd / f"{i}.json").unlink(missing_ok=True)
+            idx["ids"] = idx["ids"][:pos0 + 1] + [keep] + idx["ids"][idx["pos"] + 1:]
+            idx["pos"] = pos0 + 1
+            self._hsave(slug, idx)
+            base = _read_json(hd / f"{idx['ids'][pos0]}.json") if pos0 >= 0 else None
+            cur = _read_json(hd / f"{keep}.json")
+            return base is None or _canon(base) != _canon(cur)
 
     def history_info(self, slug):
         idx = self._hidx(slug)
@@ -1295,6 +1431,11 @@ tool_summary = agentmod._tool_summary
 _result_text = agentmod._result_text
 
 
+def hashlib_sha(obj, n=10):
+    import hashlib
+    return hashlib.sha1(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:n]
+
+
 def _short(v, n=160):
     s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
     s = " ".join(s.split())
@@ -1428,9 +1569,11 @@ class ChatBridge:
                   and (not slug or not m.get("plan") or m.get("plan") == slug)]
         except Exception:  # noqa: BLE001
             ms = []
+        if ctx.get("comment"):                       # a review-comment turn is about that one comment only
+            ms = []
         if ms:
-            lines.append(f"- Open markers ({len(ms)}; full list in `studio/markers.json`, mark handled ones with "
-                         f"`cutroom markers done <id>`):")
+            lines.append(f"- Open review comments ({len(ms)}; full list in `studio/markers.json`, mark handled ones with "
+                         f"`cutroom comments done <id> --reply \"...\"`):")
             for m in ms[:20]:
                 fr = self.s.media_url_to_path(m.get("frame_url") or "")
                 lines.append(f"  - {m['id']} @ {float(m.get('t', 0)):.2f}s [{m.get('kind', 'note')}]: "
@@ -1452,7 +1595,7 @@ class ChatBridge:
         a = self.agent if (self.agent and self.agent.path == binary) else agentmod.ClaudeAgent(binary)
         return a.chat_cmd(sid, self.s.cfg.work, REPO, images)
 
-    def run(self, message, attachments, context, emit):
+    def run(self, message, attachments, context, emit, display=None):
         """Run one chat turn; emit(dict) is called for every event (it may raise if the client left:
         the turn still runs to completion so the session and history stay consistent)."""
         client = {"ok": True}
@@ -1485,21 +1628,21 @@ class ChatBridge:
                 raise ApiError(409, f"{ag.label} is already working on a message; stop it first")
             self.busy, self.stopped, self.proc, self.agent = True, False, None, ag
         try:
-            self._turn(message, attachments, context, send, ag)
+            self._turn(message, attachments, context, send, ag, display)
         finally:
             with self.lock:
                 self.busy, self.proc = False, None
 
-    def _turn(self, message, attachments, context, send, ag):
+    def _turn(self, message, attachments, context, send, ag, display=None):
         if isinstance(context, dict) and context:
             self.s.save_context(context)
         prompt, bad = self.compose(message, context, attachments)
         images, _ = self.attachment_paths(attachments)
         if bad:
             send({"type": "warning", "text": f"attachments not found: {bad}"})
-        self._hist({"role": "user", "text": str(message), "attachments": attachments or [], "context": context or {},
-                    "agent": ag.name})
-        job = self.s.jobs.add(Job("chat", [ag.path], title=_short(message, 60), meta={"agent": ag.name}))
+        self._hist({"role": "user", "text": str(display or message), "attachments": attachments or [], "context": context or {},
+                    "agent": ag.name, **({"comment": context.get("comment")} if isinstance(context, dict) and context.get("comment") else {})})
+        job = self.s.jobs.add(Job("chat", [ag.path], title=_short(display or message, 60), meta={"agent": ag.name}))
         job.status, job.started, job.stage = "running", time.time(), "thinking"
         self.job = job
         self.s.jobs.emit(job, True)
@@ -1630,12 +1773,219 @@ class ChatBridge:
                 acc["err"] = ev.get("error") or "error"
 
 
+# ================================================================================================ review comments
+class CommentRunner:
+    """"Send open comments to AI": one chat turn per comment, in timeline order, like a real review.
+
+    Each turn gets that comment's text, timecode (and range), the segment under it and its annotated
+    frame; the AI makes the one change and marks the comment done with a short reply
+    (`cutroom comments done <id> --reply ...`), or says "Needs you: <question>". Whatever the AI did to
+    the draft during one comment is squashed into ONE undo step, so a single comment's change can be
+    undone. Stop finishes the current comment and leaves the rest open. Progress goes out on SSE
+    `comments`."""
+
+    def __init__(self, studio):
+        self.s = studio
+        self.lock = threading.Lock()
+        self.thread = None
+        self.state = self._idle()
+
+    @staticmethod
+    def _idle():
+        return {"running": False, "plan": None, "queue": [], "current": None, "index": 0, "total": 0,
+                "done": [], "results": [], "stop_requested": False, "started": None, "ended": None, "error": None}
+
+    def status(self):
+        with self.lock:
+            return copy.deepcopy(self.state)
+
+    def _emit(self, **ev):
+        st = self.status()
+        self.s.bus.publish("comments", {**ev, "run": st})
+
+    def start(self, plan, ids=None, all_open=False):
+        if not plan or not SLUG_RE.match(str(plan)):
+            raise ApiError(400, "plan is required")
+        ms = [m for m in markers_load(self.s.cfg) if m.get("plan") == plan or (not m.get("plan"))]
+        if all_open or not ids:
+            pick = [m for m in ms if m.get("status", "open") == "open" and m.get("kind", "note") == "note"]
+        else:
+            want = list(dict.fromkeys(str(i) for i in ids))
+            byid = {m["id"]: m for m in ms}
+            missing = [i for i in want if i not in byid]
+            if missing:
+                raise ApiError(404, f"no comment {missing[0]}")
+            pick = [byid[i] for i in want]
+        pick.sort(key=lambda m: float(m.get("t") or 0))
+        pick = [m for m in pick if str(m.get("text") or "").strip() or m.get("drawing")]
+        if not pick:
+            raise ApiError(409, "no open comments with a note or a drawing to send")
+        with self.lock:
+            if self.state["running"]:
+                raise ApiError(409, "the AI is already working through comments; stop it first")
+            if self.s.chat.running():
+                raise ApiError(409, "the AI is busy with a chat message; wait for it or stop it first")
+            self.state = {**self._idle(), "running": True, "plan": plan, "queue": [m["id"] for m in pick],
+                          "total": len(pick), "started": time.time()}
+        for m in pick:                                        # queued comments show as queued at once
+            try:
+                marker_set_status(self.s.cfg, m["id"], "open")
+            except KeyError:
+                pass
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="comment-runner")
+        self.thread.start()
+        self._emit(type="start")
+        return self.status()
+
+    def stop(self):
+        with self.lock:
+            if not self.state["running"]:
+                return False
+            self.state["stop_requested"] = True
+        self._emit(type="stopping")
+        return True
+
+    def _loop(self):
+        try:
+            k = 0
+            while True:
+                with self.lock:
+                    if self.state["stop_requested"] or not self.state["queue"]:
+                        break
+                    mid = self.state["queue"].pop(0)
+                    k += 1
+                    self.state.update(current=mid, index=k)
+                self._one(mid, k)
+                with self.lock:
+                    self.state["done"].append(mid)
+                    self.state["current"] = None
+        except Exception as e:  # noqa: BLE001
+            with self.lock:
+                self.state["error"] = f"{type(e).__name__}: {e}"
+            sys.stderr.write(f"studio: comment runner: {traceback.format_exc()}\n")
+        finally:
+            with self.lock:
+                self.state.update(running=False, current=None, ended=time.time())
+                left = list(self.state["queue"])
+            self._emit(type="end", left=left)
+
+    def prompt(self, m, k, n):
+        t = float(m.get("t") or 0)
+        rng = ""
+        if m.get("t_end") is not None and float(m["t_end"]) > t + 0.04:
+            rng = f" to {float(m['t_end']):.2f}s ({_mmss(float(m['t_end']))})"
+        lines = [f"Review comment {k} of {n} (comment id `{m['id']}`), at {t:.2f}s ({_mmss(t)}){rng} on the timeline:",
+                 f"\"{str(m.get('text') or '').strip() or '(no words: look at what they drew on the frame)'}\""]
+        if m.get("drawing"):
+            lines.append(f"The creator drew {drawing_words(m['drawing'])} on the frame; the attached frame shows exactly "
+                         "what they marked. Open it before you change anything.")
+        if rng:
+            lines.append("The comment covers that whole range (\"from here to here\").")
+        try:
+            tl = self.s.resolve(self.s.plans.read_draft(m["plan"])) if m.get("plan") else None
+        except Exception:  # noqa: BLE001
+            tl = None
+        if tl and rng:
+            from .render import locate
+            a, b = locate(tl, t), locate(tl, float(m["t_end"]) - 1e-3)
+            if a and b:
+                lines.append(f"Segments in the range: [{a['sec']}, {a['seg']}] to [{b['sec']}, {b['seg']}].")
+        for th in (m.get("thread") or [])[-6:]:
+            lines.append(f"Earlier in this thread, {'you' if th.get('author') == 'ai' else 'the creator'} said: "
+                         f"\"{_short(th.get('text', ''), 300)}\"")
+        lines += ["",
+                  "Make exactly this one change in the draft, nothing else (one change per comment). Then run "
+                  f"`cutroom comments done {m['id']} --reply \"<one or two plain sentences: what you changed, with a "
+                  "[[t:<seconds>]] chip where it is>\"`.",
+                  "If the note is ambiguous or you cannot do it, do not guess: run "
+                  f"`cutroom comments needs {m['id']} --reply \"Needs you: <one short question>\"` and change nothing."]
+        return "\n".join(lines)
+
+    def _one(self, mid, k):
+        st = self.s
+        m = next((x for x in markers_load(st.cfg) if x.get("id") == mid), None)
+        if m is None:
+            return
+        n = self.state["total"]
+        slug = m.get("plan") or self.state["plan"]
+        marker_set_status(st.cfg, mid, "working")
+        self._emit(type="working", id=mid, index=k, total=n)
+        pos0 = None
+        if slug and st.plans.draft_path(slug).exists():
+            with st.plans.lock(slug):
+                st.plans.sync(slug)
+                pos0 = st.plans.history_info(slug)["pos"]
+        acc = {"text": [], "final": None}
+
+        def emit(ev):
+            if ev.get("type") == "text":
+                acc["text"].append(ev.get("text") or "")
+            elif ev.get("type") in ("done", "error"):
+                acc["final"] = ev
+            self.s.bus.publish("comments", {"type": "chat", "id": mid, "event": ev})
+        ctx = {"plan": slug, "playhead": float(m.get("t") or 0), "selection": [], "comment": mid}
+        atts = [m["frame_url"]] if m.get("frame_url") else []
+        err = None
+        try:
+            label = f"Comment {k} of {n} at {_mmss(float(m.get('t') or 0))}: {str(m.get('text') or '').strip() or '(drawing)'}"
+            st.chat.run(self.prompt(m, k, n), atts, ctx, emit, display=label)
+        except ApiError as e:
+            err = e.msg
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"
+        fin = acc["final"] or {}
+        if fin.get("type") == "error":
+            err = err or fin.get("error") or "the AI turn failed"
+        squashed = False
+        if slug and pos0 is not None:
+            try:
+                squashed = st.plans.squash_since(slug, pos0)
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"studio: squash after comment {mid}: {e}\n")
+        text = "".join(acc["text"]).strip()
+        cur = next((x for x in markers_load(st.cfg) if x.get("id") == mid), None) or {}
+        stopped = bool(fin.get("stopped"))
+        if cur.get("status") in ("done", "needs_you"):          # the AI marked it itself (CLI), reply attached
+            status = cur["status"]
+        elif stopped:
+            status = "open"
+            marker_set_status(st.cfg, mid, "open")
+        elif err:
+            status = "needs_you"
+            marker_set_status(st.cfg, mid, status, reply=f"Couldn't finish this one: {_short(err, 300)}")
+        else:
+            needs = bool(re.search(r"\bneeds you\b", text, re.I)) or (text.rstrip().endswith("?") and not squashed)
+            status = "needs_you" if needs else "done"
+            marker_set_status(st.cfg, mid, status, reply=reply_of(text) or ("Done." if status == "done" else None))
+        with self.lock:
+            self.state["results"].append({"id": mid, "status": status, "changed": squashed, "error": err})
+        st.bus.publish("markers", {"updated": next((x for x in markers_load(st.cfg) if x.get("id") == mid), None)})
+        self._emit(type="result", id=mid, status=status, changed=squashed, index=k, total=n)
+
+
+def reply_of(text, limit=600):
+    """The AI's short reply for a comment thread: its last paragraph(s), at most `limit` characters."""
+    text = re.sub(r"```.*?(```|$)", "", str(text or ""), flags=re.S).strip()
+    if not text:
+        return ""
+    k = text.lower().rfind("needs you:")
+    if k >= 0:                                    # the question is the reply
+        text = text[k:]
+        text = "Needs you:" + text[len("needs you:"):]
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    out = paras[-1] if paras else text
+    if len(out) < 40 and len(paras) > 1 and k < 0:
+        out = paras[-2] + "\n\n" + out
+    return out if len(out) <= limit else "…" + out[-(limit - 1):]
+
+
 # ================================================================================================ the app
 class Studio:
     def __init__(self, cfg):
         self.cfg = cfg
         self.work = Path(cfg.work)
-        for d in ("studio", "studio/grabs", "studio/markers", "frames/thumbs", "frames/studio", "renders/reference"):
+        for d in ("studio", "studio/grabs", "studio/markers", "frames/thumbs", "frames/studio", "frames/looks",
+                  "renders/reference"):
             (self.work / d).mkdir(parents=True, exist_ok=True)
         self.stopping = threading.Event()
         self.bus = Bus()
@@ -1643,6 +1993,7 @@ class Studio:
         self.plans = PlanStore(self)
         self.jobs = Jobs(self)
         self.chat = ChatBridge(self)
+        self.comments = CommentRunner(self)
         self._klocks = {}
         self._klock = threading.Lock()
         ensure_project_claude(cfg)
@@ -1675,6 +2026,7 @@ class Studio:
 
     def close(self):
         self.stopping.set()
+        self.comments.stop()
         self.chat.stop()
         self.jobs.stop_all()
         self.pool.close()
@@ -1709,6 +2061,10 @@ class Studio:
                "draft_path": str(self.plans.draft_path(slug)),
                "version_files": self.plans.version_files(slug), "history": hist,
                "can_undo": hist["can_undo"], "can_redo": hist["can_redo"]}
+        try:
+            out["saved"] = self.plans.saved_state(slug, plan)
+        except Exception:  # noqa: BLE001
+            out["saved"] = None
         try:
             out["timeline"] = self.resolve(plan)
         except Exception as e:  # noqa: BLE001
@@ -1749,6 +2105,74 @@ class Studio:
             if work.resolve() in p.parents:
                 return p
         return None
+
+    def annotate_comment(self, m):
+        """m["frame_url"] = its raw frame with the drawing composited (studio/grabs/), for the AI to see."""
+        raw = self.media_url_to_path(m.get("frame_raw_url") or "")
+        if not raw or not Path(raw).is_file():
+            return m
+        if not m.get("drawing"):
+            m["frame_url"] = m["frame_raw_url"]
+            return m
+        name = f"comment_{m['id']}_{hashlib_sha(m['drawing'])}.jpg"
+        out = self.work / "studio" / "grabs" / name
+        if not out.exists():
+            annotate_frame(raw, m["drawing"], out)
+        m["frame_url"] = f"/media/grab/{quote(name)}"
+        return m
+
+    # -- references ----------------------------------------------------------------------------------
+    def ref_row(self, m):
+        """The list row the Reference panel shows for one reference (reference.py meta + URLs)."""
+        rid = m["id"]
+        d = self.work / "refs" / rid
+        q = quote(rid)
+        origin = str(m.get("origin") or "")
+        ref_folder = str((self.work / "renders" / "reference").resolve())
+        job = next((j for j in self.jobs.jobs.values() if j.kind == "ref" and j.status in ("queued", "running")
+                    and j.meta.get("ref") == rid), None)
+        return {"id": rid, "title": m.get("title") or rid, "status": m.get("status"), "stage": m.get("stage"),
+                "progress": m.get("progress"), "error": m.get("error"), "duration": m.get("duration"),
+                "fps": m.get("fps"), "width": m.get("width"), "height": m.get("height"), "url": m.get("url"),
+                "origin": "link" if m.get("url") else ("reference folder" if origin.startswith(ref_folder) else "file"),
+                "file": Path(origin).name if origin and not m.get("url") else None,
+                "summary": m.get("summary"), "added": m.get("added"), "job": job.id if job else None,
+                "thumb": f"/media/refthumb/{q}/0" if (d / "thumbs" / "s0000.jpg").exists() else None,
+                "proxy_url": f"/media/refproxy/{q}" if ((d / "proxy.mp4").exists() or m.get("source")) else None}
+
+    def ref_job(self, cmd, title, meta):
+        """Run `cutroom ref ...` as a job; its progress lines become `job` and `ref` SSE events."""
+        rx = re.compile(r"^ref-progress (\S+) ([\d.]+) ([^:]*):?\s*(.*)$")
+        rx_id = re.compile(r"^ref ([0-9a-f]{6,40}): ")
+
+        def parse(job, line):
+            m = rx.match(line.strip())
+            if m:
+                rid, frac, stage, msg = m.group(1), float(m.group(2)), m.group(3).strip(), m.group(4)
+                if rid != "-":
+                    job.meta["ref"] = rid
+                job.progress, job.stage = max(job.progress, frac), f"{stage}{': ' + msg if msg else ''}"[:120]
+                self.bus.publish("ref", {"id": job.meta.get("ref"), "status": "analyzing", "stage": stage,
+                                         "progress": round(frac, 3), "message": msg, "job": job.id})
+                return
+            m = rx_id.match(line.strip())
+            if m:
+                job.meta["ref"] = m.group(1)
+                job.stage = line.strip()[:120]
+
+        def done(job):
+            rid = job.meta.get("ref")
+            row = {"id": rid, "job": job.id, "status": "error" if job.status != "done" else "done", "error": job.error}
+            if rid:
+                try:
+                    from . import reference as R
+                    row.update(self.ref_row(R.load_meta(self.cfg, rid)))
+                    row["job"] = job.id
+                except Exception:  # noqa: BLE001
+                    pass
+            job.result = rid
+            self.bus.publish("ref", row)
+        return self.jobs.submit("ref", cmd, title=title, parse=parse, on_done=done, lane="ref", meta=dict(meta))
 
     # -- frames ---------------------------------------------------------------------------------------
     def clip_row(self, cid):
@@ -1816,8 +2240,9 @@ class Studio:
         img.save(out, "JPEG", quality=88)
         return out
 
-    def grab(self, source, t, clip=None, file=None, plan=None, dest="grabs", w=1280):
-        """Save a frame jpg into studio/<dest>/ and return (path, url)."""
+    def grab(self, source, t, clip=None, file=None, plan=None, dest="grabs", w=1280, ref=None):
+        """Save a frame jpg into studio/<dest>/ and return (path, url). source=ref takes `ref` (an id from the
+        reference engine) or `file` (a video in renders/reference/)."""
         t = _f(t, "t")
         root = self.work / "studio" / dest
         stamp = f"{int(time.time() * 1000) % 10**10:010d}"
@@ -1826,6 +2251,18 @@ class Studio:
                 raise ApiError(400, "clip is required for source=clip")
             src = self.frame(clip, t, w)
             name = f"clip_{Path(src).stem}_{stamp}.jpg"
+        elif source == "ref" and ref:
+            from . import reference as R
+            try:
+                rid = R.resolve_id(self.cfg, ref)
+            except KeyError as e:
+                raise ApiError(404, str(e).strip("'\"")) from None
+            p = R.ref_dir(self.cfg, rid) / "proxy.mp4"
+            p = p if p.is_file() else R.source_path(self.cfg, rid)
+            if not p:
+                raise ApiError(404, f"reference {rid} has no video yet")
+            src = self._extract(Path(p), t, self.work / "frames" / "studio" / f"ref_{rid}_{int(t * 1000):09d}_{w}.jpg", w, 2)
+            name = f"ref_{rid}_{stamp}.jpg"
         elif source == "ref":
             p = _within(self.work / "renders" / "reference", file or "")
             if not p or not p.is_file():
@@ -1892,6 +2329,8 @@ class Studio:
                               "source": "studio" if own else "external", "by": "hand" if own else "claude",
                               "deleted": path not in cur,
                               "mtime": (cur.get(path) or (0,))[0] / 1e9}
+                        if c[1] == "version" and not own and path in cur and path not in seen:
+                            self.plans.note_version(c[0], name, "ai")        # a version the AI (or anyone) wrote
                         if c[1] == "draft" and not own and path in cur:
                             try:
                                 self.plans.sync(c[0])
@@ -2043,7 +2482,7 @@ class Handler(BaseHTTPRequestHandler):
         path = u.path
         self._raw = None
         try:
-            if method != "GET":
+            if method != "GET" and path != "/api/upload":          # uploads stream their body to disk
                 self._read_raw()
             for m, rx, fn in ROUTES:
                 if m != method:
@@ -2144,7 +2583,10 @@ class Handler(BaseHTTPRequestHandler):
                              max_shake=num("max_shake"), min_quality=num("min_quality"), speech=speech,
                              creator=bool(flag("creator")), min_dur=num("min_dur"),
                              offset=int(num("offset") or 0), limit=int(num("limit") or 200),
-                             day=q.get("day") or None)
+                             day=q.get("day") or None, highlights=bool(flag("highlights")),
+                             dedupe=bool(flag("dedupe")),
+                             session=int(num("session")) if num("session") is not None else None,
+                             near=q.get("near") or None)
         for r in res["rows"]:
             r["thumb"] = f"/media/thumb/{r['id']}"
             r["proxy_url"] = f"/media/proxy/{r['id']}" if r["has_proxy"] else None
@@ -2288,7 +2730,7 @@ class Handler(BaseHTTPRequestHandler):
         errs = st.validate(st.plans.open(slug))
         body = self._body()
         if errs and not (isinstance(body, dict) and body.get("force")):
-            raise ApiError(422, "draft has problems; fix them before committing (or force: true)", errors=errs)
+            raise ApiError(422, "draft has problems; fix them before saving a version (or force: true)", errors=errs)
         name, plan = st.plans.commit(slug)
         self._json({"name": name, "file": f"plans/{name}", "version": plan["version"], "slug": slug})
 
@@ -2319,7 +2761,7 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body() or {}
         p = self._plan_file(body.get("plan_file"))
         if p.name.endswith(".draft.json") and not body.get("allow_draft"):
-            raise ApiError(409, "render a committed version (commit the draft first), or pass allow_draft: true")
+            raise ApiError(409, "render a saved version (Save version first), or pass allow_draft: true")
         preview = bool(body.get("preview", True))
         cmd = _cli_cmd("render", p, *(["--preview"] if preview else []),
                        *(["--only", str(body["only"])] if body.get("only") else []))
@@ -2359,6 +2801,61 @@ class Handler(BaseHTTPRequestHandler):
                             qa_html=f"/media/render/{quote(rel(qh))}" if qh.exists() else None)
             st.bus.publish("qa_done", {"job": job.id, "video": rel(v), **job.meta})
         job = st.jobs.submit("qa", cmd, title=f"qa {v.name}", parse=_parse_qa, on_done=done, meta={"video": v.name})
+        self._json({"job": job.id, "status": job.status})
+
+    def api_export(self):
+        """Deliverables (cutroom/export.py) as a job: {video: "renders/x.mp4" | plan_file, preset: "reels" |
+        [..] | "all", cutdown: [15, 30, 60], thumbs: bool, captions: bool}. Outputs land in
+        renders/exports/<stem>/; the `export_done` event lists them."""
+        st = self.studio
+        body = self._body() or {}
+        if body.get("video"):
+            target = _within(st.work / "renders", str(body["video"]).removeprefix("renders/"))
+            if not target or not target.is_file():
+                raise ApiError(404, f"no render {body.get('video')!r}")
+        elif body.get("plan_file"):
+            target = self._plan_file(body["plan_file"])
+        else:
+            raise ApiError(400, "pass video (a render) or plan_file")
+        presets = body.get("preset") or []
+        presets = [presets] if isinstance(presets, str) else list(presets)
+        from . import export as EX
+        try:
+            EX.preset_names(presets)
+        except ValueError as e:
+            raise ApiError(400, str(e)) from None
+        cuts = [str(float(x)) for x in (body.get("cutdown") or [])]
+        args = ["export", target]
+        for pr in presets:
+            args += ["--preset", pr]
+        if cuts:
+            args += ["--cutdown", ",".join(cuts)]
+        if body.get("thumbs"):
+            args.append("--thumbs")
+        if body.get("captions") is False:
+            args.append("--no-captions")
+        cmd = _cli_cmd(*args)
+        stem = target.stem
+
+        def parse(job, line):
+            s_ = line.strip()
+            if s_.startswith(("export:", "cutdown:")):
+                job.stage = s_[:100]
+                job.progress = min(0.95, job.progress + 0.08)
+
+        def done(job):
+            d = st.work / "renders" / "exports" / stem
+            man = _read_json(d / "export.json", {}) or {}
+            files = []
+            for f in sorted(d.rglob("*")) if d.exists() else []:
+                if f.is_file() and not f.name.startswith(".") and f.suffix in (".mp4", ".srt", ".vtt", ".txt", ".jpg", ".json"):
+                    rel = f.relative_to(st.work / "renders").as_posix()
+                    files.append({"file": rel, "url": f"/media/render/{quote(rel)}"})
+            job.meta.update(dir=f"renders/exports/{stem}", files=files, warnings=man.get("warnings", []))
+            st.bus.publish("export_done", {"job": job.id, "dir": job.meta["dir"], "files": files,
+                                           "warnings": job.meta["warnings"]})
+        job = st.jobs.submit("export", cmd, title=f"export {target.name} ({', '.join(presets) or 'files'})",
+                             parse=parse, on_done=done, meta={"target": target.name, "presets": presets})
         self._json({"job": job.id, "status": job.status})
 
     def api_jobs(self):
@@ -2446,7 +2943,15 @@ class Handler(BaseHTTPRequestHandler):
         if kind not in ("note", "ref"):
             raise ApiError(400, "kind must be note or ref")
         m = {"id": uuid.uuid4().hex[:8], "plan": plan, "t": round(t, 3), "text": str(body.get("text") or "")[:4000],
-             "status": "open", "kind": kind, "created": time.time(), "frame_url": None}
+             "status": "open", "kind": kind, "created": time.time(), "frame_url": None,
+             "author": str(body.get("author") or "you")[:40], "thread": []}
+        if body.get("t_end") is not None:
+            te = _f(body["t_end"], "t_end")
+            if te > t + 0.02:
+                m["t_end"] = round(te, 3)
+        drawing = clean_drawing(body.get("drawing"))
+        if drawing:
+            m["drawing"] = drawing
         for k in ("render", "clip", "seg"):
             if body.get(k) is not None:
                 m[k] = body[k]
@@ -2462,6 +2967,10 @@ class Handler(BaseHTTPRequestHandler):
                     _, m["frame_url"] = st.grab("program", t, plan=plan, dest="markers")
             except Exception as e:  # noqa: BLE001
                 m["frame_error"] = str(getattr(e, "msg", e))[:300]
+        if m["frame_url"]:
+            m["frame_raw_url"] = m["frame_url"]
+            if drawing:
+                st.annotate_comment(m)
         markers_update(st.cfg, lambda data: data.append(m))
         st.bus.publish("markers", {"created": m})
         self._json(m)
@@ -2473,18 +2982,54 @@ class Handler(BaseHTTPRequestHandler):
         if not mid:
             raise ApiError(400, "marker id required")
 
+        drawing = clean_drawing(body["drawing"]) if "drawing" in body else None
+        reply = body.get("reply")
+        if reply is not None and (not isinstance(reply, dict) or not str(reply.get("text") or "").strip()):
+            raise ApiError(400, "reply must be {text, author?}")
+
         def f(data):
             for m in data:
                 if m.get("id") == mid:
-                    for k in ("text", "status", "t", "kind", "plan", "frame_url"):
+                    for k in ("text", "status", "t", "t_end", "kind", "plan", "frame_url", "author"):
                         if k in body:
-                            if k == "status" and body[k] not in ("open", "done"):
-                                raise ApiError(400, "status must be open or done")
-                            m[k] = round(_f(body[k], "t"), 3) if k == "t" else body[k]
+                            if k == "status" and body[k] not in COMMENT_STATUSES:
+                                raise ApiError(400, f"status must be one of {', '.join(COMMENT_STATUSES)}")
+                            if k == "t_end" and body[k] is None:
+                                m.pop("t_end", None)
+                                continue
+                            m[k] = round(_f(body[k], k), 3) if k in ("t", "t_end") else body[k]
+                    if body.get("thread") is not None:
+                        k_thread = body["thread"]
+                        if not isinstance(k_thread, list):
+                            raise ApiError(400, "thread must be a list")
+                        m["thread"] = [{"author": str(x.get("author") or "you")[:40], "text": str(x.get("text") or "")[:4000],
+                                        "ts": x.get("ts") or time.time()} for x in k_thread if isinstance(x, dict)]
+                    if reply:
+                        m.setdefault("thread", []).append({"author": str(reply.get("author") or "you")[:40],
+                                                           "text": str(reply["text"]).strip()[:4000], "ts": time.time()})
+                    if drawing is not None:
+                        m["drawing"] = drawing
+                        if m.get("frame_raw_url"):
+                            st.annotate_comment(m)
                     m["updated"] = time.time()
                     return m
             raise ApiError(404, f"no marker {mid}")
         m = markers_update(st.cfg, f)
+        if "t" in body and not body.get("frame_url") and m.get("kind", "note") == "note" and m.get("plan"):
+            try:                                           # the comment moved: its frame follows
+                _, raw = st.grab("program", float(m["t"]), plan=m["plan"], dest="markers")
+                fresh = dict(m, frame_raw_url=raw)
+                st.annotate_comment(fresh)
+
+                def g(data):
+                    for x in data:
+                        if x.get("id") == mid:
+                            x.update(frame_raw_url=fresh["frame_raw_url"], frame_url=fresh["frame_url"])
+                            return x
+                    return m
+                m = markers_update(st.cfg, g)
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"studio: regrab for comment {mid}: {e}\n")
         st.bus.publish("markers", {"updated": m})
         self._json(m)
 
@@ -2503,10 +3048,147 @@ class Handler(BaseHTTPRequestHandler):
         st.bus.publish("markers", {"deleted": mid})
         self._json({"ok": True, "deleted": mid})
 
+    # -- review comments run queue ---------------------------------------------------------------------------------
+    def api_comments_run(self):
+        body = self._body() or {}
+        st = self.studio.comments.start(body.get("plan") or self.q.get("plan"), ids=body.get("ids"),
+                                        all_open=bool(body.get("all_open")))
+        self._json(st)
+
+    def api_comments_stop(self):
+        self._json({"stopping": self.studio.comments.stop(), **self.studio.comments.status()})
+
+    def api_comments_status(self):
+        self._json(self.studio.comments.status())
+
+    # -- looks (cutroom/looks.py) ----------------------------------------------------------------------------------
+    def _look_frame(self):
+        """(clip, source t, plan style, where) from ?clip=&t= or ?plan=&t= (timeline time)."""
+        st = self.studio
+        q = self.q
+        style = None
+        slug = q.get("plan")
+        if slug:
+            if not SLUG_RE.match(slug):
+                raise ApiError(400, "bad plan slug")
+            plan = st.plans.open(slug)
+            style = plan.get("style") or {}
+        if q.get("clip"):
+            return q["clip"], _f(q.get("t", 0), "t"), style, None
+        if not slug:
+            raise ApiError(400, "pass ?clip=<id>&t=<source s> or ?plan=<slug>&t=<timeline s>")
+        from .render import locate
+        t = _f(q.get("t", 0), "t")
+        tl = st.resolve(plan)
+        loc = locate(tl, t, "V2")
+        if not (loc and loc["piece"]["start"] - 1e-6 <= t < loc["piece"]["end"]):
+            loc = locate(tl, t)
+        if not loc or not loc.get("clip") or loc.get("src_t") is None:
+            raise ApiError(409, "no picture at that moment (title or black); move the playhead onto a shot")
+        return loc["clip"], loc["src_t"], style, {"sec": loc["sec"], "seg": loc["seg"], "t": t}
+
+    def _look_previews(self, clip, t, lks, style):
+        from . import looks as LK
+        st = self.studio
+        cfg = st.cfg
+
+        def run(args):
+            with light_slot(cfg, label="look previews"):
+                from . import media
+                media.ffmpeg(cfg, args, timeout=180)
+        with st.keylock(f"looks:{clip}:{round(t, 2)}"), st.pool.get() as con:
+            try:
+                return LK.previews(cfg, con, clip, t, lks, plan_style=style, run=run)
+            except KeyError as e:
+                raise ApiError(404, str(e).strip("'\"")) from None
+            except LK.LookError as e:
+                raise ApiError(400, str(e)) from None
+
+    @staticmethod
+    def _look_q(name, k):
+        from . import looks as LK
+        try:
+            k = 1.0 if k in (None, "") else float(k)
+        except ValueError:
+            raise ApiError(400, "intensity must be a number") from None
+        if k > 1.0:
+            k = k / 100.0                                   # 0-100 % also accepted
+        try:
+            return LK.normalize_look({"name": name or "natural", "intensity": max(0.0, min(1.0, k))})
+        except LK.LookError as e:
+            raise ApiError(400, str(e)) from None
+
+    def api_looks(self):
+        from . import looks as LK
+        st = self.studio
+        self._json({"looks": LK.catalogue(st.cfg), "luts_dir": str(LK.luts_dir(st.cfg))})
+
+    def api_looks_preview(self):
+        clip, t, style, _ = self._look_frame()
+        lk = self._look_q(self.q.get("look"), self.q.get("intensity"))
+        (p,) = self._look_previews(clip, t, [lk], style)
+        self._file(p, cache="max-age=3600")
+
+    def api_looks_sheet(self):
+        from . import looks as LK
+        st = self.studio
+        clip, t, style, where = self._look_frame()
+        k = self.q.get("intensity")
+        cat = LK.catalogue(st.cfg)
+        lks = [self._look_q(c["name"], k) for c in cat]
+        paths = self._look_previews(clip, t, lks, style)
+        items = [{"name": c["name"], "label": c["label"], "kind": c["kind"], "desc": c["desc"], "css": c["css"],
+                  "intensity": lk["intensity"], "url": f"/media/look/{quote(p.name)}"}
+                 for c, lk, p in zip(cat, lks, paths)]
+        self._json({"clip": clip, "t": round(t, 3), "where": where, "items": items,
+                    "before_url": items[0]["url"] if items else None})
+
+    def api_looks_match(self):
+        """Nearest built-in look (+ intensity) to a reference's colour (overall or one section)."""
+        from . import looks as LK
+        from . import reference as R
+        st = self.studio
+        rid = self._ref_id(self.q.get("ref") or "")
+        an = R._jload(R.ref_dir(st.cfg, rid) / "analysis.json")
+        if not an or not an.get("colour"):
+            raise ApiError(409, f"reference {rid} is not analyzed yet", ref=rid)
+        col = an["colour"]
+        target, scope = col.get("overall"), "whole reference"
+        if self.q.get("section") not in (None, ""):
+            sec = next((x for x in col.get("by_section") or [] if str(x.get("i")) == str(self.q["section"])), None)
+            if sec:
+                target, scope = sec, f"section {sec.get('name') or sec.get('i')}"
+        if not target or any(target.get(k) is None for k in ("luma", "contrast", "sat", "warmth")):
+            raise ApiError(409, "the reference has no colour measurements")
+        clip, t, style, where = self._look_frame()
+        names = [b["name"] for b in LK.BUILTIN]
+        paths = self._look_previews(clip, t, [{"name": n, "intensity": 1.0} for n in names], style)
+        stats = {n: LK.image_stats(p) for n, p in zip(names, paths)}
+        res = LK.match(stats["natural"], {n: v for n, v in stats.items() if n != "natural"}, target)
+        (pv,) = self._look_previews(clip, t, [{"name": res["name"], "intensity": res["intensity"]}], style)
+        thumb = None
+        shots = an.get("shots") or []
+        if shots:
+            mid = shots[len(shots) // 2]
+            if scope != "whole reference":
+                inside = [x for x in shots if str(x.get("section")) == str(self.q.get("section"))]
+                mid = inside[len(inside) // 2] if inside else mid
+            if mid.get("thumb"):
+                thumb = f"/media/refthumb/{quote(rid)}/{mid['i']}"
+        self._json({"ref": rid, "scope": scope, "target": {k: target[k] for k in ("luma", "contrast", "sat", "warmth")},
+                    "yours": stats["natural"], "pick": {"name": res["name"], "label": LK.label_of(res["name"]),
+                                                       "intensity": res["intensity"]},
+                    "distance": res["distance"], "base_distance": res["base_distance"], "ranked": res["ranked"][:5],
+                    "preview_url": f"/media/look/{quote(pv.name)}", "before_url": f"/media/look/{quote(paths[0].name)}",
+                    "ref_thumb": thumb, "clip": clip, "t": round(t, 3), "where": where})
+
+    def media_look(self, rel):
+        self._file(_within(self.studio.work / "frames" / "looks", rel), cache="max-age=3600")
+
     def api_grab(self):
         body = self._body() or {}
         src = body.get("source", "program")
-        path, url = self.studio.grab(src, body.get("t", 0), clip=body.get("clip"),
+        path, url = self.studio.grab(src, body.get("t", 0), clip=body.get("clip"), ref=body.get("ref"),
                                      file=body.get("file"), plan=body.get("plan"), w=int(_f(body.get("w", 1280), "w")))
         self._json({"url": url, "path": str(path), "source": src, "t": body.get("t", 0)})
 
@@ -2583,6 +3265,279 @@ class Handler(BaseHTTPRequestHandler):
         ch.new()
         self._json({"ok": True, "session_id": None})
 
+    # -- references (cutroom/reference.py, docs/STUDIO.md "Reference engine") -------------------------------------
+    def _ref_id(self, rid):
+        from . import reference as R
+        try:
+            return R.resolve_id(self.studio.cfg, rid)
+        except KeyError as e:
+            raise ApiError(404, str(e).strip("'\"")) from None
+
+    def api_refs(self):
+        from . import reference as R
+        st = self.studio
+        try:
+            R.sync_reference_folder(st.cfg)          # renders/reference/* show up as references (linked, not copied)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"studio: reference folder sync failed: {e}\n")
+        self._json({"refs": [st.ref_row(m) for m in R.list_refs(st.cfg)]})
+
+    def api_refs_post(self):
+        from . import reference as R
+        st = self.studio
+        body = self._body() or {}
+        src = str(body.get("src") or body.get("url") or body.get("file") or "").strip()
+        if not src:
+            raise ApiError(400, "src is required: a link (needs yt-dlp) or a video file path")
+        link = False
+        if R.is_url(src) and not shutil.which("yt-dlp"):
+            from .imports import YTDLP_INSTALL
+            raise ApiError(424, "adding a reference from a link needs yt-dlp, which is not installed",
+                           install=YTDLP_INSTALL)
+        if not R.is_url(src):
+            if src.startswith(("/media/ref/", "renders/reference/")):          # a file in the Reference tab folder
+                p = _within(st.work / "renders" / "reference", unquote(src.split("/reference/", 1)[-1].split("/ref/", 1)[-1]))
+            elif Path(src).expanduser().is_absolute():
+                p = Path(src).expanduser()
+            else:
+                p = _within(st.work, src)
+            if not p or not Path(p).is_file():
+                raise ApiError(404, f"no video file at {src!r}")
+            src = str(p)
+            link = (st.work / "refs" / "_incoming").resolve() in Path(src).resolve().parents   # an upload: no 2nd copy
+        title = str(body.get("title") or "").strip()
+        args = ["ref", "add", src] + (["--title", title] if title else []) + (["--link"] if link else []) + \
+            (["--no-analyze"] if body.get("analyze") is False else [])
+        job = st.ref_job(_cli_cmd(*args), f"reference {title or Path(src).name}"[:120], {"src": src})
+        self._json({"job": job.id, "status": job.status})
+
+    def api_ref_analyze(self, rid):
+        st = self.studio
+        rid = self._ref_id(rid)
+        body = self._body() or {}
+        job = st.ref_job(_cli_cmd("ref", "analyze", rid, *(["--force"] if body.get("force") else [])),
+                         f"analyze reference {rid}", {"ref": rid})
+        self._json({"job": job.id, "status": job.status, "ref": rid})
+
+    def api_ref(self, rid):
+        from . import reference as R
+        st = self.studio
+        rid = self._ref_id(rid)
+        m = R.load_meta(st.cfg, rid)
+        an = R._jload(R.ref_dir(st.cfg, rid) / "analysis.json") if m.get("status") == "analyzed" else None
+        out = st.ref_row(m)
+        out["meta"] = m
+        out["analysis"] = an
+        if an:
+            q = quote(rid)
+            out["thumbs"] = [f"/media/refthumb/{q}/{s['i']}" if s.get("thumb") else None for s in an["shots"]]
+            out["sheets"] = [f"/media/refsheet/{q}/{k + 1}" for k in range(len(an.get("sheets") or []))]
+            out["cutmap"] = R.cutmap_rows(an)
+        self._json(out)
+
+    def media_refthumb(self, rid, n):
+        from . import reference as R
+        rid = self._ref_id(rid)
+        try:
+            k = int(n)
+        except ValueError:
+            raise ApiError(400, "shot number must be an integer") from None
+        self._file(R.ref_dir(self.studio.cfg, rid) / "thumbs" / f"s{k:04d}.jpg", cache="max-age=3600")
+
+    def media_refsheet(self, rid, n):
+        from . import reference as R
+        rid = self._ref_id(rid)
+        try:
+            k = int(n)
+        except ValueError:
+            raise ApiError(400, "sheet number must be an integer") from None
+        self._file(R.ref_dir(self.studio.cfg, rid) / f"sheet_{k:03d}.jpg", cache="no-cache")
+
+    def media_refproxy(self, rid):
+        from . import reference as R
+        rid = self._ref_id(rid)
+        d = R.ref_dir(self.studio.cfg, rid)
+        p = d / "proxy.mp4"
+        if not p.is_file():
+            p = R.source_path(self.studio.cfg, rid)
+        self._file(p and Path(p).resolve())
+
+    def api_ref_compare(self, rid):
+        from . import reference as R
+        st = self.studio
+        rid = self._ref_id(rid)
+        if not (R.ref_dir(st.cfg, rid) / "analysis.json").exists():
+            raise ApiError(409, f"reference {rid} is not analyzed yet", ref=rid)
+        render, slug = self.q.get("render"), self.q.get("plan")
+        if render:
+            v = _within(st.work / "renders", render.removeprefix("renders/").removeprefix("/media/render/"))
+            if not v or not v.is_file():
+                raise ApiError(404, f"no render {render!r}")
+        elif slug:
+            if not SLUG_RE.match(slug):
+                raise ApiError(400, "bad plan slug")
+            v = R.latest_render_for_plan(st.cfg, slug)
+        else:
+            raise ApiError(400, "pass ?plan=<slug> or ?render=<file in renders/>")
+        if v is not None:
+            res = R.compare(st.cfg, rid, v, echo=lambda *_: None)
+            try:
+                res["render"] = v.resolve().relative_to((st.work / "renders").resolve()).as_posix()
+            except ValueError:                      # a render outside this project (moved / copied project)
+                res["render"] = v.name
+            res["render_url"] = f"/media/render/{quote(res['render'])}"
+        else:
+            plan = st.plans.open(slug)
+            tl = st.resolve(plan)
+            norm = P.normalize(plan, st.cfg)
+            out_h = (norm.get("output") or {}).get("height") or st.cfg.out_height
+            res = R.compare(st.cfg, rid, {**tl, "label": f"{slug} (draft timeline, not rendered)"},
+                            style=norm.get("style"), out_h=out_h)
+            res["render"] = None
+        res["plan"] = slug
+        self._json(res)
+
+    # -- import (cutroom/imports.py, docs/STUDIO.md "Import") ------------------------------------------------------
+    def api_upload(self):
+        """POST /api/upload?kind=reference|song|image|footage-link&name=<file>[&id=<hex>&offset=<n>&final=0|1&total=<n>]
+        Body = the bytes (Content-Length or chunked), streamed straight to disk. Big files come in pieces with the
+        same id; each piece must start where the last one ended (409 + received otherwise)."""
+        from . import imports as I
+        st = self.studio
+        q = self.q
+        try:
+            kind = q.get("kind", "")
+            d = I.dest_dir(st.cfg, kind)
+            name = I.safe_name(q.get("name"), I.KINDS[kind]["exts"])
+            uid = q.get("id") or uuid.uuid4().hex[:16]
+            part = I.part_path(d, uid)
+            offset = int(q.get("offset") or 0)
+            final = str(q.get("final", "1")) not in ("0", "false", "")
+            total = int(q.get("total") or 0)
+            limit = I.KINDS[kind]["max"]
+            if total > limit:
+                raise I.UploadError(413, f"file is too large (max {limit / 1024 ** 3:.1f} GB for {kind})")
+            with st.keylock("upload:" + uid):
+                have = part.stat().st_size if part.exists() else 0
+                if offset != have:
+                    self.close_connection = True
+                    raise ApiError(409, "upload piece out of order", received=have, id=uid)
+                if offset == 0:
+                    I.sweep_stale(d)
+                cl = int(self.headers.get("Content-Length") or 0)
+                I.check_disk(st.cfg, d, max(total - offset, cl))
+                try:
+                    with open(part, "ab") as fh:
+                        n = I.read_body(self.rfile, self.headers, fh.write, limit - offset)
+                except I.UploadError:
+                    self.close_connection = True
+                    raise
+                size = offset + n
+                if not final:
+                    return self._json({"id": uid, "kind": kind, "received": size, "done": False})
+                if total and size != total:
+                    raise ApiError(409, f"upload incomplete: {size} of {total} bytes", received=size, id=uid)
+                out = I.unique_path(d, name)
+                os.replace(part, out)
+        except I.UploadError as e:
+            self.close_connection = True
+            raise ApiError(e.code, e.msg) from None
+        except ValueError:
+            self.close_connection = True
+            raise ApiError(400, "offset and total must be integers") from None
+        res = {"id": uid, "kind": kind, "name": out.name, "path": str(out), "size": out.stat().st_size, "done": True}
+        if kind == "image":
+            res["url"] = f"/media/image/{quote(out.name)}"
+        elif kind == "song":
+            job = st.jobs.submit("songs", _cli_cmd("songs", "index"), title=f"add song {out.stem}"[:120], lane="songs",
+                                 meta={"file": out.name})
+            res["job"] = job.id
+        elif kind == "footage-link":
+            I.add_roots(st.cfg, [str(d.resolve())])
+            res["job"] = self._index_job([str(out.resolve())], f"import {out.name}").id
+        self._json(res)
+
+    def api_upload_status(self, uid):
+        from . import imports as I
+        try:
+            part = I.part_path(I.dest_dir(self.studio.cfg, self.q.get("kind", "")), uid)
+        except I.UploadError as e:
+            raise ApiError(e.code, e.msg) from None
+        self._json({"id": uid, "received": part.stat().st_size if part.exists() else 0})
+
+    def media_image(self, rel):
+        self._file(_within(self.studio.work / "studio" / "images", rel), cache="max-age=3600")
+
+    def api_import_info(self):
+        from . import imports as I
+        self._json({"ytdlp": bool(shutil.which("yt-dlp")), "ytdlp_install": I.YTDLP_INSTALL,
+                    "kinds": {k: {"max": v["max"], "exts": sorted(v["exts"])} for k, v in I.KINDS.items()},
+                    "library_roots": len(self.studio.cfg.library_roots)})
+
+    def api_import_locate(self):
+        """{files: [{name, size}], folder?} -> {files: [{name, size, path|null, clip|null, in_library}]}"""
+        from . import imports as I
+        body = self._body() or {}
+        files = body.get("files") if isinstance(body.get("files"), list) else []
+        if len(files) > 500:
+            raise ApiError(400, "at most 500 files at a time")
+        with self.studio.pool.get() as con:
+            got = I.locate(self.studio.cfg, con, files, folder=body.get("folder"))
+        self._json({"files": got, "found": sum(1 for g in got if g["path"]), "total": len(got)})
+
+    def _index_job(self, files, title):
+        st = self.studio
+        lst = st.work / "studio" / "imports" / f"{uuid.uuid4().hex[:10]}.txt"
+        lst.parent.mkdir(parents=True, exist_ok=True)
+        lst.write_text("\n".join(files) + "\n")
+        steps = {"probe": (0.05, "reading files"), "proxies": (0.15, "making previews"),
+                 "sheets": (0.6, "contact sheets"), "analyze": (0.75, "finding shots")}
+
+        def parse(job, line):
+            s_ = line.strip()
+            if s_.startswith("index-step "):
+                job.progress, job.stage = steps.get(s_[11:], (job.progress, s_[11:]))
+            elif s_.startswith(("proxies ", "analyze ")) and "/" in s_:
+                m = re.match(r"(proxies|analyze) (\d+)/(\d+)", s_)
+                if m:
+                    a, b = (0.15, 0.6) if m.group(1) == "proxies" else (0.75, 0.98)
+                    job.progress = a + (b - a) * int(m.group(2)) / max(1, int(m.group(3)))
+
+        def done(job):
+            st.bus.publish("library_changed", {"job": job.id, "n": len(files), "status": job.status})
+        return st.jobs.submit("import", _cli_cmd("index", "--files-from", lst), title=title[:120], parse=parse,
+                              on_done=done, lane="import", meta={"files": len(files)})
+
+    def api_import_footage(self):
+        """{paths: [file or folder, ...], folder?} -> footage is linked, never copied: a folder outside the library
+        becomes a library root, then just those files are indexed as a job."""
+        from . import imports as I
+        st = self.studio
+        body = self._body() or {}
+        paths = body.get("paths") if isinstance(body.get("paths"), list) else []
+        if not paths and not body.get("folder"):
+            raise ApiError(400, "paths (files or folders) are required")
+        plan = I.plan_footage(st.cfg, [str(x) for x in paths][:5000], folder=body.get("folder"))
+        if not plan["files"]:
+            raise ApiError(422, "nothing to add" + (f": {plan['skipped'][0]['why']}" if plan["skipped"] else ""),
+                           skipped=plan["skipped"])
+        I.add_roots(st.cfg, plan["roots_new"])
+        n = len(plan["files"])
+        job = self._index_job(plan["files"], f"import {n} clip{'s' if n != 1 else ''}")
+        self._json({"job": job.id, "files": n, "roots_added": len(plan["roots_new"]), "skipped": plan["skipped"]})
+
+    def api_plan_version(self, slug, name):
+        """A saved version's plan JSON (for Restore / Compare with draft)."""
+        st = self.studio
+        st.plans.check_slug(slug)
+        c = PlanStore.classify(name)
+        if not c or c[0] != slug or c[1] == "draft":
+            raise ApiError(404, f"no saved version {name!r} of {slug}")
+        d = _read_json(st.plans.dir / name, None)
+        if not isinstance(d, dict):
+            raise ApiError(404, f"no saved version {name!r} of {slug}")
+        self._json({"file": name, "plan": d})
+
 
 def _r(method, pattern, fn):
     return method, re.compile(pattern), fn
@@ -2614,6 +3569,7 @@ ROUTES = [
     _r("POST", rf"/api/plan/{ID}/commit", Handler.api_plan_commit),
     _r("POST", r"/api/render", Handler.api_render),
     _r("POST", r"/api/qa", Handler.api_qa),
+    _r("POST", r"/api/export", Handler.api_export),
     _r("GET", r"/api/jobs", Handler.api_jobs),
     _r("GET", rf"/api/jobs/{ID}", Handler.api_job),
     _r("POST", rf"/api/jobs/{ID}/stop", Handler.api_job_stop),
@@ -2624,6 +3580,14 @@ ROUTES = [
     _r("PATCH", rf"/api/markers/{ID}", Handler.api_marker_patch),
     _r("DELETE", r"/api/markers", Handler.api_marker_delete),
     _r("DELETE", rf"/api/markers/{ID}", Handler.api_marker_delete),
+    _r("POST", r"/api/comments/run", Handler.api_comments_run),
+    _r("GET", r"/api/comments/run", Handler.api_comments_status),
+    _r("POST", r"/api/comments/stop", Handler.api_comments_stop),
+    _r("GET", r"/api/looks", Handler.api_looks),
+    _r("GET", r"/api/looks/preview", Handler.api_looks_preview),
+    _r("GET", r"/api/looks/sheet", Handler.api_looks_sheet),
+    _r("GET", r"/api/looks/match", Handler.api_looks_match),
+    _r("GET", rf"/media/look/{REST}", Handler.media_look),
     _r("POST", r"/api/grab", Handler.api_grab),
     _r("POST", r"/api/context", Handler.api_context),
     _r("GET", r"/api/context", Handler.api_context_get),
@@ -2637,6 +3601,21 @@ ROUTES = [
     _r("POST", r"/api/chat/new", Handler.api_chat_new),
     _r("GET", r"/api/governor", Handler.api_governor),
     _r("POST", r"/api/overnight", Handler.api_overnight),
+    _r("GET", r"/api/refs", Handler.api_refs),
+    _r("POST", r"/api/refs", Handler.api_refs_post),
+    _r("GET", rf"/api/ref/{ID}", Handler.api_ref),
+    _r("POST", rf"/api/ref/{ID}/analyze", Handler.api_ref_analyze),
+    _r("GET", rf"/api/ref/{ID}/compare", Handler.api_ref_compare),
+    _r("GET", rf"/media/refthumb/{ID}/(\d+)", Handler.media_refthumb),
+    _r("GET", rf"/media/refsheet/{ID}/(\d+)", Handler.media_refsheet),
+    _r("GET", rf"/media/refproxy/{ID}", Handler.media_refproxy),
+    _r("POST", r"/api/upload", Handler.api_upload),
+    _r("GET", rf"/api/upload/{ID}", Handler.api_upload_status),
+    _r("GET", rf"/media/image/{REST}", Handler.media_image),
+    _r("GET", r"/api/import", Handler.api_import_info),
+    _r("POST", r"/api/import/locate", Handler.api_import_locate),
+    _r("POST", r"/api/import/footage", Handler.api_import_footage),
+    _r("GET", rf"/api/plan/{ID}/version/{ID}", Handler.api_plan_version),
 ]
 
 

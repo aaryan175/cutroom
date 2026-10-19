@@ -20,6 +20,14 @@ possible:
   - loudness normalised to −14 LUFS / −1.5 dBTP
 - **QA's its own output.** Silence holes, frozen or black frames, off-beat cuts, repeated shots,
   captions over faces and shaky shots, plus contact sheets at every cut for the AI to look at.
+- **Delivers to every platform** (`cutroom export`): YouTube master, face-tracked 9:16 for Reels /
+  TikTok / Shorts, 1:1 and 4:5, each at its platform's resolution and loudness; `.srt` / `.vtt`
+  captions, YouTube chapters, thumbnail candidates with a contact sheet, and 15 / 30 / 60 s cutdowns
+  built as new plans the AI can refine.
+- **Scales to multi-TB libraries.** Duplicate and near-duplicate collapse, a quality gate before AI
+  tagging, highlight moments (applause, laughter, motion peaks), capture-time shoots and GPS places,
+  best-take ranking for repeated lines, a fast-then-accurate two-pass transcription option, ASR on
+  another machine, and `cutroom estimate` to see the time and disk a library needs before starting.
 - **Serves a review page.** You watch and scrub on your phone, leave timestamped notes, and the AI
   turns each note into the next version.
 - **Has a browser editor** (`cutroom studio`): a timeline, source and program monitors, markers, and
@@ -80,7 +88,7 @@ footage (read-only) ──► index ──► library.db + proxies + contact she
 | `CLAUDE.md` | operating manual for the AI (Claude Code loads it automatically) |
 | `AGENTS.md` | the same for Codex: points it at `CLAUDE.md`, the skills and `docs/ARCHITECTURE.md` |
 | `BOOTSTRAP_PROMPT.md` | the paste-in prompts (Claude Code and Codex) that set everything up |
-| `.claude/skills/` | indexing, tagging, planning, render-and-qa, review-loop and extending-cutroom skills |
+| `.claude/skills/` | indexing, tagging, planning, render-and-qa, review-loop, reference-matching, deliverables-and-scale and extending-cutroom skills |
 | `docs/ARCHITECTURE.md` | map of the code for the AI that extends the tool |
 | `docs/STUDIO.md` | the browser editor and its API, including the Claude Code / Codex bridge |
 | `docs/OVERNIGHT.md` | the unattended "understand my library" run and the resource governor |

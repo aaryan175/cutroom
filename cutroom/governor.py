@@ -2,7 +2,7 @@
 
 Every heavy thing cutroom does (proxy encodes, contact sheets, analysis workers, render segments,
 match-cut decodes) takes a *slot* first; transcription takes the single ASR slot. Slots are flock'ed
-files in <work>/.locks, so the CLI, the overnight run and the studio all share the same budget, and a
+files in ~/.cutroom/locks (machine-wide), so every project, the CLI, the overnight run and the studio share one budget, and a
 slot held by a process that dies is released by the kernel (no stale locks).
 
 What it protects against, and how
@@ -57,6 +57,10 @@ GB = 1024 ** 3
 
 class MemoryGuardError(MemoryError):
     """The current process grew past its memory cap. Free memory / work in smaller chunks."""
+
+
+class SlotAborted(Exception):
+    """A slot wait was abandoned because the caller's abort_check fired (e.g. overnight --stop)."""
 
 
 class DiskFullError(OSError):
@@ -249,7 +253,9 @@ class Governor:
     def __init__(self, cfg):
         self.cfg = cfg
         self.work = Path(getattr(cfg, "work", "") or ".").resolve()
-        self.lock_dir = self.work / ".locks"
+        # Slots are machine-wide (one ASR, N heavy jobs across EVERY project on this computer): resources
+        # belong to the machine, not the project. CUTROOM_LOCK_DIR overrides (tests use it).
+        self.lock_dir = Path(os.environ.get("CUTROOM_LOCK_DIR") or (Path.home() / ".cutroom" / "locks"))
         self.ram_total = total_ram()
         ncpu = os.cpu_count() or 2
         g = lambda k, d=0: getattr(cfg, k, d) or 0     # noqa: E731 - 0 / "" / None = automatic
@@ -436,6 +442,18 @@ class Governor:
         os.close(fd)
         return None
 
+    # set by a caller that can be stopped (the overnight stage process): a callable returning a reason
+    # string when work should stop. A thread waiting for a slot then raises SlotAborted instead of
+    # starting new work after the stop was requested.
+    abort_check = None
+
+    def _abort_reason(self):
+        fn = self.abort_check
+        try:
+            return fn() if fn else None
+        except Exception:  # noqa: BLE001 - a broken check never blocks work
+            return None
+
     @contextlib.contextmanager
     def slot(self, kind="heavy", label=""):
         """Hold one slot of `kind` ('heavy', 'asr', 'light') for the duration of the block.
@@ -463,6 +481,9 @@ class Governor:
         said, reason, got = 0.0, "", None
         try:
             while True:
+                why = self._abort_reason()
+                if why:
+                    raise SlotAborted(f"{kind} slot for {label or 'work'} not taken: {why}")
                 blocks = self.blockers(kind) if self.enabled else []
                 if not blocks and self._first_in_line(kind, me, since):
                     if kind == "light":
@@ -490,6 +511,15 @@ class Governor:
             me.unlink(missing_ok=True)
             self.last_wait = None
         i, fd = got
+        why = self._abort_reason()
+        if why:                                      # stopped while we were acquiring: give it back
+            if fd is not None:
+                try:
+                    os.ftruncate(fd, 0)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+            raise SlotAborted(f"{kind} slot for {label or 'work'} not taken: {why}")
         if fd is not None:
             os.ftruncate(fd, 0)
             os.pwrite(fd, json.dumps({"pid": os.getpid(), "kind": kind, "label": label, "index": i,

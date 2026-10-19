@@ -489,7 +489,9 @@ class PlanState:
 
     def payload(self):
         return {"slug": self.slug, "draft": self.draft, "version_files": list(self.versions),
-                "can_undo": bool(self.undo), "can_redo": bool(self.redo), "timeline": resolve(self.draft)}
+                "can_undo": bool(self.undo), "can_redo": bool(self.redo), "timeline": resolve(self.draft),
+                "saved": {"latest": self.versions[-1] if self.versions else None, "version": len(self.versions),
+                          "dirty": bool(self.undo)}}
 
     def push(self):
         self.undo.append(copy.deepcopy(self.draft))
@@ -1255,6 +1257,30 @@ class H(BaseHTTPRequestHandler):
             with LOCK:
                 ps = PLANS.get(m.group(1))
                 return self.json(ps.payload()) if ps else self.json({"error": f"no plan {m.group(1)}"}, 404)
+        # stubs for newer contract routes (reference engine, import, looks, agent, comment runs)
+        if path == "/api/refs":
+            return self.json({"refs": []})
+        if re.fullmatch(r"/api/ref/[\w.-]+(/compare)?", path):
+            return self.json({"error": "no such reference (mock has none)"}, 404)
+        if path == "/api/import":
+            return self.json({"ytdlp": False, "ytdlp_install": "pip install yt-dlp", "kinds": ["footage", "song", "ref"],
+                              "library_roots": ["/path/footage"]})
+        if path == "/api/looks":
+            return self.json({"looks": [], "luts_dir": ""})
+        if path == "/api/agent":
+            return self.json({"name": "claude", "label": "Claude Code", "logged_in": True, "setting": "auto",
+                              "available": ["claude"], "agents": {"claude": {"path": "claude", "installed": True,
+                                                                             "logged_in": True}}})
+        if path == "/api/comments/run":
+            return self.json({"running": False, "plan": None, "queue": [], "current": None, "index": 0, "total": 0,
+                              "done": 0, "results": [], "stop_requested": False})
+        m = re.fullmatch(r"/api/plan/([\w.-]+)/version/([\w.-]+)", path)
+        if m:
+            with LOCK:
+                ps = PLANS.get(m.group(1))
+                if not ps or m.group(2) not in ps.versions:
+                    return self.json({"error": "no such version"}, 404)
+                return self.json({"file": m.group(2), "plan": copy.deepcopy(ps.draft)})
         if path == "/api/jobs":
             with LOCK:
                 return self.json({"jobs": list(reversed(JOBS))})
@@ -1422,6 +1448,10 @@ class H(BaseHTTPRequestHandler):
                 out = ps.payload()
             emit("plan_changed", {"slug": slug, "by": "hand"})
             return self.json(out)
+        if path == "/api/import/locate":
+            return self.json({"files": [dict(f, path=None, clip=None, in_library=False) for f in b.get("files", [])]})
+        if path in ("/api/refs", "/api/import/footage") or re.fullmatch(r"/api/ref/[\w.-]+/analyze", path):
+            return self.json({"error": "not available in the mock"}, 501)
         if path == "/api/render":
             pf = str(b.get("plan_file") or "daytrip_v2.json")
             preview = bool(b.get("preview", True))

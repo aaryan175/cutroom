@@ -13,6 +13,7 @@ from .config import AUDIO_EXTS
 
 SR = 48000
 ANALYSIS_SR = 22050
+BREAK_GAIN = 10 ** (-30 / 20)      # a music break drops ~30 dB (reference: the bass falls to -45..-52 dB), never to digital silence
 
 
 # --------------------------------------------------------------------------------------------- index
@@ -34,8 +35,15 @@ def analyze_beats(path, max_s=600):
     """Beat grid for one audio file: {"tempo", "beats", "downbeats", "drops"}."""
     import librosa
     y, sr = librosa.load(str(path), sr=ANALYSIS_SR, mono=True, duration=max_s)
-    hop = 512
-    env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    return beats_from_signal(y, sr)
+
+
+def beats_from_signal(y, sr, hop=512, env=None):
+    """Beat grid for a mono signal already in memory (a song, or the full mix of a reference video).
+    `env` = a precomputed onset-strength envelope at this hop. Same result shape as analyze_beats."""
+    import librosa
+    if env is None:
+        env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
     tempo, bt = librosa.beat.beat_track(onset_envelope=env, sr=sr, hop_length=hop, units="time")
     tempo = float(np.atleast_1d(tempo)[0]) if np.size(tempo) else 0.0
     bt = np.asarray(bt, dtype=float)
@@ -223,20 +231,81 @@ def duck_envelope(n, spans, floor_gain, ramp=0.25, sr=SR):
     return (1.0 - (1.0 - floor_gain) * w).astype(np.float32)
 
 
+def _span_env(n, spans, ramp, sr=SR, centred=True):
+    """0..1 membership curve of length n for timeline-relative spans, linear ramps of `ramp` s.
+    centred: the ramp is centred on each span edge (lift around cuts); else it finishes at the edge."""
+    t = np.arange(n, dtype=np.float64) / sr
+    w = np.zeros(n)
+    for a, b in _merge_spans(spans, join=2 * ramp + 0.05):
+        if centred:
+            up = np.clip((t - (a - ramp / 2)) / max(ramp, 1e-6), 0, 1)
+            down = np.clip(((b + ramp / 2) - t) / max(ramp, 1e-6), 0, 1)
+        else:
+            up = np.clip((t - (a - ramp)) / max(ramp, 1e-6), 0, 1)
+            down = np.clip(((b + ramp) - t) / max(ramp, 1e-6), 0, 1)
+        w = np.maximum(w, np.minimum(up, down))
+    return w.astype(np.float32)
+
+
+def _edge(n, kind, sr=SR, head=True):
+    """Gain ramp at a section edge: "cut" = 8 ms quarter-sine on the exact sample, or {"fade": s}."""
+    if isinstance(kind, dict):
+        d = float(kind.get("fade", 0.0) or 0.0)
+        m = min(n // 2, int(round(d * sr)))
+        r = np.linspace(0, 1, m, dtype=np.float32) if m else np.zeros(0, np.float32)
+    else:
+        m = min(n // 2, int(round(0.008 * sr)))
+        r = np.sin(np.linspace(0, np.pi / 2, m, dtype=np.float32)) if m else np.zeros(0, np.float32)
+    return r if head else r[::-1]
+
+
+def k_weighted_lufs(a, sr=SR):
+    """Integrated loudness (BS.1770 K-weighting, absolute + relative gate) of a float stereo array."""
+    from scipy.signal import lfilter
+    x = np.asarray(a, np.float64)
+    if x.ndim == 1:
+        x = x[:, None]
+    if len(x) < sr // 2:
+        return None
+    # K-weighting biquads for 48 kHz (ITU-R BS.1770-4 table 1 and 2)
+    b1, a1 = [1.53512485958697, -2.69169618940638, 1.19839281085285], [1.0, -1.69065929318241, 0.73248077421585]
+    b2, a2 = [1.0, -2.0, 1.0], [1.0, -1.99004745483398, 0.99007225036621]
+    y = lfilter(b2, a2, lfilter(b1, a1, x, axis=0), axis=0)
+    blk, hop = int(0.4 * sr), int(0.1 * sr)
+    k = 1 + (len(y) - blk) // hop
+    if k < 1:
+        return None
+    ms = np.array([np.mean(y[i * hop:i * hop + blk] ** 2, axis=0).sum() for i in range(k)])
+    lk = -0.691 + 10 * np.log10(ms + 1e-12)
+    g = ms[lk > -70]
+    if not len(g):
+        return None
+    rel = -0.691 + 10 * np.log10(g.mean()) - 10
+    g = ms[(lk > -70) & (lk > rel)]
+    return float(-0.691 + 10 * np.log10(g.mean())) if len(g) else None
+
+
 def music_bed(cfg, con, sections_timeline, out_wav):
-    """Render the music track for a whole timeline to a 48 kHz stereo 16-bit WAV.
+    """Render the music track for a whole timeline to a 48 kHz stereo float WAV.
 
     sections_timeline: [{"song": path|id|None, "offset": song s at section start, "start": timeline s,
-                         "dur": s, "gain_db": 0, "speech": [(t0, t1) timeline], "mode": "duck"|"mute"|"full",
-                         "duck_db": -18, "fade_in": 0.3, "fade_out": 0.6}]
-    Each section is decoded/trimmed by ffmpeg, then gain, speech ducking (0.25 s ramps) and edge
-    fades are applied sample-accurately and the sections are summed onto the timeline.
+                         "dur": s, "gain_db": -8, "speech": [(t0, t1) timeline]  -- REAL dialogue only,
+                         "mode": "duck"|"mute"|"full"|"under", "duck_db": -18, "start_edge": "cut"|{"fade"},
+                         "end_edge": "cut"|{"fade"}, "lift_db": 7, "lift_ramp": 0.06,
+                         "breaks": [(t_end, dur)], "under_db": -5, "voice_lufs": -16,
+                         "natural": [(t0, t1)], "natural_duck_db": 0}]
+    Structure (measured on a reference vlog): songs start and stop hard on the section's cut frames
+    (8 ms ramps), sit `lift_db` higher wherever nobody talks (montage/b-roll ~7 LU above talk), drop ~30 dB
+    for 0.2-0.4 s before a flash so the hit lands into silence, and duck only under real dialogue.
+    "under" = a fixed bed `under_db` below the voice and never ducked (cold-open teaser lines).
+    Legacy "fade_in"/"fade_out" seconds are honoured when no start/end edge is given.
     """
     import soundfile as sf
     secs = [s for s in sections_timeline if s.get("dur", 0) > 0]
     total = max((float(s["start"]) + float(s["dur"]) for s in secs), default=0.0)
     n_total = int(round(total * SR))
     bed = np.zeros((n_total, 2), dtype=np.float32)
+    report = []
     for s in secs:
         song = s.get("song")
         if not song:
@@ -247,28 +316,65 @@ def music_bed(cfg, con, sections_timeline, out_wav):
         start, dur = float(s["start"]), float(s["dur"])
         a = _decode(cfg, path, float(s.get("offset", 0.0)), dur)
         n = len(a)
-        g = 10 ** (float(s.get("gain_db", 0.0)) / 20)
+        g_db = float(s.get("gain_db", 0.0))
         mode = s.get("mode", "duck")
         rel = [(t0 - start, t1 - start) for t0, t1 in s.get("speech", []) if t1 > start and t0 < start + dur]
-        if mode in ("duck", "mute") and rel:
-            floor = 0.0 if mode == "mute" else 10 ** (float(s.get("duck_db", -18)) / 20)
-            env = duck_envelope(n, rel, floor)
+        env = np.ones(n, dtype=np.float32)
+        if mode == "under":
+            lv = k_weighted_lufs(a)
+            if lv is not None:
+                g_db = float(s.get("voice_lufs", -16.0)) + float(s.get("under_db", -5.0)) - lv
         else:
-            env = np.ones(n, dtype=np.float32)
-        fi, fo = int(float(s.get("fade_in", 0.3)) * SR), int(float(s.get("fade_out", 0.6)) * SR)
-        fi, fo = min(fi, n // 2), min(fo, n // 2)
-        if fi:
-            env[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)
-        if fo:
-            env[-fo:] *= np.linspace(1, 0, fo, dtype=np.float32)
+            if mode in ("duck", "mute") and rel:
+                floor = 0.0 if mode == "mute" else 10 ** (float(s.get("duck_db", -18)) / 20)
+                env *= duck_envelope(n, rel, floor)
+            lift = float(s.get("lift_db", 0.0) or 0.0)
+            if lift > 0:
+                # the lift is RELATIVE TO THE DIALOGUE: lifted music lands ~lift LU over the voice target,
+                # never louder, whatever the song's mastering level or the section's gain
+                lv = k_weighted_lufs(a)
+                if lv is not None:
+                    cap = float(s.get("voice_lufs", -16.0)) + lift - lv
+                    lift = max(0.0, min(g_db + lift, cap) - g_db)
+            if lift:
+                talk = _span_env(n, rel, float(s.get("lift_ramp", 0.06)), centred=True) if rel else np.zeros(n, np.float32)
+                env *= (10 ** (lift / 20)) ** (1.0 - talk)
+            nd = float(s.get("natural_duck_db", 0.0) or 0.0)
+            nat = [(t0 - start, t1 - start) for t0, t1 in s.get("natural", []) if t1 > start and t0 < start + dur]
+            if nd < 0 and nat:
+                env *= (10 ** (max(-6.0, nd) / 20)) ** _span_env(n, nat, 0.25, centred=True)
+        for t_end, bd in s.get("breaks", []) or []:
+            e = float(t_end) - start
+            if not 0 < e <= dur + 1e-6:
+                continue
+            w = _span_env(n, [(max(0.0, e - float(bd)), e)], 0.01, centred=False) if bd > 0 else None
+            if w is not None:
+                # the gap ends exactly on the event sample: the ramp back up starts at the event
+                t = np.arange(n) / SR
+                w = np.where(t >= e, np.clip(1 - (t - e) / 0.01, 0, 1), w).astype(np.float32)
+                env *= 1.0 - (1.0 - BREAK_GAIN) * w
+        se = s.get("start_edge")
+        ee = s.get("end_edge")
+        if se is None:
+            se = {"fade": float(s.get("fade_in", 0.3))}
+        if ee is None:
+            ee = {"fade": float(s.get("fade_out", 0.6))}
+        hr = _edge(n, se, head=True)
+        tr = _edge(n, ee, head=False)
+        if len(hr):
+            env[:len(hr)] *= hr
+        if len(tr):
+            env[n - len(tr):] *= tr
+        g = 10 ** (g_db / 20)
         i0 = int(round(start * SR))
         m = min(n, n_total - i0)
         bed[i0:i0 + m] += a[:m] * (env[:m, None] * g)
+        report.append({"start": round(start, 4), "dur": round(dur, 4), "gain_db": round(g_db, 2), "mode": mode})
     peak = float(np.abs(bed).max()) if len(bed) else 0.0
-    if peak > 0.999:                                         # protect against overlapping-section clipping
-        bed *= 0.999 / peak
+    if peak > 4.0:                                           # absurd overlap; the programme limiter does the rest
+        bed *= 4.0 / peak
     Path(out_wav).parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(out_wav), bed, SR, subtype="PCM_16")
+    sf.write(str(out_wav), bed, SR, subtype="FLOAT")
     return str(out_wav)
 
 
@@ -283,6 +389,31 @@ SFX = {
     "riser": ("anoisesrc=d=1.5:c=white:r=48000:a=0.4",
               "highpass=f=600,lowpass=f=9000,afade=t=in:d=1.45:curve=exp,afade=t=out:st=1.45:d=0.05"),
 }
+
+
+_PEAKS = {}
+
+
+def sfx_peak(path) -> float:
+    """Seconds from the start of a sound file to its transient peak (argmax of the 5 ms RMS envelope).
+    The renderer aligns this instant, not the file start, to the event frame."""
+    import soundfile as sf
+    st = os.stat(path)
+    key = (str(path), st.st_size, int(st.st_mtime))
+    if key in _PEAKS:
+        return _PEAKS[key]
+    x, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    m = np.abs(x).max(axis=1)
+    w = max(1, int(sr * 0.005))
+    k = len(m) // w
+    if k == 0:
+        return 0.0
+    env = np.sqrt((m[:k * w].reshape(k, w) ** 2).mean(axis=1))
+    i = int(np.argmax(env))
+    seg = m[i * w:(i + 1) * w]
+    pk = (i * w + int(np.argmax(seg))) / sr          # sample-accurate inside the loudest 5 ms block
+    _PEAKS[key] = float(pk)
+    return float(pk)
 
 
 def sfx(name, cfg=None) -> str:

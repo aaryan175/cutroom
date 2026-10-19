@@ -18,8 +18,8 @@ in the docstring at the top of `cutroom/plan.py`; this page explains it with exa
   "version": 1,
   "output": {"width": 1920, "height": 1080, "fps": 25},
   "style": {
-    "captions": {"enabled": true, "size": 54, "position": "bottom", "max_words": 5},
-    "grade": {"lut": "", "normalize_exposure": true},
+    "captions": {"enabled": true, "size": 32, "position": "bottom", "max_words": 5},
+    "grade": {"lut": "", "normalize_exposure": true, "look": {"name": "warm_film", "intensity": 0.8}},
     "voice": {"clean": true, "atten_lim_db": 20},
     "music_under_speech": "mute"
   },
@@ -78,7 +78,133 @@ drop or a downbeat. A section without `music` has no music.
 
 ## Common optional fields
 `speed`, `zoom`, `crop` (`"center"`, `"face"` or `[x, y, w, h]` fractions), `sfx`
-(`[{"name": "whoosh", "at": 0.0, "gain_db": -8}]`; built-ins are whoosh, hit, tick and riser), `note`.
+(`[{"name": "whoosh", "at": 0.0, "gain_db": -8}]` or `[{"name": "hit", "on": "cut"}]`; built-ins are whoosh,
+hit, tick and riser), `transition`, `push`, `ramp`, `conform`, `exposure_stops`, `note` (see Craft below).
+
+## Craft (measured on a reference vlog; all optional, defaults shown)
+These fields encode what a finished edit does that a rough cut doesn't. The defaults come from a frame- and
+sample-level audit of a reference vlog; change them only when the creator asks.
+
+**Captions.** `style.captions.size` is 43 px at 1080 (text about 3 % of the frame height, as in the reference) and
+scales with the output height. Position and the no-outline rule are unchanged.
+
+**Grade (house grade v2).** The exposure correction runs in the LOG domain *before* the LUT: half of the
+measured error, at most ±1 stop, nothing inside ±1/3 stop, and night scenes aim at luma 70 instead of 118.
+Then one fixed finishing curve runs on every shot (black point ~10/255, soft highlight shoulder, light
+vibrance). Nothing is brightened after the LUT, because that turns blacks milky.
+```json
+"grade": {"exposure": {"strength": 0.5, "max_stops": 1.0, "deadband_stops": 0.33, "target_luma": 118,
+                       "night_luma": 60, "night_target": 70},
+          "finish": {"enabled": true, "black": 0.028, "shoulder": 0.96, "vibrance": 0.18}}
+```
+`"exposure_stops": 0.5` on a segment is a manual trim the creator names (rule 94). The sidecar records each
+piece's applied `stops`.
+
+**Dialogue audio.**
+```json
+"audio": {"join_xfade_s": 0.02, "room_tone": true, "room_tone_under_voice_db": -32, "bed_fade_s": 0.3,
+          "jl_duck_db": -12, "auto_lead_in": 0.3, "auto_tail": 0.0}
+```
+- Every join between two pieces of the same sound (talk→talk, ambience→ambience) is a 20 ms equal-power
+  crossfade over handles taken from the source.
+- A room-tone bed runs under every talk segment, 0.3 s past each end. It is the clip's own quietest steady
+  patch, taken from the cleaned dialogue, at max(the segment's floor, voice − 32 dB). The noise floor
+  never steps at a jump cut. `"room_tone": false` on a talk segment turns it off there.
+
+**J/L cuts.** On talk segments, `"lead_in": 0.3` starts the voice that many seconds before its picture,
+under the previous shot (a J-cut). The audio comes from the source before `in`, so put `in` just after the
+first word starts if you want the voice itself to lead. `"tail": 0.4` lets the audio run on under the next
+shot (an L-cut). Neither changes the timeline length. When a talk segment follows b-roll, montage, a match
+cut or a still, `lead_in` defaults to `style.audio.auto_lead_in` (0.3 s). In the reference, the voice
+leads the face in 33 of 40 cuts into talk. The b-roll's ambience ducks 12 dB under the arriving voice, and
+captions follow the heard audio.
+
+**B-roll sound.** `broll.audio` now defaults to `"natural"`, so the location sound plays under the music
+(about −24 LUFS under music, −20 without). `"music"` means no natural sound. Montage ambience sits a
+further 6 dB down.
+
+**Music structure** (`section.music`):
+```json
+"music": {"song": "...", "offset": 41.2, "gain_db": -8, "mode": "mute",
+          "start": "cut", "end": "cut", "montage_gain_db": 7, "natural_duck_db": 0,
+          "breaks": [{"before": "cut:2", "dur": 0.3}, {"at": 12.4, "dur": 0.25}]}
+```
+- `start` and `end` are `"cut"` by default: the song starts and stops on the section's cut frame with an
+  8 ms ramp. `{"fade": 0.6}` gives a fade instead.
+- The music sits `montage_gain_db` (+7) higher wherever nobody is talking. That puts it about 7 LU above
+  talk, as in the reference.
+- Only real dialogue ducks the music. Natural sound never ducks it by more than `natural_duck_db` (0 to −6).
+- `breaks` silence the music for 0.2–0.4 s ending on an event. A flash or whip adds its own break
+  automatically (`transition.break`, 0.3 s).
+- `"mode": "under"` (used by the cold open) is a fixed bed `under_db` (−5) below the voice. It is never
+  ducked.
+
+**Transitions.** Put `"transition"` on a segment (the cut into it), or on a section (the cut into its
+first segment):
+```json
+"transition": {"kind": "flash", "frames": 4, "sfx": "hit", "gain_db": -6, "break": 0.3}
+```
+- `flash` mixes toward white, made from the footage itself, with a small log-domain exposure push
+  underneath. Its peak is on the cut frame.
+- `dip` goes through black, `dip_white` through white.
+- `whip` is a temporal mix plus a horizontal smear on the 3 frames either side, with a `whoosh` by default.
+- `frames` is split between the outgoing and incoming side; `frames_out` and `frames_in` set them
+  directly.
+- The sound's transient *peak*, not its file start, lands on the cut frame.
+- Never use overlay assets (leaks, scribbles, film strips). The creator banned them (rule 38).
+- Segment SFX can bind the same way: `{"name": "hit", "on": "cut"|"end"}`.
+
+**Frame-rate conform.** `style.conform` (or per segment/shot `conform`) is `"auto"` by default.
+- A 23.976 or 24 fps b-roll source is sped up to 25 (+4.3 %, pitch-kept atempo on its ambience), so
+  there are no duplicate frames.
+- Sync talk and match cuts are frame-blended (`framerate`), so lip-sync holds.
+- Sources far from the output rate (50, 60) go through `fps` (frames dropped, never duplicated).
+- `"dup"` forces the old fps behaviour.
+
+**Push-in.** `"push": {"to": 1.06, "ease": "inout"}` on talk, broll or a montage shot (or the montage)
+does a slow digital move. It uses sub-pixel `perspective`, the smoothest of the measured methods.
+- On talk it runs across the whole segment, through the jump cuts. With `crop: "face"` it centres on the
+  face.
+- `to` < 1 pulls out.
+- `style.auto_push: {"min_hold": 4, "to": 1.04}` adds one to every talk segment held at least that long.
+- Keep pushes to 3–8 %. A 1080p source has no headroom for more.
+
+**Speed ramp.** `"ramp": {"to": 2.0, "over": 0.4}` on broll or a montage shot.
+- The speed rises linearly over the last `over` seconds into the cut, with a temporal-mix motion blur.
+  The piece keeps its planned length and consumes more source.
+- The ambience fades out with the ramp.
+- True slow motion needs a ≥ 48 fps source (none in the current library). Never slow 25p down (rule 34).
+
+**Pacing.** `section.pace: {"asl": 0.6, "max_hold": 6, "alternate": true}`.
+- Montages without beat sync get shot lengths around `asl`, in alternating fast and slow blocks.
+- Beat-synced montages snap those lengths to beats.
+- `max_hold` caps any shot. On a talk segment with `auto_cover` and a `cover` pool, it inserts a cutaway
+  whenever the face is held longer than that.
+- Take the numbers from the reference's sections (`cutroom ref show <id>`): ASL per section type.
+
+**Cold open (teaser template).** A plan-level object. It renders as a generated first section (index −1
+in the sidecar and in `resolve_timeline`):
+```json
+"cold_open": {"style": "teaser", "dur": 10, "lines": [{"from": "villa/0"}, {"clip": "C0107", "in": 41.2, "out": 43.0}],
+              "shots": "auto", "asl": 0.45, "from_reference": "9fe6442b1b", "face_s": 0.8,
+              "music": {"song": "...", "offset": 52.0, "under_db": -5}, "end_flash": true}
+```
+- Lines are teaser lines from later in the edit. `{"from": "<section>/<segment>"}` picks the strongest
+  0.8–2.6 s claim in that talk segment by itself (numbers, superlatives, stakes words, clean edges).
+- Micro-cuts run between and under the lines. Each line starts on the face for `face_s`, then cuts away.
+  The rhythm comes from `from_reference` (that reference's cold-open cut map, one-to-one) or from `asl`
+  (~0.45 s, varied, pulled onto the half-beat grid).
+- `shots: "auto"` takes the edit's own b-roll at windows the edit does *not* use later.
+- The music runs `under` the voice (not ducked). Defaults: the first section's song.
+- A flash goes into the second block of micro-cuts and out of the cold open.
+
+## Looks
+`style.grade.look` colours the whole edit; `look` on a segment overrides it for that segment
+(`{"name": "natural"}` = no look there). Value: `{"name": ..., "intensity": 0-1}` or just the name
+(intensity 1). Built-ins: `natural`, `warm_film`, `cool_clean`, `golden_hour`, `teal_orange`,
+`moody_matte`, `punchy`, `soft_pastel`, `bw`, `vintage_fade`, `night_cinematic`; a `.cube` in the project's
+`luts/` folder is `"lut:<file name>"`. The look runs after the base grade (LUT / log curve, saturation)
+and the exposure correction, on every shot of the segment including its cutaways (`cutroom/looks.py`).
 
 ## Overlays
 `kind` is one of `callout`, `lower_third`, `title` or `label`. `position` is one of `auto`, `top-left`,

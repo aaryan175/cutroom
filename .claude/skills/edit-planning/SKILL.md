@@ -28,7 +28,7 @@ changes the story:
 ## 3. Structure a 2-minute edit (default shape)
 | Part | Length | What |
 |---|---|---|
-| Cold open | 5–10 s | fast beat-cut montage of the best moments, with the strongest line in the first 2 s |
+| Cold open | 5–10 s | the `cold_open` teaser template (below): 2–3 teaser lines from later in the edit, dense micro-cuts, music under the voice |
 | Setup | 10–20 s | the creator says what this is (talking clip, captions) |
 | Body | 60–90 s | talk ↔ action alternating, one idea per beat, a journey shot whenever the location changes |
 | Peak | 10–20 s | the biggest moment, a montage on the drop, or a match cut |
@@ -65,7 +65,50 @@ For a no-talk hype edit: cold open → three montage sections on the song's sect
 - Default `music_under_speech: "mute"`: no music while the creator talks (a rule from real reviews). Use `"duck"` only if the creator asks for a quiet bed under speech.
 - Change songs at section boundaries, not in the middle of a line.
 
-## 6. Check and render
+## 6. Cold open: use the template
+For any edit with talking, write a plan-level `cold_open` instead of hand-cutting a montage:
+```json
+"cold_open": {"dur": 10, "lines": [{"from": "villa/0"}, {"from": "evening/2"}], "shots": "auto",
+              "from_reference": "<ref id>"}
+```
+- **lines** are open loops: 2–3 short claims (0.8–2.6 s) that pay off later in the edit, each from a
+  *different* section. `{"from": "<section>/<segment>"}` picks the strongest line in that talk segment
+  (numbers, superlatives, stakes). Read the pick back in `cutroom plan check` / the sidecar note, and give
+  explicit `clip/in/out` when you know the better line (rule 49: lines are on the face or a related bright
+  shot).
+- **rhythm**: when the creator gave a reference, set `from_reference`. The teaser is then rebuilt on that
+  reference's own cold-open cut map, one-to-one (rule 45); `cutroom ref show <id>` prints it. Without one,
+  `asl: 0.45` gives a varied ~0.45 s rhythm pulled onto half beats.
+- **shots: "auto"** takes the edit's own b-roll at windows the edit doesn't use later (no rule-23
+  repeats). Pass a list of approved picks when the creator named them (rule 47).
+- **music** defaults to the first section's song, playing *under* the voice and never ducked. Point
+  `music.offset` at the part of the song you want.
+- A flash goes into the second block and out of the cold open. Set `"end_flash": false` to drop the
+  last one.
+
+## 7. Craft fields
+The defaults already do these. Change them only for a reason:
+- **J/L cuts**: a talk segment after b-roll gets `lead_in` 0.3 automatically, so the voice starts under
+  the b-roll. Set `"lead_in": 0` for a hard sync cut, or `"tail": 0.4` to let a last line trail over the
+  next b-roll. For a voice that leads with words, put `in` ~0.3 s after the first word starts.
+- **B-roll sound**: broll defaults to `"audio": "natural"` (ambience under the music). Use `"music"` only
+  when the location sound is ugly (wind, strangers talking).
+- **Transitions**: put `"transition": {"kind": "flash"}` on the first segment of a section where the
+  *location or time* changes. That's at most one per ~20 s of body, never inside a talk segment, and
+  devices stay ≤ 25 % of runtime (rule 44). Use `dip` for a time jump and `whip` between two moving
+  shots. Never use overlay assets.
+- **Music**: songs start and stop on the section cut. Montage and b-roll get +7 dB over talk. A flash
+  gets a 0.3 s music break before it. For a drop on the first montage cut, set `offset` from
+  `cutroom beats`.
+- **Pacing**: copy the reference's section ASLs into `section.pace` (`cutroom ref show <id>` lists them,
+  e.g. talk 6–10 s, montage 0.5–0.9 s, voice-over b-roll 0.6–2 s). Use `alternate: true` and a
+  `max_hold` (talk 6–8 s with an `auto_cover` pool).
+- **Push-ins**: use `"push": {"to": 1.05}` on long held talk or static b-roll from 4K masters. Never on
+  phone footage or 1080p sources.
+- **Speed ramps**: use `"ramp": {"to": 2.0, "over": 0.4}` on a b-roll or montage shot going into a cut
+  on a drop. Never on talk, and never as slow motion.
+
+## 8. Check and render
 Run `cutroom plan check <plan>`; it validates every clip and in/out against the library. Then
 continue with the render-and-qa skill.
 

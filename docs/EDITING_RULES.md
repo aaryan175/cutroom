@@ -527,3 +527,51 @@ Tags: **[creator-feedback]** means the creator asked for it or rejected somethin
 118. **An approval that names a change is conditional. Build only that change, then record the approval on the new version.** [measured-failure]
      Why: "approve, but change the last clip" nearly shipped with the unwanted clip.
      Check: parse approvals for change verbs. If any are present, rebuild with only that change and diff everything else against the previous version.
+
+---
+
+## 14. Craft (measured on a reference vlog)
+
+Source: a frame- and sample-level audit of a creator's favourite reference vlog against the approved
+predecessor cut and a cutroom render. These rules hold the measured numbers. Renderer support is in
+`docs/PLAN_FORMAT.md` under "Craft".
+
+119. **Never let the noise floor step at a jump cut. Room tone runs under all dialogue, and every join is an equal-power crossfade.** [measured-failure]
+    Why: the reference's floor steps 2.2 dB (median) across talk-to-talk cuts. The approved predecessor stepped 9.5 dB and the creator heard "loud silence".
+    Check: QA `room_tone_steps`: median |step| ≤ 3 dB, p90 ≤ 8 dB, and the quietest 250 ms inside talk is above −55 dBFS.
+
+120. **Normalise exposure in log before the LUT, by at most one stop and by half the measured error. Run the same finishing curve on every shot. Never brighten after the LUT.** [measured-failure]
+    Why: a post-LUT brightness lift put the black point at 28/255 against the reference's 10, and the night interior went milky grey.
+    Check: QA `black_level`: median p1 ≤ 16. The sidecar shows one `finish` string on every piece.
+
+121. **Build the cold open from teaser lines that pay off later. Cut it dense (about 0.45 s, faster than the beat), and keep the music full under the teaser voice.** [measured-failure]
+    Why: the reference opens with 22 shots in 10.4 s. Its first word comes at 1.43 s, and the music runs 3.5–7 dB under the voice without ducking. The rough cut opened with 8 shots at 1.33 s each, then a title card.
+    Check: the cold open has ≥ 4 cuts in the first 3 s. Every teaser line comes from a talk segment later in the edit.
+
+122. **Start and stop songs hard on the section cut. Lift the music about 7 LU over montage and b-roll. Break the music for 0.2–0.4 s before a flash. Duck only under real dialogue.** [measured-failure]
+    Why: in the reference, the bass falls 20 dB within one 10 ms frame at section cuts, and the montage music sits 7 LU above the talking. Natural sound under b-roll used to duck the music 18 dB.
+    Check: music edges are within a frame of a cut, and the music under natural-sound b-roll is within 3 dB of the montage level.
+
+123. **A transition is light made from the footage (a flash or dip) or a footage device (a match cut or whip). It sits on a real event, lasts 2–5 frames, and its one SFX lands with the transient peak on the cut frame.** [measured-failure]
+    Why: 16 of the reference's 58 events are light bursts exactly at section and location changes, and 59 % of its transitions carry a transient. Pushing exposure past about +1 stop through the LUT turns magenta, so mix toward white instead. Overlay assets stay banned (rule 38).
+    Check: QA `flash_sfx_alignment`: the flash peak lands on the cut frame ±1, and the SFX transient within ±5 ms.
+
+124. **Lead the voice into the face (J-cut, about 0.3 s) and let it trail over b-roll (L-cut). Keep the b-roll's own sound under the music.** [measured-failure]
+    Why: in the reference, speech is already running before the cut in 33 of 40 cuts into talk. B-roll keeps its location sound at about −35 dBFS between lines.
+    Check: `lead_in`/`tail` show up as audio before/after the picture in the sidecar (`audio_pre`/`audio_post`), and captions follow the heard words.
+
+125. **Captions are about 43 px at 1080 (text about 3 % of the frame height), white, with no outline.** [measured-failure]
+    Why: the rough cut's 54 px captions were 1.7× the reference's size.
+    Check: QA `caption_size`: 2.4–4.0 % of the frame height.
+
+126. **Conform 23.976 fps footage to 25 without duplicate frames: speed up b-roll by 4.3 %, frame-blend sync talk.** [measured-failure]
+    Why: 271 of 395 masters in the library are 23.976 fps, and `fps=25` repeats a frame about once a second (visible judder on pans).
+    Check: QA `duplicate_frames` reports 0 in moving shots.
+
+127. **Give long held shots a slow push-in (3–6 % over 4 s or more) as a slider stand-in. Never zoom-punch a jump cut.** [measured-failure]
+    Why: the reference's long talk holds drift 3–9 %. It punches in on only 1 of 110 same-setup cuts.
+    Check: push values stay within 1.03–1.08. On talk, the push runs across the whole segment, not per piece.
+
+128. **Vary the pace by section: fast blocks (ASL 0.5–0.9 s) between long holds (ASL 5–10 s), and cap the longest hold.** [measured-failure]
+    Why: the reference's section ASLs run 0.47 / 10.3 / 1.85 / 0.67 / 6.3 / 0.85 / 8.8 / 0.63 / 1.8 / 4.7 / 2.2 / 5.0 s. One global pace reads flat.
+    Check: `section.pace` takes the reference's ASL for that section type. No talk hold runs past `max_hold` unless it is on purpose.

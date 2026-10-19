@@ -3,6 +3,8 @@ import { S, on, emit, op, select, setPlayhead, pieceAt, sectionAt, segmentOf, KI
 import { h, icon, tc, clamp, LS, throttle, toast, eta } from './util.js';
 import { media, api } from './api.js';
 import { STARTERS } from './chat.js';
+import { STATUS_COLOR } from './comments.js';
+import { lookLabel } from './looks.js';
 
 const RULER = 24, BAND = 17;
 const TRACKS = [
@@ -357,8 +359,14 @@ function draw() {
   // markers (ruler)
   for (const m of S.markers) {
     const x = Math.round(tToX(m.t)) + 0.5;
-    if (x < -8 || x > W + 8) continue;
-    const col = m.status === 'done' ? '#55555e' : (m.kind === 'ref' ? '#3fb8a8' : '#e7a93d');
+    if (x < -8 || (x > W + 8 && !(m.t_end > m.t))) continue;
+    const col = m.kind === 'ref' ? (m.status === 'done' ? '#55555e' : STATUS_COLOR.ref) : (STATUS_COLOR[m.status || 'open'] || STATUS_COLOR.open);
+    if (m.t_end > m.t) {                     // a "from here to here" comment: a bar along the ruler
+      const x2 = Math.round(tToX(m.t_end)) + 0.5;
+      ctx.fillStyle = col; ctx.globalAlpha = m.status === 'done' ? 0.25 : 0.4;
+      ctx.fillRect(x, 4, Math.max(1, x2 - x), 5); ctx.globalAlpha = 1;
+      ctx.fillRect(x2 - 1, 2, 2, 9);
+    }
     ctx.fillStyle = col;
     ctx.beginPath(); ctx.moveTo(x - 4.5, 2); ctx.lineTo(x + 4.5, 2); ctx.lineTo(x + 4.5, 9); ctx.lineTo(x, 13); ctx.lineTo(x - 4.5, 9); ctx.closePath(); ctx.fill();
     if (m.status !== 'done') { ctx.fillStyle = col; ctx.globalAlpha = 0.35; ctx.fillRect(x, 13, 1, H); ctx.globalAlpha = 1; }
@@ -432,6 +440,17 @@ function drawV(arr, track, now) {
       const label = p.label || [p.clip_rel ? p.clip_rel.split('/').pop() : p.clip, p.kind].filter(Boolean).join(' · ');
       ctx.fillText(joinL ? '' : label, bx + 5, top + Math.min(labelH, bh) / 2 + 0.5);
       ctx.restore();
+    }
+    if (track === 'V1' && p.look && !joinR && bw > 70) {   // look badge: the colour look on this segment
+      ctx.save(); ctx.font = '500 9.5px -apple-system, BlinkMacSystemFont, Inter, "Segoe UI", system-ui, sans-serif';
+      const txt = lookLabel(p.look.name), tw0 = Math.min(bw - 30, ctx.measureText(txt).width + 18);
+      const lx = bx + bw - tw0 - 3, ly = top + 2;
+      ctx.fillStyle = 'rgba(8,8,10,.62)'; rrect(lx, ly, tw0, 12, 6); ctx.fill();
+      ctx.beginPath(); ctx.rect(lx, ly, tw0, 12); ctx.clip();
+      const g = ctx.createLinearGradient(lx + 4, 0, lx + 11, 0); g.addColorStop(0, '#f6b26b'); g.addColorStop(1, '#6fa8ff');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(lx + 7.5, ly + 6, 3, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,.88)';
+      ctx.fillText(txt, lx + 13, ly + 6.5); ctx.restore();
     }
     if (sel) {
       ctx.strokeStyle = 'rgba(107,151,255,.35)'; ctx.lineWidth = 3;
@@ -542,7 +561,7 @@ function onDown(e) {
   const hh = hit(x, y);
   try { canvas.setPointerCapture(e.pointerId); } catch { /* synthetic pointer */ }
   emit('focusMonitor', 'program');
-  if (hh.area === 'ruler' && hh.marker) { openMarkerPop(hh.marker, x); return; }
+  if (hh.area === 'ruler' && hh.marker) { if ((hh.marker.kind || 'note') === 'note') emit('openComment', hh.marker); else openMarkerPop(hh.marker, x); return; }
   if (hh.area === 'ruler' || hh.area === 'band') {
     drag = { kind: 'scrub' };
     emit('scrubStart');
@@ -675,7 +694,7 @@ function setTip(x, y, text) {
 function hideTip() { tip.hidden = true; }
 const showHoverTip = throttle((hh, x, y) => {
   if (drag) return;
-  if (hh.marker) { setTip(x, y, `${tc(hh.marker.t, fps())}  ${hh.marker.text || '(no note)'}`); return; }
+  if (hh.marker) { const st = { open: 'Open', working: 'AI working', done: 'Done', needs_you: 'Needs you' }[hh.marker.status || 'open'] || ''; setTip(x, y, `Comment · ${tc(hh.marker.t, fps())}${hh.marker.t_end > hh.marker.t ? ' → ' + tc(hh.marker.t_end, fps()) : ''} · ${st}  ${hh.marker.text || (hh.marker.drawing && hh.marker.drawing.length ? '(drawing)' : '(no note)')}`); return; }
   if (hh.edge) { setTip(x, y, `Drag to trim ${hh.edge.edge === 'in' ? 'In' : 'Out'}`); return; }
   if (hh.piece && hh.area === 'track') {
     const p = hh.piece;
@@ -873,7 +892,7 @@ export function initTimeline(body, tools) {
   tools.append(
     h('button.ib', { title: 'Razor at playhead (C)', html: icon('razor'), on: { click: razor } }),
     h('button.ib', { title: 'Freeze frame (F)', html: icon('freeze'), on: { click: freeze } }),
-    h('button.ib', { title: 'Add marker (M)', html: icon('marker'), on: { click: () => emit('addMarker') } }),
+    h('button.ib', { title: 'Add comment at the playhead (M)', html: icon('marker'), on: { click: () => emit('addMarker') } }),
     h('span', { style: { width: '1px', height: '16px', background: 'var(--line-2)', margin: '0 4px' } }),
     snapBtn,
     h('button.ib', { title: 'Zoom out (−)', html: icon('zoomout'), on: { click: () => zoomBy(1 / 1.5) } }),

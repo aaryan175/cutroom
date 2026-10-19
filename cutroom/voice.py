@@ -113,42 +113,51 @@ def silence_holes(wav_or_video_path, win=0.25, floor_db=-65, cfg=None):
     return [(round(i * win, 3), round(float(v), 1)) for i, v in enumerate(db_) if v < floor_db]
 
 
-def room_tone(cfg, cid, dur, force=False) -> str:
+def room_tone(cfg, cid, dur, force=False, src=None) -> str:
     """WAV (48 kHz stereo) of `dur` seconds of the clip's room tone: the quietest 1.5 s stretch
-    without speech (and not digital silence), looped with crossfades."""
+    without speech (and not digital silence), looped with 0.25 s equal-power crossfades.
+    `src` = take the tone from this file instead of the camera audio (the renderer passes the CLEANED
+    dialogue, so the bed under the voice has the same spectrum as the pauses inside it)."""
+    import hashlib
     import soundfile as sf
     from . import asr
     dur = float(dur)
-    out = cfg.p("voice", f"{cid}_tone_{dur:.2f}.wav")
+    tag = "" if not src else "_" + hashlib.sha1(f"{src}|{os.path.getsize(src)}|{int(os.path.getmtime(src))}".encode()).hexdigest()[:8]
+    out = cfg.p("voice", f"{cid}_tone{tag}_{dur:.2f}.wav")
     if out.exists() and not force:
         return str(out)
-    src = _clip_path(cfg, cid)
-    seg = 1.5
+    src = src or _clip_path(cfg, cid)
     a16 = load_audio(cfg, src, sr=16000)
     hop = 0.1
     db_ = _rms_db_windows(a16, 16000, hop)
-    speech = [(w[0] - 0.3, w[1] + 0.3) for w in asr.words(cfg, cid)]
+    words = asr.words(cfg, cid)
+    speech = [(w[0] - 0.3, w[1] + 0.3) for w in words]
     if not speech:
         speech = asr.speech_spans(a16)
-    nwin = int(seg / hop)
-    best, best_t = None, 0.0
-    for i in range(0, max(1, len(db_) - nwin + 1)):
-        t0, t1 = i * hop, i * hop + seg
-        w = db_[i:i + nwin]
-        if len(w) < nwin or w.min() < -90:          # contains digital silence
-            continue
-        if any(s < t1 and e > t0 for s, e in speech):
-            continue
-        score = float(np.mean(w)) + float(np.std(w))  # quiet and steady
-        if best is None or score < best:
-            best, best_t = score, t0
+    best, best_t, seg = None, 0.0, 1.5
+    # longest clean stretch first; busy clips (no 1.5 s pause) fall back to shorter patches
+    for seg, pad in ((1.5, 0.3), (0.8, 0.2), (0.4, 0.12)):
+        sp = [(w[0] - pad, w[1] + pad) for w in words] if words else speech
+        nwin = max(1, int(round(seg / hop)))
+        for i in range(0, max(1, len(db_) - nwin + 1)):
+            t0, t1 = i * hop, i * hop + seg
+            w = db_[i:i + nwin]
+            if len(w) < nwin or w.min() < -90:          # contains digital silence
+                continue
+            if any(s_ < t1 and e > t0 for s_, e in sp):
+                continue
+            score = float(np.mean(w)) + float(np.std(w))  # quiet and steady
+            if best is None or score < best:
+                best, best_t = score, t0
+        if best is not None:
+            break
     piece = load_audio(cfg, src, sr=OUT_SR, start=best_t, dur=seg)
     if len(piece) < OUT_SR * 0.2:
         piece = np.zeros(int(OUT_SR * seg), dtype=np.float32)
     xf = min(int(0.25 * OUT_SR), len(piece) // 3)
     n_out = int(round(dur * OUT_SR))
     buf = np.zeros(n_out + len(piece), dtype=np.float32)
-    fade_in = np.sqrt(np.linspace(0, 1, xf, dtype=np.float32))
+    fade_in = np.sin(np.linspace(0, np.pi / 2, xf, dtype=np.float32))     # equal power
     fade_out = fade_in[::-1]
     pos = 0
     first = True

@@ -15,6 +15,7 @@ the project only stores paths to it.
     <work>/plans/              edit plans (JSON) written by the operator
     <work>/renders/            finished videos + QA reports
     <work>/notes/              review notes captured from the board
+    <work>/refs/<id>/          reference videos the creator wants matched + their measurements (reference.py)
 """
 import json
 import os
@@ -33,19 +34,28 @@ class Config:
     work: str = ""
     library_roots: list = field(default_factory=list)      # folders scanned for footage (read-only)
     music_roots: list = field(default_factory=list)        # folders scanned for songs
-    proxy_height: int = 540                                # proxies are this tall
-    proxy_crf: int = 28
+    proxy_height: int = 540                                # proxies are this tall (360 = half the disk, enough for tagging)
+    proxy_crf: int = 28                                    # x264 fallback quality
+    proxy_bitrate: str = ""                                # hardware encoder bitrate, e.g. "1200k"; "" = auto by proxy_height
+                                                           # (360: 600k, 540: 1200k, 720: 2000k)
     sheet_every_s: float = 2.0                             # one contact-sheet tile per N seconds (capped)
     sheet_max_tiles: int = 24
     asr_model: str = "medium"                              # faster-whisper model name
     asr_language: str = ""                                 # "" = auto-detect
+    ref_asr_model: str = "small"                           # model for reference videos (reference.py); "" = asr_model
+    asr_device: str = ""                                   # "" = auto (cuda when present, else cpu) | "cpu" | "cuda"
+    asr_remote: str = ""                                   # run ASR elsewhere: a command template with {audio} {out} {model}
+                                                           # {language}, e.g. "ssh gpu-box /opt/cutroom/.venv/bin/python -m
+                                                           # cutroom.asr {audio} {out} --model {model}" (paths must be shared)
+    asr_fast_model: str = ""                               # two passes: everything with this model first (e.g. "small"),
+                                                           # then the clips with speech again with asr_model; "" = one pass
     lut: str = ""                                          # optional .cube applied to log footage
     log_transfer_hint: list = field(default_factory=lambda: ["slog", "s-log", "log", "vlog", "clog", "flog", "hlg"])
     out_width: int = 1920
     out_height: int = 1080
     out_fps: float = 25.0
     caption_font: str = ""                                 # path to .ttf/.otf; "" = auto (Helvetica/Inter/DejaVu)
-    caption_size: int = 54
+    caption_size: int = 43
     preview_height: int = 720
     workers: int = 0                                       # 0 = auto (cpu_count // 2)
     ffmpeg: str = "ffmpeg"
@@ -69,6 +79,16 @@ class Config:
     tag_sleep_s: float = 20.0                              # pause between tagging calls
     tag_model: str = ""                                    # Claude model alias for tagging ("" = your default)
     tag_timeout_s: float = 900.0                           # one tagging call may take this long
+    # -- scale: tagging cost control + library structure (analyze.py, docs/OVERNIGHT.md "Big libraries")
+    tag_gate: bool = True                                  # skip clips that can't be useful (short / black / very shaky)
+    tag_min_dur: float = 1.0                               # gate: shorter clips are not sent to the AI
+    tag_gate_dark: float = 6.0                             # gate: median luma (0-255) below this = black / lens cap
+    tag_gate_shake: float = 12.0                           # gate: median shake above this (0 = off; >8 is already shaky)
+    dedupe_hamming: float = 6.0                            # near-duplicate: mean perceptual-hash distance (of 64 bits)
+    dedupe_window_h: float = 2.0                           # near-duplicates are looked for in the same folder or this
+                                                           # many hours of capture time
+    session_gap_min: float = 45.0                          # a capture-time gap this long starts a new shoot ("session")
+    place_radius_m: float = 150.0                          # clips with GPS within this radius share a place
 
     # -- paths ---------------------------------------------------------------------------------
     def p(self, *parts) -> Path:

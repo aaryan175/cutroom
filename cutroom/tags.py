@@ -99,6 +99,29 @@ def todo(cfg, con, n=20):
 
 # -- search ----------------------------------------------------------------------------------
 
+HL_MIN = 0.35                    # a window scoring this (0-1) or more counts as a highlight
+
+
+def _hl_dict(v):
+    return None if not v else {"score": round(v[0], 3), "t": v[1], "kind": v[2]}
+
+
+def _scale_maps(cfg, con, args) -> dict:
+    """Highlight peaks, duplicate representatives, shoots and --near ranking (analyze.py scale tables)."""
+    analyze.ensure_scale_schema(con)
+    hl = {r["clip_id"]: (r["score"] or 0.0, r["t"], r["kind"]) for r in con.execute("SELECT * FROM highlight_peaks")}
+    rep = {r["clip_id"]: r["rep"] for r in con.execute("SELECT clip_id, rep FROM dupes")}
+    sess = {r["clip_id"]: r["session"] for r in con.execute("SELECT clip_id, session FROM sessions")}
+    only, near_rank = None, None
+    if getattr(args, "session", None) is not None:
+        only = {cid for cid, sn in sess.items() if sn == int(args.session)}
+    if getattr(args, "near", None):
+        lst = analyze.near(cfg, con, args.near, limit=max(50, getattr(args, "limit", 30) or 30))
+        near_rank = {x["id"]: (i, x["dist"]) for i, x in enumerate(lst)}
+        only = set(near_rank) if only is None else only & set(near_rank)
+    return {"hl": hl, "rep": rep, "sess": sess, "only": only, "near": near_rank}
+
+
 def search(cfg, con, args):
     words = [_norm(w) for w in (getattr(args, "text", "") or "").split() if _norm(w)]
     rows = con.execute("""
@@ -143,6 +166,13 @@ def search(cfg, con, args):
             where = "tags" if all(in_t) else "speech" if all(in_s) else "path" if all(in_p) else "mixed"
         cand.append({"row": r, "tags": tags, "score": score, "where": where, "in_speech": words and any(in_s)})
 
+    scale = _scale_maps(cfg, con, args)
+    if scale["only"] is not None:
+        cand = [c for c in cand if c["row"]["id"] in scale["only"]]
+    if getattr(args, "dedupe", False):
+        cand = [c for c in cand if scale["rep"].get(c["row"]["id"], c["row"]["id"]) == c["row"]["id"]]
+    if getattr(args, "highlights", False):
+        cand = [c for c in cand if (scale["hl"].get(c["row"]["id"]) or (0,))[0] >= HL_MIN]
     qmap = _median_shake(con, [c["row"]["id"] for c in cand])
     out = []
     max_shake, min_q = getattr(args, "max_shake", None), getattr(args, "min_quality", None)
@@ -162,7 +192,13 @@ def search(cfg, con, args):
             continue
         c.update(quality=quality, shake=m["shake"] if m else None)
         out.append(c)
-    out.sort(key=lambda c: (-c["score"], -(c["quality"] or 0), -(c["row"]["duration"] or 0)))
+    hl = scale["hl"]
+    if scale["near"] is not None:
+        out.sort(key=lambda c: scale["near"].get(c["row"]["id"], (999, None))[0])
+    elif getattr(args, "highlights", False):
+        out.sort(key=lambda c: (-c["score"], -(hl.get(c["row"]["id"]) or (0,))[0], -(c["quality"] or 0)))
+    else:
+        out.sort(key=lambda c: (-c["score"], -(c["quality"] or 0), -(c["row"]["duration"] or 0)))
     out = out[:getattr(args, "limit", 30) or 30]
 
     res = []
@@ -173,7 +209,10 @@ def search(cfg, con, args):
                     "quality": c["quality"], "shake": None if c["shake"] is None else round(c["shake"], 2),
                     "setting": tags.get("setting"), "time_of_day": tags.get("time_of_day"),
                     "summary": tags.get("summary"), "match": c["where"], "hit_t": hit_t,
-                    "sheet": r["sheet"], "proxy": r["proxy"], "tags": tags})
+                    "sheet": r["sheet"], "proxy": r["proxy"], "tags": tags,
+                    "highlight": _hl_dict(hl.get(r["id"])), "session": scale["sess"].get(r["id"]),
+                    "dupe_of": (lambda rep: rep if rep and rep != r["id"] else None)(scale["rep"].get(r["id"])),
+                    "near_dist": (scale["near"] or {}).get(r["id"], (0, None))[1]})
     _note_usage(cfg, [x["id"] for x in res[:10]] if words else [])
     if getattr(args, "json", False):
         print(json.dumps(res, indent=1))
@@ -187,6 +226,13 @@ def search(cfg, con, args):
         desc = x["summary"] or x["rel"]
         if x["hit_t"] is not None:
             desc = f"[says @{x['hit_t']:.1f}s] {desc}"
+        if x["highlight"] and (getattr(args, "highlights", False) or x["highlight"]["score"] >= HL_MIN):
+            h = x["highlight"]
+            desc = f"[hl {h['score']:.2f} @{h['t'] or 0:.0f}s{(' ' + h['kind']) if h['kind'] else ''}] {desc}"
+        if x["near_dist"] is not None:
+            desc = f"[near {x['near_dist']:.1f}] {desc}"
+        if x["session"] is not None and getattr(args, "session", None) is None:
+            desc = f"[shoot {x['session']}] {desc}"
         q = f"{x['quality']:.0f}" if x["quality"] is not None else "-"
         sh = f"{x['shake']:.1f}" if x["shake"] is not None else "-"
         print(f"{x['id']:10s} {x['duration'] or 0:6.1f} {q:>3s} {sh:>5s}  {st:22s} {desc[:90]}")
@@ -229,6 +275,20 @@ def describe(cfg, con, ref, frames=0):
     print(f"  proxy    {c['proxy'] or '-'}\n  sheet    {c['sheet'] or '-'}")
     tags = db.get_tags(con, cid)
     print("  tags     " + (json.dumps(tags, ensure_ascii=False) if tags else "(untagged)"))
+    analyze.ensure_scale_schema(con)
+    dup = analyze.dupe_info(con, cid)
+    if dup:
+        print(f"  dupes    {dup['kind']} group of {len(dup['members'])}: " + ", ".join(dup["members"][:8])
+              + ("  (this is the representative)" if dup["rep"] == cid else f"  (representative {dup['rep']})"))
+    pk = con.execute("SELECT score, t, kind FROM highlight_peaks WHERE clip_id=?", (cid,)).fetchone()
+    if pk and pk["t"] is not None:
+        print(f"  highlight {pk['score']:.2f} at {pk['t']:.0f}s" + (f" ({pk['kind']})" if pk["kind"] else ""))
+    se = con.execute("SELECT session, place FROM sessions WHERE clip_id=?", (cid,)).fetchone()
+    if se:
+        print(f"  shoot    {se['session']}" + (f" · place {se['place']}" if se["place"] else ""))
+    gate = con.execute("SELECT reason FROM tag_gate WHERE clip_id=?", (cid,)).fetchone()
+    if gate and not tags:
+        print(f"  not sent for AI tagging: {gate['reason']}")
 
     q = analyze.clip_quality(con, cid)
     print(f"  quality  {_quality_line(q)}")
@@ -311,7 +371,7 @@ _STATS_CHECKED = {}
 
 def query(cfg, con, text="", setting=None, time=None, people=None, shot=None, camera=None, max_shake=None,
           min_quality=None, speech=None, creator=False, min_dur=None, offset=0, limit=200,
-          include_unusable=False, day=None) -> dict:
+          include_unusable=False, day=None, highlights=False, dedupe=False, session=None, near=None) -> dict:
     """Filtered, scored, paged clip search in SQL. Same filters and ranking as `search`
     (tags x3, speech x2, path x1 per word; then quality, then duration). speech: True = with
     speech, False = without, None = either. Returns {total, offset, limit, rows}."""
@@ -322,6 +382,22 @@ def query(cfg, con, text="", setting=None, time=None, people=None, shot=None, ca
         _STATS_CHECKED[key] = _time.time()
     words = [_norm(w) for w in (text or "").split() if _norm(w)]
     where, args = ["c.status != 'error'"], []
+    analyze.ensure_scale_schema(con)
+    if session not in (None, ""):
+        where.append("se.session = ?")
+        args.append(int(session))
+    if dedupe:
+        where.append("(d.clip_id IS NULL OR d.rep = c.id)")
+    if highlights:
+        where.append("COALESCE(hp.score, 0) >= ?")
+        args.append(HL_MIN)
+    near_pos = {}
+    if near:
+        lst = analyze.near(cfg, con, near, limit=max(100, int(limit or 200)))
+        near_pos = {x["id"]: (i, x["dist"]) for i, x in enumerate(lst)}
+        ids = list(near_pos) or ["-"]
+        where.append(f"c.id IN ({','.join('?' * len(ids))})")
+        args += ids
     tag = lambda k: f"lower(COALESCE(json_extract(t.data, '$.{k}'), ''))"     # noqa: E731
     if not include_unusable:
         where.append(f"(t.data IS NULL OR json_type(t.data, '$.usable') IS NULL OR "
@@ -365,15 +441,25 @@ def query(cfg, con, text="", setting=None, time=None, people=None, shot=None, ca
     score = " + ".join(score_parts) or "0"
     speech_hit = " OR ".join(["instr(lower(COALESCE(tr.text, '')), ?) > 0"] * len(words)) or "0"
     frm = ("FROM clips c LEFT JOIN tags t ON t.clip_id = c.id LEFT JOIN transcripts tr ON tr.clip_id = c.id "
-           "LEFT JOIN clip_stats s ON s.clip_id = c.id WHERE " + " AND ".join(where))
+           "LEFT JOIN clip_stats s ON s.clip_id = c.id LEFT JOIN highlight_peaks hp ON hp.clip_id = c.id "
+           "LEFT JOIN dupes d ON d.clip_id = c.id LEFT JOIN sessions se ON se.clip_id = c.id WHERE " + " AND ".join(where))
+    order = "score DESC, COALESCE(quality, 0) DESC, COALESCE(c.duration, 0) DESC, c.id"
+    order_args = []
+    if near_pos:
+        order = "CASE c.id " + " ".join("WHEN ? THEN ?" for _ in near_pos) + " END, c.id"
+        for cid, (i, _) in near_pos.items():
+            order_args += [cid, i]
+    elif highlights:
+        order = "score DESC, COALESCE(hp.score, 0) DESC, COALESCE(quality, 0) DESC, c.id"
     total = con.execute(f"SELECT COUNT(*) {frm}", args).fetchone()[0]
     limit = max(1, min(int(limit or 200), 1000))
     offset = max(0, int(offset or 0))
     sql = (f"SELECT c.id, c.rel, c.duration, c.width, c.height, c.rotation, c.fps, c.proxy, c.sheet, c.status, "
            f"c.shot_at, c.has_audio, t.data AS tags, COALESCE(tr.n_words, 0) AS n_words, tr.clip_id AS has_tr, "
-           f"s.shake AS shake, {qexpr} AS quality, ({score}) AS score, ({speech_hit}) AS speech_hit {frm} "
-           f"ORDER BY score DESC, COALESCE(quality, 0) DESC, COALESCE(c.duration, 0) DESC, c.id LIMIT ? OFFSET ?")
-    rows = con.execute(sql, score_args + list(words) + args + [limit, offset]).fetchall()
+           f"s.shake AS shake, {qexpr} AS quality, ({score}) AS score, ({speech_hit}) AS speech_hit, "
+           f"hp.score AS hl_score, hp.t AS hl_t, hp.kind AS hl_kind, d.rep AS dupe_rep, d.grp AS dupe_grp, "
+           f"se.session AS session {frm} ORDER BY {order} LIMIT ? OFFSET ?")
+    rows = con.execute(sql, score_args + list(words) + args + order_args + [limit, offset]).fetchall()
     out = []
     for r in rows:
         tags = json.loads(r["tags"]) if r["tags"] else {}
@@ -387,6 +473,12 @@ def query(cfg, con, text="", setting=None, time=None, people=None, shot=None, ca
                     "tags": {k: tags.get(k) for k in ("summary", "setting", "time_of_day", "people", "shot", "mood",
                                                        "quality", "usable", "creator_visible") if k in tags},
                     "tagged": bool(tags),
+                    "highlight": None if r["hl_score"] is None else {"score": round(r["hl_score"], 3), "t": r["hl_t"],
+                                                                     "kind": r["hl_kind"]},
+                    "session": r["session"],
+                    "dupe_of": r["dupe_rep"] if r["dupe_rep"] and r["dupe_rep"] != r["id"] else None,
+                    "dupe_group": r["dupe_grp"],
+                    "near_dist": near_pos.get(r["id"], (0, None))[1] if near_pos else None,
                     "hit_t": first_hit(cfg, r["id"], words) if words and r["speech_hit"] else None})
     return {"total": total, "offset": offset, "limit": limit, "rows": out}
 
@@ -398,5 +490,9 @@ def days(con) -> list:
         "COALESCE(SUM(c.duration), 0) AS dur, SUM(CASE WHEN COALESCE(tr.n_words, 0) > 5 THEN 1 ELSE 0 END) AS sp "
         "FROM clips c LEFT JOIN transcripts tr ON tr.clip_id = c.id WHERE c.status != 'error' "
         "GROUP BY day ORDER BY day DESC").fetchall()
-    return [{"day": r["day"], "clips": r["n"], "hours": round(r["dur"] / 3600, 2), "speech_clips": r["sp"] or 0}
+    by_day = {}
+    for s_ in analyze.session_list(con):
+        by_day.setdefault(s_["day"], []).append(s_)
+    return [{"day": r["day"], "clips": r["n"], "hours": round(r["dur"] / 3600, 2), "speech_clips": r["sp"] or 0,
+             "sessions": sorted(by_day.get(r["day"], []), key=lambda x: x["start"] or "")}
             for r in rows]

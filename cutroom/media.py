@@ -1,6 +1,7 @@
 """Thin, logged wrappers around ffprobe/ffmpeg. Every module renders through `ffmpeg()` so one
 place controls binaries, logging, retries and the optional remote-render prefix."""
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -117,14 +118,82 @@ def doctor(cfg) -> list:
     return res
 
 
-def hw_encoder(cfg) -> list:
-    """Fast encoder args for proxies/previews: VideoToolbox on macOS, NVENC on NVIDIA, else x264 veryfast."""
-    enc = run([cfg.ffmpeg, "-hide_banner", "-encoders"], check=False).stdout
+def proxy_bitrate(cfg) -> str:
+    """Hardware-encoder bitrate for proxies: cfg.proxy_bitrate, or scaled from proxy_height.
+    540p at 1.2 Mb/s is about 0.16 MB per second of footage (54 GB per 100 h); 360p at 0.6 Mb/s half that."""
+    b = str(getattr(cfg, "proxy_bitrate", "") or "").strip()
+    if b:
+        return b
+    h = int(getattr(cfg, "proxy_height", 540) or 540)
+    return f"{max(300, int(round(1200 * (h / 540) ** 1.7 / 50)) * 50)}k"
+
+
+_ENCODERS = {}
+
+
+def hw_encoder(cfg, bitrate=None) -> list:
+    """Fast encoder args for proxies/previews: VideoToolbox on macOS, NVENC on NVIDIA, else x264 veryfast.
+    The hardware bitrate comes from cfg (proxy_bitrate / proxy_height), never a hard-coded number."""
+    key = cfg.ffmpeg
+    if key not in _ENCODERS:
+        _ENCODERS[key] = run([cfg.ffmpeg, "-hide_banner", "-encoders"], check=False).stdout or ""
+    enc = _ENCODERS[key]
+    b = bitrate or proxy_bitrate(cfg)
     if "h264_videotoolbox" in enc and sys.platform == "darwin":
-        return ["-c:v", "h264_videotoolbox", "-b:v", "2500k"]
+        return ["-c:v", "h264_videotoolbox", "-b:v", b]
     if "h264_nvenc" in enc:
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "28"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(cfg.proxy_crf)]
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "28", "-maxrate", b]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(cfg.proxy_crf), "-maxrate", b, "-bufsize", b]
+
+
+# -- GPS --------------------------------------------------------------------------------------------
+_ISO6709 = re.compile(r"^\s*([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)?")
+
+
+def parse_iso6709(s) -> tuple | None:
+    """'+37.7749-122.4194+010.000/' -> (lat, lon, alt|None). Phones and many cameras write this in the
+    `location` / `com.apple.quicktime.location.ISO6709` tags. None when it is not decimal-degree ISO 6709."""
+    m = _ISO6709.match(str(s or ""))
+    if not m:
+        return None
+    lat, lon = float(m.group(1)), float(m.group(2))
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == 0 and lon == 0):
+        return None
+    return lat, lon, float(m.group(3)) if m.group(3) else None
+
+
+def _dms(v, ref) -> float | None:
+    """'35:39.1234' or '35:39:07.4' (+ N/S/E/W) -> decimal degrees."""
+    try:
+        parts = [float(x) for x in str(v).replace(",", ".").split(":")]
+    except ValueError:
+        return None
+    deg = parts[0] + (parts[1] / 60 if len(parts) > 1 else 0) + (parts[2] / 3600 if len(parts) > 2 else 0)
+    return -deg if str(ref or "").upper()[:1] in ("S", "W") else deg
+
+
+def geo_from_xml(text: str) -> tuple | None:
+    """Camera XML sidecars (e.g. NonRealTimeMeta ExifGPS items Latitude/LatitudeRef/Longitude/LongitudeRef)."""
+    items = dict(re.findall(r'<Item\s+name="(\w+)"\s+value="([^"]*)"', text or ""))
+    if "Latitude" in items and "Longitude" in items:
+        lat, lon = _dms(items["Latitude"], items.get("LatitudeRef")), _dms(items["Longitude"], items.get("LongitudeRef"))
+        if lat is not None and lon is not None and -90 <= lat <= 90 and -180 <= lon <= 180 and (lat or lon):
+            return lat, lon, None
+    return None
+
+
+def geo_from_probe(info: dict) -> tuple | None:
+    """GPS (lat, lon, alt) from ffprobe format/stream tags, or None."""
+    tags = dict((info.get("format") or {}).get("tags") or {})
+    for s in info.get("streams", []) or []:
+        tags.update(s.get("tags") or {})
+    for k, v in tags.items():
+        kl = k.lower()
+        if kl.startswith("location") or kl.endswith("location.iso6709"):
+            g = parse_iso6709(v)
+            if g:
+                return g
+    return None
 
 
 def frame_at(cfg, src, t, out, width=640):

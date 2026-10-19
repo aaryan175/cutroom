@@ -1,15 +1,13 @@
 // Program monitor: draft playback of the resolved timeline from proxies (two <video>s swapped at
-// cuts, captions/overlays drawn as HTML, section music synced), render playback, and the Reference
-// side-by-side view.
+// cuts, captions/overlays drawn as HTML, section music synced) and render playback. The Reference tab
+// opens the Reference workspace (reference.js), which borrows this monitor for side by side / onion skin.
 import { S, on, emit, setPlayhead, pictureAt, pieceAt, sectionAt, segmentOf, fps } from './state.js';
 import { api, media } from './api.js';
 import { h, icon, tc, clamp, toast, LS } from './util.js';
 
 let view, frame, vids, rv, music, card, gfx, safe, tcEl, durEl, playBtn, modeSeg, renderSel, emptyEl;
-let refPane, refBar, refFrame, refVideo, refSel, refSyncBtn, refOffsetInp, refTc;
 let active = 0;
 const clock = { playing: false, rate: 1, wall0: 0, t0: 0 };
-let refOn = false, refSync = LS.get('refSync', true), refOffset = LS.get('refOffset', 0);
 
 // ---------------------------------------------------------------- video helpers
 function want(v, clip, t) {
@@ -160,7 +158,6 @@ function tick() {
     setPlayhead(T, 'program');
     showDraftFrame(T, clock.rate > 0);
   }
-  syncRef();
   requestAnimationFrame(tick);
 }
 function play(rate = 1) {
@@ -176,7 +173,6 @@ function play(rate = 1) {
 function pause() {
   clock.playing = false; S.playing = false;
   vids.forEach((v) => v.pause()); music.pause(); rv.pause();
-  if (refSync && refVideo) refVideo.pause();
   playBtn.innerHTML = icon('play');
   emit('playing', false);
   if (S.programMode === 'draft') showDraftFrame(S.playhead, false);
@@ -230,7 +226,7 @@ function setMode(mode) {
     if (!S.renderFile && list[0]) S.renderFile = list[0].file;
     if (S.renderFile) { renderSel.value = S.renderFile; if (!rv.src.endsWith(media.render(S.renderFile))) rv.src = media.render(S.renderFile); }
     emptyEl.hidden = !!S.renderFile;
-    emptyEl.querySelector('div').textContent = 'No render for this plan yet. Commit a version, then Render preview.';
+    emptyEl.querySelector('div').textContent = 'No render for this plan yet. Save a version, then Render preview.';
   } else {
     emptyEl.hidden = !!S.tl;
     emptyEl.querySelector('div').textContent = 'Open a plan to play the edit';
@@ -241,69 +237,8 @@ function setMode(mode) {
 }
 
 // ---------------------------------------------------------------- reference
-function syncRef() {
-  if (!refOn || !refSync || !refVideo || !refVideo.src) return;
-  const t = S.playhead + refOffset;
-  if (clock.playing) {
-    if (refVideo.paused) refVideo.play().catch(() => {});
-    refVideo.playbackRate = clamp(Math.abs(clock.rate), 0.25, 8);
-    if (Math.abs(refVideo.currentTime - t) > 0.25) refVideo.currentTime = Math.max(0, t);
-  } else if (Math.abs(refVideo.currentTime - t) > 0.5 / fps()) { refVideo.pause(); refVideo.currentTime = Math.max(0, t); }
-}
-function buildRef() {
-  refVideo = h('video', { preload: 'auto', playsInline: true, muted: true });
-  refFrame = h('div.mon-frame', refVideo);
-  refSel = h('select.inp', { title: 'Reference video' });
-  refSyncBtn = h('button.btn', { title: 'Lock the reference playhead to the program', on: { click: () => { refSync = !refSync; LS.set('refSync', refSync); refSyncBtn.classList.toggle('on', refSync); syncRef(); } } }, h('span', { html: icon('sync', 13) }), 'Sync');
-  refSyncBtn.classList.toggle('on', refSync);
-  refOffsetInp = h('input.inp.mono', { type: 'number', step: 0.04, value: refOffset, style: { width: '64px' }, title: 'Reference offset (s) relative to the program' });
-  refOffsetInp.addEventListener('change', () => { refOffset = +refOffsetInp.value || 0; LS.set('refOffset', refOffset); syncRef(); });
-  refOffsetInp.addEventListener('keydown', (e) => e.stopPropagation());
-  refTc = h('span.tc.mono', { style: { color: 'var(--text-2)', fontSize: '11.5px' } }, '00:00:00:00');
-  const refPlay = h('button.ib.sm', { title: 'Play / pause reference', html: icon('play'), on: { click: () => { if (refVideo.paused) refVideo.play(); else refVideo.pause(); } } });
-  refVideo.addEventListener('play', () => (refPlay.innerHTML = icon('pause')));
-  refVideo.addEventListener('pause', () => (refPlay.innerHTML = icon('play')));
-  refVideo.addEventListener('timeupdate', () => (refTc.textContent = tc(refVideo.currentTime, fps())));
-  refVideo.addEventListener('seeked', () => (refTc.textContent = tc(refVideo.currentTime, fps())));
-  const markRef = h('button.btn', { title: 'Grab this reference frame to chat as "match this" (R)', on: { click: markReference } }, h('span', { html: icon('grab', 13) }), 'Match this');
-  const refView = h('div.mon-view', refFrame);
-  refPane = refView;
-  refBar = h('div.ref-bar', h('span.ref-lbl', 'Reference'), refSel, refPlay, refTc, h('span', { style: { flex: 1 } }), refSyncBtn, h('span.ref-lbl', 'offset s'), refOffsetInp, markRef);
-  split.parentNode.insertBefore(refBar, split.nextSibling);
-  refSel.addEventListener('change', () => { refVideo.src = media.ref(refSel.value); LS.set('refFile', refSel.value); syncRef(); });
-  new ResizeObserver(() => fitFrame(refView, refFrame, refVideo.videoWidth && refVideo.videoHeight ? refVideo.videoWidth / refVideo.videoHeight : 16 / 9)).observe(refView);
-  refVideo.addEventListener('loadedmetadata', () => fitFrame(refView, refFrame, refVideo.videoWidth / refVideo.videoHeight));
-  return refPane;
-}
-function fillRefs() {
-  if (!refSel) return;
-  const refs = (S.project && S.project.references) || [];
-  const renders = (S.project && S.project.renders) || [];
-  refSel.innerHTML = '';
-  if (refs.length) { const g = h('optgroup', { label: 'Reference' }); for (const r of refs) g.appendChild(h('option', { value: r.file }, r.file)); refSel.appendChild(g); }
-  if (!refs.length) refSel.appendChild(h('option', { value: '' }, 'No reference videos (put files in renders/reference/)'));
-  void renders;
-  const want0 = LS.get('refFile', refs[0] && refs[0].file);
-  if (want0 && refs.some((r) => r.file === want0)) { refSel.value = want0; if (!refVideo.src) refVideo.src = media.ref(want0); }
-}
-export async function markReference() {
-  if (!refOn) { setRef(true); }
-  if (!refVideo || !refSel.value) { toast('Pick a reference video first', 'warn'); return; }
-  try {
-    const t = +refVideo.currentTime.toFixed(3);
-    const r = await api.grab({ source: 'ref', file: refSel.value, t });
-    emit('attach', { url: r.url, label: `match this · ${refSel.value} @ ${t.toFixed(2)}s`, source: 'ref', t, match: true });
-    toast('Reference frame attached to chat', 'ok', 1500);
-  } catch (e) { toast(`Reference grab failed: ${e.message}`, 'error'); }
-}
-function setRef(onOff) {
-  refOn = onOff;
-  document.querySelectorAll('#p-program .ptab[data-ptab]').forEach((b) => b.classList.toggle('on', b.dataset.ptab === 'program' || onOff));
-  if (onOff && !refPane) { split.appendChild(buildRef()); fillRefs(); }
-  if (refPane) { refPane.hidden = !onOff; refBar.hidden = !onOff; }
-  LS.set('refOn', onOff);
-  requestAnimationFrame(() => { fitMain(); syncRef(); });
-}
+// The Reference tab opens the Reference workspace (reference.js); R grabs a reference frame to chat.
+export function markReference() { emit('markReference'); }
 
 // ---------------------------------------------------------------- frame fitting
 function fitFrame(container, el, ar) {
@@ -365,7 +300,7 @@ export function initProgram(body, tools) {
     modeSeg, renderSel,
     h('span.grow'),
     safeBtn,
-    h('button.ib.nw', { title: 'Add marker (M)', html: icon('marker'), on: { click: () => emit('addMarker') } }),
+    h('button.ib.nw.cm-btn', { title: 'Add comment at this frame (M)', html: '<svg class="ic" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 3.5h11v7.5h-6.2L4 13.6V11H2.5z"/><path d="M5.2 6.6h5.6M5.2 8.6h3.6"/></svg>', on: { click: () => emit('addMarker') } }),
     h('button.ib', { title: 'Grab frame to chat', html: icon('grab'), on: { click: grabProgram } }),
     durEl);
   durEl.classList.add('nw');
@@ -374,7 +309,7 @@ export function initProgram(body, tools) {
   document.body.appendChild(music);
 
   document.querySelectorAll('#p-program .ptab[data-ptab]').forEach((b) => b.addEventListener('click', () => {
-    if (b.dataset.ptab === 'reference') setRef(!refOn); else if (refOn) setRef(false);
+    emit('toggleReference', b.dataset.ptab === 'reference' ? undefined : false);
   }));
   void tools;
 
@@ -392,7 +327,6 @@ export function initProgram(body, tools) {
     if (clock.playing) { clock.t0 = S.playhead; clock.wall0 = performance.now(); }
     if (S.programMode === 'render') { if (Math.abs(rv.currentTime - S.playhead) > 0.02) rv.currentTime = S.playhead; }
     else showDraftFrame(S.playhead, clock.playing);
-    syncRef();
   });
   on('scrubStart', () => { if (clock.playing) { pause(); } });
   on('plan', () => {
@@ -404,8 +338,7 @@ export function initProgram(body, tools) {
     fitMain();
     if (S.programMode === 'draft') showDraftFrame(S.playhead, clock.playing);
   });
-  on('project', () => { fillRefs(); if (S.programMode === 'render') setMode('render'); });
+  on('project', () => { if (S.programMode === 'render') setMode('render'); });
   on('playRender', playRender);
   on('layout', fitMain);
-  if (LS.get('refOn', false)) setRef(true);
 }

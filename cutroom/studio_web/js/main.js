@@ -9,6 +9,12 @@ import { initProgram, programCtl, markReference } from './program.js';
 import { initTimeline, razor, freeze, deleteSelection, toggleSnap, zoomBy, fit, revealPlayhead, _test as tlTest } from './timeline.js';
 import { initChat } from './chat.js';
 import { initDock } from './dock.js';
+import { initImporter } from './importer.js';
+import { initVersions, draftLabel } from './versions.js';
+import { initReference, _test as refTest } from './reference.js';
+import { initComments } from './comments.js';
+import { initLooks } from './looks.js';
+import { initTour } from './tour.js';
 
 // ---------------------------------------------------------------- header
 function fmtN(n) { return n === undefined || n === null ? '–' : Number(n).toLocaleString(undefined, { maximumFractionDigits: 1 }); }
@@ -30,9 +36,10 @@ function renderPlanBits() {
   const hasVersion = pl && pl.versions && pl.versions.length;
   $('#btn-render').disabled = !hasVersion;
   $('#btn-render-more').disabled = !hasVersion;
-  $('#btn-render').title = hasVersion ? `Render a preview of ${latestVersion()}` : 'Commit a version first (⌘S)';
+  $('#btn-render').title = hasVersion ? `Render a preview of ${latestVersion().replace(/^.*_v(\d+)\.json$/, 'v$1')}` : 'Save a version first (⌘S)';
   const ds = $('#draft-state');
-  ds.textContent = pl ? `draft${hasVersion ? ` · last commit ${latestVersion().replace(/^.*_v(\d+)\.json$/, 'v$1')}` : ' · never committed'}` : '';
+  ds.textContent = draftLabel();
+  ds.classList.toggle('dirty', /unsaved|not saved/.test(ds.textContent));
 }
 function latestVersion() {
   const v = (S.plan && S.plan.versions) || [];
@@ -49,7 +56,7 @@ function renderPlanMenu() {
   }
   if (S.plan && S.plan.versions && S.plan.versions.length) {
     m.appendChild(h('hr'));
-    m.appendChild(h('div.mh', 'Committed versions of this plan'));
+    m.appendChild(h('div.mh', 'Saved versions of this plan'));
     for (const v of S.plan.versions.slice().reverse()) {
       m.appendChild(h('button', { title: 'Render this version', on: { click: () => { m.hidden = true; doRender(true, v); } } }, v, h('span.k', 'render preview')));
     }
@@ -73,7 +80,7 @@ async function refreshProject() {
 
 async function doRender(preview = true, file = null) {
   const v = file || latestVersion();
-  if (!v) { toast('Commit a version first (⌘S). Renders always use a committed version.', 'warn'); return; }
+  if (!v) { toast('Save a version first (⌘S). Renders always use a saved version.', 'warn'); return; }
   const planFile = v.includes('/') ? v : `plans/${v}`;
   try {
     const r = await api.render(planFile, preview);
@@ -82,14 +89,38 @@ async function doRender(preview = true, file = null) {
     emit('jobs'); emit('showDock', 'jobs');
   } catch (e) { toast(`Render failed to start: ${e.message}`, 'error'); }
 }
+// ---------------------------------------------------------------- deliverables (cutroom export)
+function exportTarget() {
+  const all = (S.project && S.project.renders) || [];
+  const slug = S.plan && S.plan.slug;
+  if (S.renderFile) return S.renderFile;
+  const mine = all.filter((r) => slug && (r.plan === slug || (r.file || '').startsWith(slug + '_')));
+  const pick = (mine.length ? mine : all).slice().sort((a, b) => (b.created || 0) - (a.created || 0))[0];
+  return pick ? pick.file : null;
+}
+async function doExport(kind) {
+  const file = exportTarget();
+  if (!file) { toast('Render the edit first: exports are made from a render.', 'warn'); return; }
+  const body = { video: file };
+  if (kind === 'thumbs') body.thumbs = true;
+  else if (kind === 'cut30') { body.cutdown = [30]; body.preset = ['reels']; }
+  else if (kind === 'all') { body.preset = ['all']; body.thumbs = true; }
+  else body.preset = [kind];
+  try {
+    const r = await api.exportRender(body);
+    toast(`Export queued for ${String(file).split('/').pop()}`, 'ok', 2200);
+    if (r && r.job) S.jobs.set(r.job, { id: r.job, kind: 'export', label: `export ${kind}`, status: 'queued', progress: 0, started: Date.now() / 1000 });
+    emit('jobs'); emit('showDock', 'jobs');
+  } catch (e) { toast(`Export failed to start: ${e.message}`, 'error'); }
+}
 async function commit() {
   if (!S.plan) return;
   try {
     const r = await api.commit(S.plan.slug);
-    toast(`Committed ${r.name || 'new version'}`, 'ok', 2200);
+    toast(`Saved as v${r.version || (String(r.name).match(/_v(\d+)/) || [0, '?'])[1]}`, 'ok', 2200);
     await reloadPlan('commit');
     refreshProject();
-  } catch (e) { toast(`Commit failed: ${e.message}`, 'error'); }
+  } catch (e) { toast(`Save version failed: ${e.message}`, 'error'); }
 }
 
 // ---------------------------------------------------------------- new plan prompt (inline, no dialogs)
@@ -110,8 +141,8 @@ const mon = () => (S.activeMonitor === 'source' && sourceCtl.loaded ? sourceCtl 
 const KEYS = [
   ['Playback', [['Play / pause', ['Space']], ['Shuttle back / stop / forward', ['J', 'K', 'L']], ['One frame', ['←', '→']], ['One second', ['⇧←', '⇧→']]]],
   ['Source', [['Set In / Out', ['I', 'O']], ['Insert at playhead', [',']], ['Overwrite at playhead', ['.']]]],
-  ['Timeline', [['Razor at playhead', ['C']], ['Delete / ripple delete', ['Del', '⇧Del']], ['Freeze frame', ['F']], ['Marker', ['M']], ['Snapping', ['S']], ['Zoom in / out / fit', ['=', '−', '\\']]]],
-  ['Edit', [['Undo / redo', ['⌘Z', '⇧⌘Z']], ['Commit version', ['⌘S']], ['Reference frame → chat', ['R']], ['Focus chat', ['/']], ['This help', ['?']]]],
+  ['Timeline', [['Razor at playhead', ['C']], ['Delete / ripple delete', ['Del', '⇧Del']], ['Freeze frame', ['F']], ['Comment (draw: A B C P, range: I / O)', ['M']], ['Snapping', ['S']], ['Zoom in / out / fit', ['=', '−', '\\']]]],
+  ['Edit', [['Undo / redo', ['⌘Z', '⇧⌘Z']], ['Save version', ['⌘S']], ['Reference frame → chat', ['R']], ['Focus chat', ['/']], ['This help', ['?']]]],
 ];
 function showHelp(onOff) {
   const o = $('#help');
@@ -150,8 +181,8 @@ function onKey(e) {
     case 'l': case 'L': handled(); mon().shuttle(1); break;
     case 'ArrowLeft': handled(); e.shiftKey ? mon().seekRel(-1) : mon().step(-1); break;
     case 'ArrowRight': handled(); e.shiftKey ? mon().seekRel(1) : mon().step(1); break;
-    case 'i': case 'I': handled(); sourceCtl.markIn(); break;
-    case 'o': case 'O': handled(); sourceCtl.markOut(); break;
+    case 'i': case 'I': handled(); if (S.commentDraft) emit('commentMark', 'in'); else sourceCtl.markIn(); break;
+    case 'o': case 'O': handled(); if (S.commentDraft) emit('commentMark', 'out'); else sourceCtl.markOut(); break;
     case ',': handled(); insertFromSource('insert'); break;
     case '.': handled(); insertFromSource('overwrite'); break;
     case 'c': case 'C': handled(); razor(); break;
@@ -208,8 +239,12 @@ function startEvents() {
     governor: (d) => { S.governor = normGovernor(d); renderGov(); emit('governor'); },
     overnight: (d) => { S.overnight = normOvernight(d); emit('overnight'); },
     render_done: (d) => { toast(`Render finished: ${String(d.file).split('/').pop()}`, 'ok', 5000); refreshProject().then(() => { if (S.programMode === 'render') emit('playRender', d.file); }); },
+    export_done: (d) => { const n = (d.files || []).filter((f) => /\.(mp4|jpg)$/.test(f.file)).length; toast(`Export finished: ${n} file(s) in ${d.dir}${(d.warnings || []).length ? ` · ${d.warnings[0]}` : ''}`, 'ok', 7000); refreshProject(); },
     notes: () => { loadMarkers(); },
     markers: (d) => { if (!d.plan || !S.plan || d.plan === S.plan.slug) loadMarkers(); },
+    ref: (d) => emit('ref', d),
+    library_changed: () => { refreshProject(); emit('libraryChanged'); },
+    comments: (d) => emit('commentsRun', d),
   }, (state) => { const c = $('#conn'); c.className = 'conn ' + state; c.title = state === 'live' ? 'Live updates connected' : state === 'down' ? 'Live updates disconnected, retrying…' : 'Connecting…'; });
 }
 
@@ -223,6 +258,11 @@ async function boot() {
   initTimeline($('#timeline-body'), $('#timeline-tools'));
   initChat($('#claude-body'), $('#claude-tools'));
   initDock($('#dock-body'));
+  initImporter();
+  initVersions();
+  initReference();
+  initComments();
+  initLooks();
 
   on('project', () => { renderHeader(); renderPlanBits(); });
   on('plan', () => { renderPlanBits(); });
@@ -240,10 +280,15 @@ async function boot() {
   $('#btn-commit').onclick = commit;
   $('#btn-render').onclick = () => doRender(true);
   $('#btn-render-more').onclick = (e) => { e.stopPropagation(); const m = $('#render-menu'); m.hidden = !m.hidden; };
-  $('#render-menu').addEventListener('click', (e) => { const b = e.target.closest('button[data-render]'); if (!b) return; $('#render-menu').hidden = true; doRender(b.dataset.render === 'preview'); });
+  $('#render-menu').addEventListener('click', (e) => {
+    const x = e.target.closest('button[data-export]');
+    if (x) { $('#render-menu').hidden = true; doExport(x.dataset.export); return; }
+    const b = e.target.closest('button[data-render]'); if (!b) return; $('#render-menu').hidden = true; doRender(b.dataset.render === 'preview');
+  });
   $('#plan-btn').onclick = (e) => { e.stopPropagation(); const m = $('#plan-menu'); if (m.hidden) renderPlanMenu(); m.hidden = !m.hidden; };
   $('#gov-pill').onclick = () => emit('showDock', 'overnight');
   $('#btn-help').onclick = () => showHelp();
+  initTour();
   document.addEventListener('click', () => { $('#plan-menu').hidden = true; $('#render-menu').hidden = true; });
   document.addEventListener('keydown', onKey);
   // clicking anywhere in a monitor panel focuses it for transport keys
@@ -272,6 +317,6 @@ async function boot() {
   const last = LS.get('lastPlan', null);
   const pick = plans.find((p) => p.slug === last) || plans[0];
   if (pick) await openPlan(pick.slug); else { emit('plan', { by: 'open' }); loadMarkers(); }
-  window.__studio = { S, emit, fps, tl: tlTest };
+  window.__studio = { S, emit, fps, tl: tlTest, ref: refTest };
 }
 boot().catch((e) => { console.error(e); toast(`Studio failed to start: ${e.message}`, 'error', 10000); });

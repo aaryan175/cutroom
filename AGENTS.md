@@ -6,7 +6,7 @@ where it says "Claude".
 
 **Before acting, read `CLAUDE.md` and the skills in `.claude/skills/*/SKILL.md`.** Load the skill that
 matches the step you are on (library-indexing, footage-tagging, edit-planning, render-and-qa,
-review-loop). Then read `docs/WORKFLOW.md`, `docs/EDITING_RULES.md` and `docs/PLAN_FORMAT.md` before the
+review-loop, reference-matching). Then read `docs/WORKFLOW.md`, `docs/EDITING_RULES.md` and `docs/PLAN_FORMAT.md` before the
 first edit, and `docs/STUDIO.md` for the browser editor.
 
 - **Extending the tool:** when the creator asks for something cutroom can't do yet, follow
@@ -32,18 +32,34 @@ chat panel. Then:
 - **Edit the draft, not a new file.** The open plan is `plans/<slug>.draft.json`; its path is
   `draft_path` in `studio/context.json` and in the "What I'm pointing at" block of each message. Edit
   it in place; the studio reloads it on save and records your edit as an undo step. Only write a
-  `_vN.json` when asked to commit; the creator commits with Cmd/Ctrl+S.
+  `_vN.json` when asked to save a version; the creator saves versions with Save version (Cmd/Ctrl+S).
 - **"This shot", "here", "this frame"** refer to the pointing block: playhead time, the segment under
   it (clip, source time, in/out), the selection, the source clip with its In/Out, and attached frame
   grabs (image paths: open them before answering).
-- **Markers** live in `studio/markers.json` (`{id, plan, t, text, frame_url, status, kind}`;
-  `cutroom markers list` shows the open ones with their frame paths). "Fix all open markers" = read
-  every open marker for the plan, look at its frame, make the change in the draft (one change per
-  marker), then `cutroom markers done <id>` for each one handled. Say which ones you skipped and why.
+- **Review comments** (called markers in older projects) live in `studio/markers.json`
+  (`{id, plan, t, t_end?, text, frame_url, drawing?, status, thread}`; `cutroom comments list` shows the
+  open ones with their frame paths). See "Review comments" below.
 - Timeline times in markers and the pointing block are OUTPUT seconds; plans use SOURCE seconds. Map
   through the tightened pieces (`cutroom plan check` + the render sidecar, or the studio's own ops),
   never by subtracting by hand across a jump cut.
 - Render from the studio's Jobs panel or `cutroom render`; never render the draft file itself.
+- **Reference requests** ("make it like this video", a link, a file in `renders/reference/`): load the
+  `reference-matching` skill. Measure it with `cutroom ref`, rebuild from the cut map, and run
+  `cutroom ref compare` every round.
+
+### Review comments: one at a time
+The creator reviews like on a review site: they pause, press M, type a note and often draw on the frame
+(arrow, box, circle, pen). "Send to AI" runs ONE turn per comment, in timeline order. In such a turn:
+- **One change per comment.** Change exactly what that comment asks, nothing else. Open its frame first:
+  the attached image has their drawing on it, so "this" means what they circled or pointed at. A
+  comment with `t_end` covers that range ("from here to here").
+- **Reply in one or two plain sentences** saying what changed, with a `[[t:<seconds>]]` chip where it
+  is, and mark it done: `cutroom comments done <id> --reply "Trimmed the pause before the laugh [[t:12.4]]."`
+- **Ambiguous or impossible? Don't guess.** Change nothing and run
+  `cutroom comments needs <id> --reply "Needs you: <one short question>"`.
+- Each comment's edits become one undo step, so the creator can undo a single comment's change.
+- Outside the queue ("fix all open comments" in chat): the same rules, one comment after another, then
+  say which ones you skipped and why.
 
 ### Talking in the studio: clips, not code
 The creator never sees code, JSON or file paths. They talk to you like an editor ("go through the

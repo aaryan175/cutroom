@@ -267,7 +267,7 @@ def test_captions_visible(renders):
     img = np.frombuffer(r.stdout, np.uint8).reshape(H, W, 3)
     band = img[int(H * 0.80):int(H * 0.97)] if cap["position"] == "bottom" else img[:int(H * 0.2)]
     white = (band.min(axis=2) > 225).sum()
-    assert white > 400, white
+    assert white > 150, white          # default caption size is the reference's ~32 px at 1080 (16 px here)
     # no keyline: there must be no ring of near-black pixels hugging the letters
     assert (band.max(axis=2) < 15).sum() < white * 0.2
 

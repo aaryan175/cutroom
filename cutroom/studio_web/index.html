@@ -6,6 +6,11 @@
 <title>Cutroom Studio</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%231d1d20'/%3E%3Cpath d='M4 4h3v8H4zM9 4h3v3H9zM9 9h3v3H9z' fill='%234c8dff'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="css/app.css">
+<link rel="stylesheet" href="css/reference.css">
+<link rel="stylesheet" href="css/importer.css">
+<link rel="stylesheet" href="css/comments.css">
+<link rel="stylesheet" href="css/looks.css">
+<link rel="stylesheet" href="css/tour.css">
 </head>
 <body>
 <div id="app">
@@ -24,13 +29,20 @@
       <button id="btn-undo" class="tb-icon" title="Undo (⌘Z)" disabled><i data-icon="undo"></i></button>
       <button id="btn-redo" class="tb-icon" title="Redo (⇧⌘Z)" disabled><i data-icon="redo"></i></button>
       <span class="hdr-sep"></span>
-      <button id="btn-commit" class="tb-btn" title="Commit version (⌘S)" disabled><i data-icon="commit"></i>Commit version</button>
+      <button id="btn-commit" class="tb-btn" title="Save version (⌘S): saves a numbered copy (v1, v2…) you can render, compare and go back to. Your edits auto-save as a draft." disabled><i data-icon="commit"></i>Save version</button>
       <div class="split-btn">
         <button id="btn-render" class="tb-btn primary" title="Render a preview of the latest version" disabled><i data-icon="render"></i>Render preview</button>
         <button id="btn-render-more" class="tb-btn primary caret" title="Render options" disabled><i data-icon="chev"></i></button>
         <div id="render-menu" class="menu right" hidden>
           <button data-render="preview">Render preview <span class="k">720p, proxies</span></button>
           <button data-render="final">Render final <span class="k">full quality, masters</span></button>
+          <div class="menu-sep" style="border-top:1px solid var(--line, #333);margin:4px 0"></div>
+          <button data-export="reels" title="Face-tracked 9:16 of the selected (or latest) render + .srt">Export Reels / TikTok <span class="k">9:16, face-tracked</span></button>
+          <button data-export="youtube" title="YouTube master + .srt/.vtt + chapters">Export YouTube <span class="k">16:9, chapters</span></button>
+          <button data-export="square">Export square <span class="k">1:1</span></button>
+          <button data-export="thumbs">Thumbnail candidates <span class="k">6 + contact sheet</span></button>
+          <button data-export="cut30">30 s cutdown <span class="k">new plan + 9:16</span></button>
+          <button data-export="all">Export everything <span class="k">all presets + thumbs</span></button>
         </div>
       </div>
     </div>
@@ -99,7 +111,8 @@
     <div class="ptabs" data-tabs="dock">
       <button class="ptab on" data-tab="inspector">Inspector</button>
       <button class="ptab" data-tab="story" title="The edit as a beat sheet">Story</button>
-      <button class="ptab" data-tab="markers">Markers<span class="badge" id="badge-markers"></span></button>
+      <button class="ptab" data-tab="comments" title="Review comments pinned to frames">Comments<span class="badge" id="badge-markers"></span></button>
+      <button class="ptab" data-tab="looks" title="Colour looks, previewed on your own frame">Looks</button>
       <button class="ptab" data-tab="qa">QA<span class="badge" id="badge-qa"></span></button>
       <button class="ptab" data-tab="jobs">Jobs<span class="badge" id="badge-jobs"></span></button>
       <button class="ptab" data-tab="overnight">Overnight</button>

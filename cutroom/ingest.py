@@ -134,6 +134,34 @@ def scan(cfg, con) -> dict:
     return {"files": n_files, "new": n_new, "changed": n_changed, "missing": missing, "seconds": dt}
 
 
+def register_files(cfg, con, paths) -> list:
+    """Register just these video files (each must sit under one of cfg.library_roots); returns their clip ids.
+    New or changed files get status 'new', unchanged ones keep their status. Used by the studio's Import."""
+    roots = [os.path.realpath(r) for r in cfg.library_roots]
+    ids, now = [], time.time()
+    for path in paths:
+        path = os.path.realpath(str(path))
+        root = next((r for r in sorted(roots, key=len, reverse=True)
+                     if path == r or path.startswith(r.rstrip(os.sep) + os.sep)), None)
+        if root is None:
+            _log(f"  ! not inside a library folder, skipped: {path}")
+            continue
+        if os.path.splitext(path)[1].lower() not in VIDEO_EXTS or not os.path.isfile(path):
+            _log(f"  ! not a video file, skipped: {path}")
+            continue
+        st = os.stat(path)
+        cid = db.clip_id(path)
+        prev = con.execute("SELECT size, mtime FROM clips WHERE id=?", (cid,)).fetchone()
+        if not (prev and prev["size"] == st.st_size and abs((prev["mtime"] or 0) - st.st_mtime) < 1e-3):
+            db.upsert(con, "clips", {"id": cid, "path": path, "rel": os.path.relpath(path, root), "size": st.st_size,
+                                     "mtime": st.st_mtime, "status": "new", "error": None, "proxy": None,
+                                     "sheet": None, "updated": now})
+        ids.append(cid)
+    con.commit()
+    _log(f"register: {len(ids)} of {len(paths)} files in the library")
+    return ids
+
+
 # -- probe -----------------------------------------------------------------------------------
 
 _dir_cache: dict = {}
@@ -179,9 +207,11 @@ def detect_log(cfg, path: str, info: dict, summary: dict) -> bool:
     return False
 
 
-def probe_all(cfg, con, limit=None):
-    """ffprobe clips with status 'new'. `limit` bounds how many are probed this run."""
+def probe_all(cfg, con, limit=None, ids=None):
+    """ffprobe clips with status 'new'. `limit` bounds how many are probed this run; `ids` = only these clips."""
     rows = con.execute("SELECT id, path FROM clips WHERE status='new' ORDER BY rel").fetchall()
+    if ids is not None:
+        rows = [r for r in rows if r["id"] in ids]
     if limit:
         rows = rows[:limit]
     if not rows:
@@ -219,18 +249,72 @@ def probe_all(cfg, con, limit=None):
 
 # -- proxies ---------------------------------------------------------------------------------
 
+# Same colour pipe as render.grade_chain: decode with an explicit BT.709 matrix into float RGB, apply the
+# LUT there, then convert back to BT.709 limited-range 4:2:0. Without in_color_matrix swscale assumes
+# BT.601 for the YUV->RGB step the LUT needs, which shifts hues (greens/skin) in every graded proxy.
+PROXY_LUT_TAIL = "colorspace=ispace=gbr:iprimaries=bt709:itrc=bt709:irange=pc:all=bt709:range=tv:format=yuv420p:dither=fsb"
+PROXY_709_TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
+
+
+def proxy_lut(cfg, row):
+    """The LUT a proxy of this clip gets baked in, or None."""
+    return cfg.lut if cfg.lut and row["is_log"] and os.path.exists(cfg.lut) else None
+
+
+def lut_sha(path) -> str:
+    import hashlib
+    try:
+        return hashlib.sha1(Path(path).read_bytes()).hexdigest()[:12]
+    except OSError:
+        return ""
+
+
 def _proxy_args(cfg, row, src, out, enc):
-    vf = []
-    if cfg.lut and row["is_log"] and os.path.exists(cfg.lut):
-        vf.append(f"lut3d='{cfg.lut}'")
-    vf.append(f"scale=-2:'min({int(cfg.proxy_height)},ih)':out_range=tv")
+    H = int(cfg.proxy_height)
+    lut = proxy_lut(cfg, row)
+    if lut:
+        vf = [f"scale=-2:'min({H},ih)':flags=bicubic:in_color_matrix=bt709:out_range=full",
+              "format=gbrpf32le", f"lut3d=file='{lut}':interp=tetrahedral", "format=gbrp16le", PROXY_LUT_TAIL]
+        tags = PROXY_709_TAGS + ["-metadata", f"comment=cutroom proxy graded lut={lut_sha(lut)}"]
+    else:
+        vf = [f"scale=-2:'min({H},ih)':out_range=tv", "format=yuv420p"]
+        tags = ["-metadata", "comment=cutroom proxy ungraded"]
     if (row["fps"] or 0) > 25.5:
-        vf.append("fps=25")
-    vf.append("format=yuv420p")
+        vf.insert(1, "fps=25")
     return ["-i", src, "-map", "0:v:0", "-map", "0:a:0?", "-vf", ",".join(vf),
             *enc, "-g", "25", "-keyint_min", "1",
             "-c:a", "aac", "-ac", "1", "-b:a", "96k",
-            "-map_metadata", "-1", "-dn", "-sn", "-movflags", "+faststart", "-f", "mp4", out]
+            "-map_metadata", "-1", *tags, "-dn", "-sn", "-movflags", "+faststart", "-f", "mp4", out]
+
+
+PROXY_INFO_SCHEMA = """
+CREATE TABLE IF NOT EXISTS proxy_info (
+  clip_id TEXT PRIMARY KEY, graded INTEGER, lut_sha TEXT, height INTEGER, bitrate TEXT, size INTEGER, updated REAL
+);
+"""
+
+
+def record_proxy(cfg, con, row, path):
+    """Record what a proxy is (LUT baked in or not, which LUT, size) as a fact, so nothing has to guess it
+    from the picture later (render's preview path and the export reframe read this)."""
+    con.executescript(PROXY_INFO_SCHEMA)
+    lut = proxy_lut(cfg, row)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = None
+    con.execute("INSERT OR REPLACE INTO proxy_info VALUES (?,?,?,?,?,?,?)",
+                (row["id"], int(bool(lut)), lut_sha(lut) if lut else None, int(cfg.proxy_height),
+                 media.proxy_bitrate(cfg), size, time.time()))
+
+
+def proxy_graded(con, cid):
+    """True / False when the proxy's grade was recorded at creation, None when unknown (older proxies)."""
+    try:
+        r = con.execute("SELECT graded FROM proxy_info WHERE clip_id=?", (cid,)).fetchone()
+    except Exception:  # noqa: BLE001 - table not there yet
+        return None
+    return None if r is None else bool(r["graded"] if hasattr(r, "keys") else r[0])
 
 
 def _make_proxy(cfg, row, enc) -> str:
@@ -263,11 +347,13 @@ def _encode_proxy(cfg, row, enc, out) -> str:
     return str(out)
 
 
-def make_proxies(cfg, con, limit=None, max_jobs=None):
+def make_proxies(cfg, con, limit=None, max_jobs=None, ids=None):
     """Small H.264 copies (cfg.proxy_height tall, <=25 fps, 1 s GOP, mono AAC) for analysis + preview."""
     for stale in cfg.p("proxies").glob("*.tmp.mp4"):
         stale.unlink(missing_ok=True)
     rows = con.execute("SELECT * FROM clips WHERE status='probed' AND proxy IS NULL ORDER BY rel").fetchall()
+    if ids is not None:
+        rows = [r for r in rows if r["id"] in ids]
     if limit:
         rows = rows[:limit]
     if not rows:
@@ -285,6 +371,7 @@ def make_proxies(cfg, con, limit=None, max_jobs=None):
                 p = f.result()
                 con.execute("UPDATE clips SET proxy=?, status='proxied', error=NULL, updated=? WHERE id=?",
                             (p, time.time(), r["id"]))
+                record_proxy(cfg, con, r, p)
                 ok += 1
             except media.GovernorKilled as e:          # not the clip's fault: retried next run
                 _log(f"  ! {r['rel']}: {e}")
@@ -424,10 +511,12 @@ def _build_sheet(cfg, row, out) -> str:
     return out
 
 
-def make_sheets(cfg, con, limit=None, max_jobs=None):
+def make_sheets(cfg, con, limit=None, max_jobs=None, ids=None):
     """One contact sheet per proxied clip at <work>/sheets/<id>.jpg (what the operator looks at)."""
     rows = con.execute("SELECT * FROM clips WHERE proxy IS NOT NULL AND sheet IS NULL "
                        "AND status IN ('proxied','analyzed') ORDER BY rel").fetchall()
+    if ids is not None:
+        rows = [r for r in rows if r["id"] in ids]
     if limit:
         rows = rows[:limit]
     if not rows:

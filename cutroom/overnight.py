@@ -6,7 +6,8 @@ unattended, resumable, inside the resource governor's limits.
     cutroom overnight --status | --stop
 
 Pipeline (each stage resumes from the database; finished work is never redone):
-    scan -> probe -> proxies -> sheets -> analyze -> transcribe (speech first) -> songs -> matchcuts -> tag
+    scan -> probe -> proxies -> sheets -> analyze -> dedupe -> highlights -> sessions -> transcribe (speech
+    first) -> takes -> songs -> matchcuts -> refs -> tag -> upgrade (second ASR pass, only with asr_fast_model)
 Clips the creator touched recently (searches, `cutroom clip`, plans, studio markers) go first, then
 longer clips / clips with more speech. Tagging starts as soon as analysis is done and runs next to
 transcription (it costs the machine almost nothing: the agent only looks at the contact-sheet JPEGs).
@@ -46,7 +47,9 @@ from pathlib import Path
 from . import agent as agentmod
 from . import db, governor
 
-STAGES = ["scan", "probe", "proxies", "sheets", "analyze", "transcribe", "songs", "matchcuts", "tag"]
+STAGES = ["scan", "probe", "proxies", "sheets", "analyze", "dedupe", "highlights", "sessions", "transcribe", "takes",
+          "songs", "matchcuts", "refs", "tag", "upgrade"]
+RATE_STAGES = ("proxies", "sheets", "analyze", "transcribe", "highlights", "upgrade")
 EXIT_DONE, EXIT_STOPPED, EXIT_MEMORY = 0, 3, 4
 MAX_RESTARTS = 20
 MAX_CLIP_FAILURES = 2
@@ -222,6 +225,28 @@ def record_failure(cfg, stage, cid, reason) -> int:
         f["reasons"][key] = str(reason)[-300:]
         _jsave(d / "failures.json", f)
         return f["counts"][key]
+
+
+def record_rate(cfg, stage, st, slots):
+    """Remember how fast a stage really ran on this machine (overnight/rates.json, last 20 per stage);
+    `cutroom estimate` projects from these."""
+    el = (st.get("finished") or time.time()) - (st.get("started") or time.time())
+    w, n = float(st.get("weight_done") or 0), int(st.get("done") or 0)
+    if el < 20 or (w <= 0 and n <= 0):
+        return
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        load = None
+    d = odir(cfg)
+    with _flocked(d / ".rates.lock"):
+        rates = _jload(d / "rates.json", {})
+        rates.setdefault(stage, []).append({"t": time.time(), "seconds": round(el, 1), "items": n,
+                                            "footage_s": round(w, 1), "x_realtime": round(w / el, 3) if w else None,
+                                            "items_per_h": round(n / el * 3600, 1), "load": load, "slots": slots,
+                                            "model": st.get("model")})
+        rates[stage] = rates[stage][-20:]
+        _jsave(d / "rates.json", rates)
 
 
 # ==================================================================================================
@@ -578,6 +603,8 @@ class Pipeline:
 
     def stage_end(self, stage, status="done", **kw):
         self.progress(stage, force=True, status=status, finished=time.time(), eta_s=0 if status == "done" else None, **kw)
+        if stage in RATE_STAGES:
+            record_rate(self.cfg, stage, self.stage_mem.get(stage, {}), self.gov.heavy_slots)
         self.log(f"stage {stage}: {status}" + (f" ({kw})" if kw else ""))
 
     def stage_done_this_run(self, stage):
@@ -602,6 +629,9 @@ class Pipeline:
             try:
                 res = fut.result()
                 on_ok(r, res)
+            except governor.SlotAborted:          # stop requested while it waited for a slot: never started
+                self._inflight_set(stage, r["id"], False)
+                return
             except (MemoryError, RestartForMemory) as e:
                 raise RestartForMemory(str(e)) from None
             except Exception as e:  # noqa: BLE001 - one clip never stops the night
@@ -749,11 +779,16 @@ class Pipeline:
 
     def st_transcribe(self):
         from . import asr
-        model = self.opts.get("model") or self.cfg.asr_model
+        full = self.opts.get("model") or self.cfg.asr_model
+        fast = (getattr(self.cfg, "asr_fast_model", "") or "").strip()
+        model = fast if fast and not self.opts.get("model") and fast != full else full
         rows = self.con.execute("SELECT * FROM clips WHERE has_audio=1 AND COALESCE(duration,0)>0 "
                                 "AND status NOT IN ('new','error')").fetchall()
-        done_ids = {r["clip_id"] for r in self.con.execute("SELECT clip_id FROM transcripts WHERE model=?", (model,))}
-        pending = self.order([r for r in rows if r["id"] not in done_ids], lambda r: -(r["duration"] or 0))
+        done_ids = {r["clip_id"] for r in self.con.execute("SELECT clip_id FROM transcripts WHERE model IN (?, ?)",
+                                                           (model, full))}
+        copies = self.exact_copies()
+        pending = self.order([r for r in rows if r["id"] not in done_ids and r["id"] not in copies],
+                             lambda r: -(r["duration"] or 0))
         self.stage_begin("transcribe", total=len(pending), weight_total=sum(r["duration"] or 0 for r in pending),
                          model=model, phase="speech check")
         speech = {}
@@ -766,8 +801,10 @@ class Pipeline:
                 asr._store(self.cfg, self.con, r["id"], None, model, [], 0, sp)
             else:
                 speech[r["id"]] = sp
-        self.run_items("transcribe", pending, vad, vad_ok, self._err("transcribe", mark_status=False), workers=1,
-                       weight=lambda r: 0.0)
+        # the speech check never loads a Whisper model (ffmpeg decode + Silero VAD): it runs in parallel,
+        # and only clips with speech ever reach the single ASR slot
+        self.run_items("transcribe", pending, vad, vad_ok, self._err("transcribe", mark_status=False),
+                       workers=max(1, min(2, self.gov.heavy_slots)), weight=lambda r: 0.0)
         todo = [r for r in pending if r["id"] in speech]
         big = len(self.rank) + 1
         todo.sort(key=lambda r: (self.rank.get(r["id"], big), -speech[r["id"]]))
@@ -784,7 +821,85 @@ class Pipeline:
             self.fail_counts[f"transcribe:{r['id']}"] = k
             self.log(f"  ! transcribe {r['rel']}: {type(e).__name__}: {str(e)[-200:]}")
         self.run_items("transcribe", todo, tx, lambda r, res: None, tx_err, workers=1)
-        self.stage_end("transcribe")
+        n_copied = self.copy_transcripts(copies)
+        self.stage_end("transcribe", **({"copied_from_exact_duplicates": n_copied} if n_copied else {}))
+
+    # -- scale stages (analyze.py): cheap passes that cut tagging cost and make big libraries searchable
+    def st_dedupe(self):
+        from . import analyze
+        self.stage_begin("dedupe", total=1)
+        res = analyze.dedupe(self.cfg, self.con, echo=self.log)
+        self.stage_end("dedupe", done=1, groups=res["groups"], redundant=res["redundant"])
+
+    def st_highlights(self):
+        from . import analyze
+        rows = self.order(analyze.highlights_pending(self.con), lambda r: -(r["duration"] or 0))
+        self.stage_begin("highlights", total=len(rows), weight_total=sum(r["duration"] or 0 for r in rows))
+
+        def fn(r):
+            with self.gov.slot("heavy", label=f"highlights {r['id']}"):
+                return analyze.highlights_clip(self.cfg, self.thread_con(), r)
+        self.run_items("highlights", rows, fn, lambda r, res: None, self._err("highlights", mark_status=False),
+                       workers=max(1, min(2, self.gov.heavy_slots)))
+        self.stage_end("highlights")
+
+    def st_sessions(self):
+        from . import analyze
+        self.stage_begin("sessions", total=1)
+        res = analyze.sessions(self.cfg, self.con, echo=self.log)
+        self.stage_end("sessions", done=1, sessions=res["sessions"], places=res["places"])
+
+    def st_takes(self):
+        from . import analyze
+        self.stage_begin("takes", total=1)
+        res = analyze.takes(self.cfg, self.con, echo=self.log)
+        self.stage_end("takes", done=1, repeated_lines=res["groups"])
+
+    def st_upgrade(self):
+        """Second ASR pass (asr_fast_model set): the clips with speech again with the full model, the
+        most-used and most-talkative first. Runs after tagging, so a night gives searchable speech early."""
+        from . import asr
+        fast = (getattr(self.cfg, "asr_fast_model", "") or "").strip()
+        full = self.opts.get("model") or self.cfg.asr_model
+        if not fast or fast == full:
+            self.stage_begin("upgrade", total=0)
+            return self.stage_end("upgrade", note="one ASR pass (asr_fast_model not set)")
+        ids = asr.upgrade_pending(self.con, fast, full)
+        rows = [self.con.execute("SELECT * FROM clips WHERE id=?", (i,)).fetchone() for i in ids]
+        rows = self.order([r for r in rows if r is not None], lambda r: -(r["duration"] or 0))
+        self.stage_begin("upgrade", total=len(rows), weight_total=sum(r["duration"] or 0 for r in rows), model=full)
+
+        def tx_err(r, e):
+            self.fail_counts[f"upgrade:{r['id']}"] = record_failure(self.cfg, "upgrade", r["id"], e)
+            self.log(f"  ! upgrade {r['rel']}: {type(e).__name__}: {str(e)[-200:]}")
+        self.run_items("upgrade", rows, lambda r: asr.transcribe_clip(self.cfg, self.thread_con(), r, full),
+                       lambda r, res: None, tx_err, workers=1)
+        self.stage_end("upgrade")
+
+    def exact_copies(self) -> dict:
+        """{clip id: representative id} for byte-identical copies (they share one transcript)."""
+        try:
+            return {r["clip_id"]: r["rep"] for r in self.con.execute(
+                "SELECT clip_id, rep FROM dupes WHERE kind='exact' AND clip_id != rep")}
+        except Exception:  # noqa: BLE001 - dedupe has not run
+            return {}
+
+    def copy_transcripts(self, copies) -> int:
+        import shutil as _sh
+        n = 0
+        for cid, rep in copies.items():
+            tr = self.con.execute("SELECT * FROM transcripts WHERE clip_id=?", (rep,)).fetchone()
+            if not tr or self.con.execute("SELECT 1 FROM transcripts WHERE clip_id=?", (cid,)).fetchone():
+                continue
+            src, dst = self.cfg.p("transcripts", f"{rep}.json"), self.cfg.p("transcripts", f"{cid}.json")
+            if src.exists():
+                _sh.copyfile(src, dst)
+            row = dict(tr)
+            row.update(clip_id=cid, path=str(dst), updated=time.time())
+            db.upsert(self.con, "transcripts", row, key=("clip_id",))
+            n += 1
+        self.con.commit()
+        return n
 
     def st_songs(self):
         from . import music
@@ -806,19 +921,112 @@ class Pipeline:
         sig_file.write_text(sig)
         self.stage_end("matchcuts", done=int(r[0]), candidates=len(res))
 
+    def st_refs(self):
+        """Measure reference videos nobody has analysed yet (refs/ and renders/reference/), one at a time."""
+        from . import reference as R
+        try:
+            R.sync_reference_folder(self.cfg)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"  ! refs: could not read renders/reference: {e}")
+        ids = [rid for rid in R.pending(self.cfg) if not self.skipped("refs", rid)]
+        self.stage_begin("refs", total=len(ids))
+        done = errors = 0
+        for rid in ids:
+            self.check_stop()
+            self._inflight_set("refs", rid, True)
+            try:
+                R.analyze(self.cfg, rid, echo=lambda *_: None)
+                done += 1
+            except MemoryError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                errors += 1
+                self.fail_counts[f"refs:{rid}"] = record_failure(self.cfg, "refs", rid, f"{type(e).__name__}: {e}")
+                self.log(f"  ! refs {rid}: {type(e).__name__}: {str(e)[-200:]}")
+            finally:
+                self._inflight_set("refs", rid, False)
+            self.progress("refs", force=True, done=done, errors=errors)
+        self.stage_end("refs", done=done, errors=errors)
+
     # -- tagging -----------------------------------------------------------------------------------
-    def tag_candidates(self, con):
+    def tag_candidates(self, con, plan=None):
+        """Untagged analysed clips worth an AI call, best first. Cost control (docs/OVERNIGHT.md): clips the
+        quality gate rejects (too short / black / very shaky) are skipped and listed in `tag_gate`;
+        duplicates are skipped because they inherit their representative's tags. `plan` (a dict) is filled
+        with the counts behind the estimate."""
+        from . import analyze
+        analyze.ensure_scale_schema(con)
         self.rank = {cid: i for i, cid in enumerate(recent_clip_ids(self.cfg, con))}
         rows = con.execute("""
-            SELECT c.*, tr.n_words AS n_words FROM clips c
+            SELECT c.*, tr.n_words AS n_words, d.rep AS dupe_rep, hp.score AS hl FROM clips c
             LEFT JOIN tags t ON t.clip_id = c.id LEFT JOIN transcripts tr ON tr.clip_id = c.id
+            LEFT JOIN dupes d ON d.clip_id = c.id LEFT JOIN highlight_peaks hp ON hp.clip_id = c.id
             WHERE t.clip_id IS NULL AND c.status='analyzed' AND c.sheet IS NOT NULL""").fetchall()
         rows = [r for r in rows if r["sheet"] and os.path.exists(r["sheet"]) and not self.skipped("tag", r["id"])]
+        out, gated, inherit = [], {}, 0
+        stats = None
+        try:
+            from . import tags as _tags
+            _tags.refresh_stats(con)
+            stats = {r["clip_id"]: dict(r) for r in con.execute("SELECT * FROM clip_stats")}
+        except Exception:  # noqa: BLE001
+            stats = {}
+        for r in rows:
+            why = analyze.gate_reason(self.cfg, r, stats.get(r["id"]))
+            if why:
+                gated[r["id"]] = why
+        ok_ids = {r["id"] for r in rows if r["id"] not in gated}
+        tagged = {x["clip_id"] for x in con.execute("SELECT clip_id FROM tags")}
+        for r in rows:
+            if r["id"] in gated:
+                continue
+            rep = r["dupe_rep"]
+            if rep and rep != r["id"] and (rep in ok_ids or rep in tagged):
+                inherit += 1                   # its representative is (or will be) tagged: it inherits
+                continue
+            out.append(r)
+        if gated:
+            con.executemany("INSERT OR REPLACE INTO tag_gate VALUES (?,?,?)",
+                            [(cid, why, time.time()) for cid, why in gated.items()])
+            con.commit()
+        if plan is not None:
+            reasons = Counter(w.split(" (")[0] for w in gated.values())
+            plan.update(untagged=len(rows), gated=len(gated), gate_reasons=dict(reasons), inherit=inherit,
+                        to_send=len(out))
         big = len(self.rank) + 1
-        # ready first: transcribed (or no audio) clips get the speech snippet in the prompt
-        return sorted(rows, key=lambda r: (self.rank.get(r["id"], big),
-                                           0 if (r["n_words"] is not None or not r["has_audio"]) else 1,
-                                           -(r["duration"] or 0)))
+        # ready first: transcribed (or no audio) clips get the speech snippet in the prompt; then highlights
+        return sorted(out, key=lambda r: (self.rank.get(r["id"], big),
+                                          0 if (r["n_words"] is not None or not r["has_audio"]) else 1,
+                                          -(r["hl"] or 0), -(r["duration"] or 0)))
+
+    def inherit_tags(self, con) -> int:
+        """Copy each tagged representative's tags to its untagged duplicates ("inherited_from": rep)."""
+        try:
+            rows = con.execute("""SELECT d.clip_id, d.rep, d.kind, t.data FROM dupes d JOIN tags t ON t.clip_id = d.rep
+                                  LEFT JOIN tags m ON m.clip_id = d.clip_id
+                                  WHERE d.clip_id != d.rep AND m.clip_id IS NULL""").fetchall()
+        except Exception:  # noqa: BLE001
+            return 0
+        n = 0
+        for r in rows:
+            data = json.loads(r["data"] or "{}")
+            if r["kind"] != "exact":                     # best/avoid times belong to the representative's clip
+                data.pop("best", None)
+                data.pop("avoid", None)
+            data.update(inherited_from=r["rep"], tagged_by="inherited", dupe_kind=r["kind"],
+                        tagged_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+            db.set_tags(con, r["clip_id"], data, merge=False)
+            n += 1
+        return n
+
+    def tag_plan_line(self, plan, batch_n) -> str:
+        calls = -(-plan.get("to_send", 0) // max(1, batch_n))
+        pause = float(getattr(self.cfg, "tag_sleep_s", 20) or 0)
+        lo, hi = calls * (20 + pause) / 3600, calls * (90 + pause) / 3600
+        gr = ", ".join(f"{k} {v}" for k, v in (plan.get("gate_reasons") or {}).items())
+        return (f"tag plan: {plan.get('untagged', 0)} untagged · {plan.get('gated', 0)} skipped by the quality gate"
+                + (f" ({gr})" if gr else "") + f" · {plan.get('inherit', 0)} duplicates inherit tags · "
+                f"{plan.get('to_send', 0)} to send = about {calls} call(s), {lo:.1f}-{hi:.1f} h")
 
     def tag_loop(self, until_idle=False):
         """Tag untagged analyzed clips in batches. until_idle=True: return when nothing is left;
@@ -832,6 +1040,11 @@ class Pipeline:
         tagger = TAGGERS.get(ag.name, f"{ag.name}-overnight")
         st = self.stage_mem.setdefault("tag", {})
         tagged = st.get("done", 0)
+        plan = {}
+        self.tag_candidates(con, plan)
+        self.log(self.tag_plan_line(plan, batch_n))
+        self.progress("tag", force=True, plan=plan, est_calls=-(-plan.get("to_send", 0) // batch_n))
+        inherited = self.inherit_tags(con)
         while True:
             if self.stop_reason():
                 return "stopped"
@@ -891,6 +1104,8 @@ class Pipeline:
                 db.set_tags(con, r["id"], data, merge=False)
                 n_ok += 1
             tagged += n_ok
+            inherited += self.inherit_tags(con)
+            self.progress("tag", force=True, inherited=inherited)
             self.log(f"tag: batch of {len(batch)} -> {n_ok} tagged ({res.get('seconds')}s, ${res.get('cost_usd') or 0:.4f})")
             self.progress("tag", force=True, done=tagged)
             self._sleep(pause)
@@ -926,13 +1141,15 @@ class Pipeline:
             self.stage_begin("tag", total=0)
             return self.stage_end("tag", status="skipped", note="--no-tag")
         if self.opts.get("dry_run"):
-            cands = self.tag_candidates(self.con)
+            plan = {}
+            cands = self.tag_candidates(self.con, plan)
             if self.opts.get("tag_limit") is not None:
                 cands = cands[:self.opts["tag_limit"]]
-            self.stage_begin("tag", total=len(cands))
+            self.stage_begin("tag", total=len(cands), plan=plan)
             n = max(1, int(getattr(self.cfg, "tag_batch", 8) or 8))
             ag = self.agent
             n = min(n, getattr(ag, "max_images", n))
+            self.log(self.tag_plan_line(plan, n))
             if cands:
                 (self.dir / "tag_prompt_preview.txt").write_text(build_tag_prompt(self.cfg, self.con, cands[:n], agent=ag.name))
             return self.stage_end("tag", status="dry-run", note=f"would send {len(cands)} clip(s) in "
@@ -958,13 +1175,23 @@ class Pipeline:
 
     # -- driver --------------------------------------------------------------------------------------
     def run(self) -> int:
+        # a stop takes effect between items everywhere: work queued for a governor slot is dropped
+        # instead of starting after the stop (only what already runs finishes)
+        self.gov.abort_check = self.stop_reason
+        try:
+            return self._run()
+        finally:
+            self.gov.abort_check = None
+
+    def _run(self) -> int:
         skip = set(self.opts.get("skip_stages") or ())
+        trigger = "dedupe" if "dedupe" not in skip else "analyze"      # tagging starts once duplicates are known
         try:
             for stage in STAGES:
                 if stage in skip:
                     continue
                 if stage != "tag" and self.stage_done_this_run(stage):
-                    if stage == "analyze":
+                    if stage == trigger:
                         self.start_tagging()
                     continue
                 self.check_stop()
@@ -972,13 +1199,15 @@ class Pipeline:
                     getattr(self, f"st_{stage}")()
                 except (Stopped, RestartForMemory):
                     raise
+                except governor.SlotAborted as e:
+                    raise Stopped(str(e)) from None
                 except MemoryError as e:
                     raise RestartForMemory(str(e)) from None
                 except Exception as e:  # noqa: BLE001 - a broken stage must not end the night
                     self.log(f"stage {stage} failed: {type(e).__name__}: {e}")
                     self.stage_end(stage, status="error", last_error=f"{type(e).__name__}: {str(e)[-300:]}")
                     merge_state(self.cfg, {"last_error": f"{stage}: {type(e).__name__}: {str(e)[-300:]}"})
-                if stage == "analyze":
+                if stage == trigger:
                     self.start_tagging()
         except Stopped as e:
             self.log(f"stopping: {e}")
@@ -1166,6 +1395,12 @@ def _give_up(cfg, stage, cid, reason):
                     (f"overnight: {stage} crashed twice ({reason})"[:300], time.time(), cid))
     elif stage == "sheets":
         con.execute("UPDATE clips SET error=? WHERE id=?", (f"overnight: sheet crashed twice ({reason})"[:300], cid))
+    elif stage == "refs":
+        try:
+            from . import reference
+            reference.save_meta(cfg, cid, status="error", error=f"overnight: analysis crashed twice ({reason})"[:300])
+        except Exception:  # noqa: BLE001
+            pass
     con.commit()
 
 
@@ -1279,6 +1514,24 @@ def write_report(cfg, con, state=None) -> Path:
           f"- tagged: {len(tags)} clips ({by_ai.get(TAGGERS['claude'], 0)} by Claude overnight"
           + (f", {by_ai[TAGGERS['codex']]} by Codex overnight" if by_ai.get(TAGGERS['codex']) else "") + ")",
           f"- match-cut candidates: {q('SELECT COUNT(*) FROM matchcuts')} · songs: {q('SELECT COUNT(*) FROM songs')}"]
+    try:
+        from . import analyze as _an
+        _an.ensure_scale_schema(con)
+        n_red = q("SELECT COUNT(*) FROM dupes WHERE clip_id != rep")
+        n_gate = q("SELECT COUNT(*) FROM tag_gate")
+        n_inh = sum(1 for t in tags.values() if t.get("inherited_from"))
+        n_sess = q("SELECT COUNT(DISTINCT session) FROM sessions")
+        n_place = q("SELECT COUNT(DISTINCT place) FROM sessions WHERE place IS NOT NULL")
+        n_takes = q("SELECT COUNT(DISTINCT grp) FROM takes")
+        L.append(f"- duplicates: {n_red} redundant clip(s) ({n_inh} inherited tags) · skipped by the tagging gate: "
+                 f"{n_gate} · shoots: {n_sess} · GPS places: {n_place} · repeated lines ranked: {n_takes}")
+        peaks = con.execute("SELECT h.clip_id, h.score, h.t, h.kind, c.rel FROM highlight_peaks h JOIN clips c "
+                            "ON c.id = h.clip_id WHERE h.score > 0 ORDER BY h.score DESC LIMIT 5").fetchall()
+        if peaks:
+            L.append("- top highlight moments: " + "; ".join(
+                f"`{r['clip_id']}` @{r['t'] or 0:.0f}s {r['kind'] or ''} ({r['score']:.2f})" for r in peaks))
+    except Exception:  # noqa: BLE001 - the report never fails on optional tables
+        pass
     if state.get("restarts"):
         L.append(f"- the stage process was restarted {state['restarts']} time(s); last: {state.get('last_error')}")
     errs = con.execute("SELECT id, rel, error FROM clips WHERE status='error' ORDER BY updated DESC LIMIT 15").fetchall()

@@ -229,4 +229,4 @@ if __name__ == "__main__":         # quick look: python -m cutroom.captions "som
     pi = find_font()
     print(pi)
     print(render_cue(sys.argv[1] if len(sys.argv) > 1 else "this is a caption test", sys.argv[2] if len(sys.argv) > 2 else "cap.png",
-                     1920, 1080, pi, 54))
+                     1920, 1080, pi, 32))

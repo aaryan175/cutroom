@@ -99,21 +99,30 @@ def speech_spans(audio, sr=SR):
 _MODEL = {}
 
 
-def _device():
+def _device(want=""):
+    """(device, compute_type). want: "" / "auto" = CUDA when present else CPU; "cpu"; "cuda"."""
+    want = (want or "").strip().lower()
+    if want == "cpu":
+        return "cpu", "int8"
     try:
         import ctranslate2
         if ctranslate2.get_cuda_device_count() > 0:
             return "cuda", "float16"
     except Exception:  # noqa: BLE001
         pass
+    if want == "cuda":
+        raise RuntimeError("asr_device is 'cuda' but no CUDA device is visible to CTranslate2")
     return "cpu", "int8"
+
+
+_DEVICE_WANT = {"v": ""}
 
 
 def get_model(name):
     if name not in _MODEL:
         from faster_whisper import WhisperModel
         _MODEL.clear()                                   # never hold two models in memory
-        dev, ct = _device()
+        dev, ct = _device(_DEVICE_WANT["v"])
         kw = {"cpu_threads": min(8, os.cpu_count() or 4)} if dev == "cpu" else {}
         _MODEL[name] = WhisperModel(name, device=dev, compute_type=ct, **kw)
     return _MODEL[name]
@@ -152,9 +161,30 @@ def release_if_bloated(gov):
         gov.check_self(what="transcription process (model released)")
 
 
+def transcribe_audio(cfg, audio, model_name, label="transcribe"):
+    """Transcribe any 16 kHz mono float32 array (not only library clips, e.g. a reference video's
+    audio) while holding the machine-wide ASR slot. Returns (language, segments) in the transcript
+    JSON shape ({"start", "end", "text", "words": [{"start", "end", "word", "probability"}]})."""
+    gov = governor.for_cfg(cfg)
+    with gov.slot("asr", label=label):
+        res = _run_model(cfg, audio, model_name)
+    release_if_bloated(gov)
+    return res
+
+
 def _transcribe_clip(cfg, con, c, model_name, audio=None, speech_s=None):
     if audio is None:
         audio = load_audio(cfg, _source(c))
+    language, out = _run_model(cfg, audio, model_name)
+    n_words = sum(len(s["words"]) for s in out)
+    sp = speech_s if speech_s is not None else sum(s["end"] - s["start"] for s in out)
+    return _store(cfg, con, c["id"], language, model_name, out, n_words, sp)
+
+
+def _run_model(cfg, audio, model_name):
+    if getattr(cfg, "asr_remote", ""):
+        return _run_remote(cfg, audio, model_name)
+    _DEVICE_WANT["v"] = getattr(cfg, "asr_device", "") or ""
     model = get_model(model_name)
     segs, info = model.transcribe(
         audio, language=(cfg.asr_language or None), word_timestamps=True, vad_filter=True,
@@ -169,9 +199,41 @@ def _transcribe_clip(cfg, con, c, model_name, audio=None, speech_s=None):
         if not ws and not s.text.strip():
             continue
         out.append({"start": round(s.start, 3), "end": round(s.end, 3), "text": s.text.strip(), "words": ws})
-    n_words = sum(len(s["words"]) for s in out)
-    sp = speech_s if speech_s is not None else sum(s["end"] - s["start"] for s in out)
-    return _store(cfg, con, c["id"], info.language, model_name, out, n_words, sp)
+    return info.language, out
+
+
+def _run_remote(cfg, audio, model_name):
+    """Run ASR through cfg.asr_remote, a command template with {audio} (a 16 kHz mono WAV we write),
+    {out} (the JSON it must write), {model} and {language}. The far side can be another machine with a
+    GPU (ssh) as long as both paths are on a shared mount; `python -m cutroom.asr {audio} {out} --model
+    {model}` there produces the expected JSON ({"language", "segments": [...]}, the transcript shape).
+    Still holds the local ASR slot: one transcription at a time, wherever it runs."""
+    import shlex
+    import tempfile
+    import wave
+    tmpdir = Path(getattr(cfg, "work", "") or tempfile.gettempdir()) / "transcripts" / "remote"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    stem = f"asr_{os.getpid()}_{int(time.time() * 1000)}"
+    wav, out = tmpdir / f"{stem}.wav", tmpdir / f"{stem}.json"
+    pcm = (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes()
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes(pcm)
+    fields = {"audio": shlex.quote(str(wav)), "out": shlex.quote(str(out)), "model": shlex.quote(model_name),
+              "language": shlex.quote(getattr(cfg, "asr_language", "") or "auto")}
+    cmd = cfg.asr_remote.format(**fields)
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=max(600, len(audio) / SR * 4))
+        if r.returncode or not out.exists():
+            raise RuntimeError(f"remote ASR failed ({r.returncode}): {cmd[:200]}\n{(r.stderr or '')[-800:]}")
+        d = json.loads(out.read_text())
+        return d.get("language"), d.get("segments") or []
+    finally:
+        wav.unlink(missing_ok=True)
+        out.unlink(missing_ok=True)
 
 
 def _store(cfg, con, cid, language, model_name, segments, n_words, speech_s):
@@ -469,3 +531,38 @@ def print_transcript(cfg, cid, start=None, end=None):
         print("\nrepeated takes (keep the later one):")
         for (a0, a1), (b0, b1), r in rp:
             print(f"  [{_mmss(a0)} → {_mmss(a1)}] ≈ [{_mmss(b0)} → {_mmss(b1)}]  sim {r:.2f}")
+
+
+# --------------------------------------------------------------------------------------------- two passes
+def upgrade_pending(con, fast_model, model_name) -> list:
+    """Clip ids transcribed by the fast first pass (with speech) that still need the full model."""
+    return [r["clip_id"] for r in con.execute(
+        "SELECT clip_id FROM transcripts WHERE model=? AND n_words > 0 ORDER BY speech_s DESC", (fast_model,))]
+
+
+# --------------------------------------------------------------------------------------------- remote side
+def _main(argv=None):
+    """`python -m cutroom.asr AUDIO OUT.json [--model M] [--language xx] [--device cpu|cuda]`:
+    transcribe one audio file and write the transcript JSON (the far side of `asr_remote`)."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="python -m cutroom.asr")
+    ap.add_argument("audio"); ap.add_argument("out")
+    ap.add_argument("--model", default="medium"); ap.add_argument("--language", default="")
+    ap.add_argument("--device", default="")
+    a = ap.parse_args(argv)
+
+    class _C:                               # minimal config: no project needed on the far side
+        ffmpeg = "ffmpeg"
+        asr_language = "" if a.language in ("", "auto") else a.language
+        asr_device = a.device
+        asr_remote = ""
+    audio = load_audio(_C, a.audio)
+    language, segs = _run_model(_C, audio, a.model)
+    tmp = Path(a.out).with_suffix(".tmp")
+    tmp.write_text(json.dumps({"language": language, "model": a.model, "segments": segs}, ensure_ascii=False))
+    os.replace(tmp, a.out)
+    print(f"{a.out}: {sum(len(s['words']) for s in segs)} words")
+
+
+if __name__ == "__main__":
+    _main()

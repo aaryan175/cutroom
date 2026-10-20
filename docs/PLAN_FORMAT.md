@@ -57,6 +57,23 @@ drop or a downbeat. A section without `music` has no music.
 {"type": "broll", "clip": "C0131", "in": 4.0, "out": 7.2, "audio": "music", "speed": 1.0}
 ```
 
+**multicam** (on talk or broll): picture from one angle of a synced group, sound from the group's best source
+(`cutroom sync`; see `docs/NLE_AND_MULTICAM.md` and the `multicam` skill).
+```json
+{"type": "talk", "clip": "C0101", "in": 812.4, "out": 828.0, "multicam": {"group": 3, "angle": "camB", "audio": "auto"}}
+```
+- `angle` is an angle code from `cutroom sync list` (or a device name).
+- `audio` is one of:
+  - `"auto"`: external recorder > lav > camera (among cameras, the angle's own);
+  - `"camera"`: the angle's own sound;
+  - a source code, such as `"rec1"`.
+- With `clip`, `in` and `out` are that clip's seconds. If `clip` belongs to another angle, the times are mapped through
+  the group's offsets and drift, so changing only `angle` keeps the moment. Without `clip`, `in` and `out` are group
+  seconds.
+- `cutroom sync switch PLAN SEC.SEG ANGLE` rewrites `clip`, `in` and `out` for the new angle.
+- Tightening and captions use the recorder's words when it has a transcript.
+- `plan check` reports when the angle or the sound source doesn't cover the range.
+
 **montage**: fast shots cut on the beat.
 ```json
 {"type": "montage", "beat_sync": true, "beats_per_cut": 1, "min_shot": 0.4, "max_shot": 1.2,
@@ -311,6 +328,12 @@ black point stays ≥ 15 and saturation within +15 % of the LUT-only picture.
 `kind` is one of `callout`, `lower_third`, `title`, `label` or `typed_title` (above). `position` is one of `auto`, `top-left`,
 `top-right`, `bottom-left`, `bottom-right` or `center`. `auto` places the overlay away from faces.
 Keep the text short. Creators usually want at most one overlay per talking section.
+
+## Handing the edit to an NLE
+`cutroom export-nle PLAN.json --format premiere|fcpxml|otio|edl|all [--zip]` writes a Premiere XML, FCPXML 1.10, OTIO
+and EDLs. They link to the original masters and are frame-exact against the render's timeline. Graphics come as ProRes
+4444, cutroom-only effects as rendered segments, captions as an .srt, plus a README. `--verify DIR` checks every clip.
+See `docs/NLE_AND_MULTICAM.md`.
 
 ## What render produces
 - `renders/<slug>_v<N>[_preview].mp4`, the video.

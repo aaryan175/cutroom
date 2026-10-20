@@ -5,7 +5,7 @@ One ffmpeg decode pass per clip (rawvideo pipe, 12.5 fps, 480 px wide) feeds:
   shake      LK optical flow -> RANSAC similarity transform -> camera translation (dx, dy) per frame;
              shake = mean |change of camera velocity| (px @ 480w), motion = mean |velocity|
   exposure   mean luma, contrast = luma std, sharpness = variance of Laplacian
-  faces      max Haar-cascade frontal faces, sampled every ~0.5 s
+  faces      max faces (vision.py YuNet; Haar cascade fallback), sampled every ~0.5 s
 """
 import json
 import math
@@ -149,7 +149,9 @@ def analyze_proxy(ffmpeg_bin: str, proxy: str, duration: float, ffprobe_bin: str
            "-vf", f"fps={FPS},scale={w}:{h}", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=w * h * 3 * 4)
     fsize = w * h * 3
-    cascade = _face_cascade()
+    from .vision import face_detector
+    fdet = face_detector()                          # YuNet, or the Haar cascade when the model is unavailable
+    cascade = fdet if fdet.available else None
     smile_c = _smile_cascade() if cascade is not None else None
     det = _cut_detector()
     n_est = max(1, int(round((duration or 0) * FPS)))
@@ -190,7 +192,10 @@ def analyze_proxy(ffmpeg_bin: str, proxy: str, duration: float, ffprobe_bin: str
         if i % 12 == 0:
             sats.append(float(cv2.cvtColor(small, cv2.COLOR_BGR2HSV)[..., 1].mean()))
         if cascade is not None and i % FACE_EVERY == 0:
-            faces = cascade.detectMultiScale(grey, scaleFactor=1.2, minNeighbors=5, minSize=(min_face, min_face))
+            faces = [(int(f["box"][0] * w), int(f["box"][1] * h), int(f["box"][2] * w), int(f["box"][3] * h))
+                     for f in fdet.detect(frame)]
+            if fdet.backend == "haar":              # keep the old size floor for the cascade
+                faces = [f for f in faces if f[3] >= min_face]
             win["faces"] = max(win["faces"], len(faces))
             if len(faces) and smile_c is not None:
                 win["face_n"] += 1
@@ -269,8 +274,9 @@ def analyze_all(cfg, con, limit=None, max_jobs=None, ids=None):
     if not rows:
         print("analyze: nothing to do", flush=True)
         return
-    if _face_cascade() is None:
-        print("  ! no Haar face cascade in this OpenCV build (install opencv-python-headless<5); faces = 0", flush=True)
+    from .vision import face_detector
+    if not face_detector().available:
+        print("  ! no face detector (no YuNet model and no Haar cascade in this OpenCV build); faces = 0", flush=True)
     gov = governor.for_cfg(cfg)
     n = max(1, min(cfg.n_workers(), max_jobs) if max_jobs else cfg.n_workers())
     n = min(n, gov.heavy_slots)

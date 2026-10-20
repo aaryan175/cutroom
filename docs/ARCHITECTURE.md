@@ -11,6 +11,7 @@ footage (read-only)
    │  analyze.py  shots + shake/exposure/sharpness/faces windows    │  all heavy work goes through
    │  asr.py      word-timestamp transcripts (+ tighten, cues)      │  governor.py (slots, memory caps,
    │  music.py    beats/drops, music bed with ducking, sfx          │  disk floor) and media.py (ffmpeg)
+   │  sync.py     multicam groups + recorder audio aligned by sound  │
    │  matchcuts.py match-cut candidates                             │
    │  reference.py reference videos measured frame by frame         │
    │  overnight.py runs all of the above + AI tagging, supervised  ─┘
@@ -23,6 +24,7 @@ render.py  expand plan → atomic pieces on a frame grid → cached per-piece en
    │   captions.py (Pillow caption PNGs) · overlays.py (HTML/Chrome or Pillow cards) · voice.py
    ▼
 renders/<slug>_vN.mp4 + .json sidecar ── qa.py (machine checks + contact sheets)
+   │   nle.py: the same timeline as Premiere XML / FCPXML / OTIO / EDL on the masters (renders/nle/)
    │
 studio.py (HTTP API + SSE + AI chat bridge) ── studio_web/ (the editor UI, plain ES modules)
 factory/ (comment -> producer / editor / critic role runs -> render -> machine QA -> version + card; code-driven
@@ -48,7 +50,10 @@ board.py (simple phone review page)
 | `film.py` | film / lens character: measure grain, softness, vignette, halation, fringing, roll-off, black lift, weave; rebuild it as a chain (`style.film`); `match()` a reference | a new film/lens trait (measure it in `measure_frame`, rebuild it in `chain`) |
 | `qa.py` | automated checks on renders | every new failure the creator catches should become a check here |
 | `looks.py` | colour looks: built-in filter chains scaled by intensity, user `.cube` LUTs (blended with identity), frame previews, colour stats + reference matching | a new look (add a BUILTIN entry: curves / colour balance / eq / vignette + a CSS approximation) |
+| `vision.py` | the eyes: YuNet DNN faces (model cached in the user cache dir, SHA-256 pinned, Haar fallback), the combined shot detector (`ShotFeatures` + `detect_shots`: content / histogram / colour / edge jumps, motion-compensated pans, ORB + block "same picture" checks for flash / burn / overlay suppression, gradual transitions), and the AI brain pass (`brain_reference`, `deep_analyze`, `merge_brain`: contact strips of every candidate event to the agent, schema-validated, citation-checked, cached by content hash, cost-capped); `clip_context` gives tagging the detector numbers | a better detector (keep the arr keys and the `detect_shots` result shape), a new device in the brain vocabulary (`DEVICE_TYPES` + the prompt), a new verdict |
 | `reference.py` | reference videos: cut map, pacing, sections, beat sync, captions, loudness, devices (cards, burns, frames, typed titles: `detect_devices`, `ensure_devices`); `compare` against a render | a new thing creators match by (measure it in `assemble` or `detect_devices`, add a row + gap in `compare_analyses` / `_compare_devices`) |
+| `nle.py` | NLE hand-off: `build_model` (from `render.resolve_timeline`, on the cutroom frame grid) -> Premiere xmeml, FCPXML 1.10, OTIO, CMX3600; graphics as ProRes 4444, cutroom-only effects cut from a render onto V4, captions .srt, README; `verify` re-parses (own parsers + OTIO readers) and compares every clip frame-exactly; `lint_xmeml` / `lint_fcpxml` structure checks | a new NLE format (write it from the model, add a parser + a `verify` check), or a new device the NLE can't rebuild (add it to `fx_spans`) |
+| `sync.py` | multicam / dual-system audio: recorder audio registration, device + timecode metadata (`clip_media`, `devices`), candidate pairs, envelope + GCC-PHAT alignment with drift (`sync_pairs`), groups (`sync_groups`, `sync_members`), `concrete()` for plans' `multicam` segments | a new metadata source (camera sidecar, timecode box), a new sound ranking, a smarter candidate rule |
 | `export.py` | deliverables: platform presets, face-tracked reframes (9:16 / 4:5 / 1:1), .srt/.vtt, chapters, thumbnail candidates, cutdown plans | a new platform (add a PRESETS entry: size, rate, loudness, safe area) or a new deliverable |
 | `estimate.py` | `cutroom estimate`: time and disk projection from measured stage speeds (`overnight/rates.json`) | a new overnight stage (add a row in `project()`) |
 | `imports.py` | Studio Import: streaming uploads, finding dropped files on disk, linking footage folders into the library | a new kind of thing creators drop in (add a kind + its follow-up job) |

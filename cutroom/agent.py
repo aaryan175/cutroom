@@ -596,6 +596,8 @@ def tag_schema():
             props[k] = lst()
         elif k == "quality":
             props[k] = {"type": ["integer", "null"]}
+        elif k == "seen_at":
+            props[k] = {"type": ["array", "null"], "items": {"type": "number"}}
         elif k == "best":
             props[k] = {"type": ["array", "null"], "items": {
                 "type": "object", "additionalProperties": False, "required": ["t", "why"],

@@ -140,7 +140,27 @@ def _faces_detector():
 
 
 def detect_faces(bgr) -> list:
-    """Face boxes as fractions [x, y, w, h] of the frame."""
+    """Face boxes as fractions [x, y, w, h] of the frame: YuNet (vision.py; side-on, small and partly covered
+    faces, few caption-band false positives) with the Haar cascade as the offline fallback."""
+    if bgr is None:
+        return []
+    try:
+        from .vision import detect_faces as _vd
+        return [f["box"] for f in _vd(bgr)]
+    except Exception:  # noqa: BLE001 - never fail a QA run on the face detector
+        return detect_faces_haar(bgr)
+
+
+def face_backend() -> str | None:
+    try:
+        from .vision import face_detector
+        return face_detector().backend
+    except Exception:  # noqa: BLE001
+        return "haar" if _faces_detector() is not None else None
+
+
+def detect_faces_haar(bgr) -> list:
+    """The old Haar-cascade detector (kept as the fallback and for comparisons)."""
     import cv2
     cas = _faces_detector()
     if cas is None or bgr is None:

@@ -283,7 +283,7 @@ function buildStrip() {
     const w = Math.max(1, s.dur * P - 1);
     const kind = s.flash ? 'flash' : s.kind;
     const t = h('div.cs-tile.k-' + kind + (s.montage ? '.mont' : ''), { style: { left: s.start * P + 'px', width: w + 'px', '--kc': KIND_COL[kind] || '#555' }, dataset: { i: s.i },
-      title: `Shot ${s.i + 1} · ${kind}${s.montage ? ' (montage)' : ''} · ${s.dur.toFixed(2)}s (${s.frames} frames) at ${tshort(s.start)}${s.beat ? ' · on the beat' : ''}${s.text && s.text.present && s.text.words ? `\n“${s.text.words}”` : ''}` });
+      title: `Shot ${s.i + 1} · ${kind}${s.montage ? ' (montage)' : ''} · ${s.dur.toFixed(2)}s (${s.frames} frames) at ${tshort(s.start)}${s.beat ? ' · on the beat' : ''}${s.text && s.text.present && s.text.words ? `\n“${s.text.words}”` : ''}${aiLine(s)}` });
     if (w >= 16 && thumbs[s.i]) t.appendChild(h('img', { src: thumbs[s.i], loading: 'lazy', alt: '', draggable: false }));
     tiles.appendChild(t);
     if (s.text && s.text.present && w >= 6) {
@@ -291,7 +291,16 @@ function buildStrip() {
       caps.appendChild(h('div.cs-cap', { style: { left: s.start * P + 'px', maxWidth: Math.max(8, w) + 'px' }, title: words ? `On screen: “${words}”` : 'Text on screen' }, w > 34 && words ? words : 'Aa'));
     }
   }
-  stripInner.append(bands, tiles, caps, h('div.cs-beats-row'));
+  const devs = h('div.cs-devs');
+  const br = a.brain, f = rfps();
+  for (const d of (br && br.devices) || []) {
+    const t0 = d.f0 / f, t1 = (d.f1 + 1) / f;
+    if (t1 - t0 > 30) continue;                          // a running overlay (captions) would cover the strip
+    devs.appendChild(h('div.cs-dev.d-' + d.kind, { style: { left: t0 * P + 'px', width: Math.max(3, (t1 - t0) * P - 1) + 'px' },
+      title: `${DEV_NAME[d.kind] || d.kind} · ${tshort(t0)}\n${d.detail || ''}\n(AI, frames ${(d.frames || []).join(', ')})`,
+      on: { click: (e) => { e.stopPropagation(); seekRef(t0 + 0.001); } } }));
+  }
+  stripInner.append(bands, tiles, caps, devs, h('div.cs-beats-row'));
   drawSel();
   drawStripCanvas();
 }
@@ -421,6 +430,38 @@ function initStripEvents() {
 }
 const curShotAt = (t) => { const i = curShot(t); return i < 0 ? 0 : i; };
 
+// ---------------------------------------------------------------- the AI brain pass (vision.py): labels + devices
+const DEV_NAME = { card: 'Title card', burn: 'Film burn', flash: 'Flash', inset: 'Inset frame', gate: 'Film gate', letterbox: 'Letterbox',
+  typed_title: 'Typed title', title: 'Title', scribble: 'Scribble', shape_wipe: 'Shape wipe', glitch: 'Glitch', pip: 'Picture in picture',
+  film_frame: 'Film frame', overlay: 'Overlay', speed_ramp: 'Speed ramp', punch_in: 'Punch-in', split_screen: 'Split screen', other: 'Device' };
+function aiLine(s) {
+  const ai = s.ai;
+  if (!ai) return '';
+  const bits = [ai.type, ai.subject, ai.camera && ai.camera !== 'static' ? ai.camera : '', ai.framing === 'poor' ? 'poor framing' : ''].filter(Boolean);
+  return `\nAI: ${bits.join(' · ')}${ai.note ? `\n${ai.note}` : ''}`;
+}
+function drawBrain(a) {
+  const br = a.brain;
+  if (!br) return [h('h5', 'AI breakdown'), h('p.sub', 'Not run yet. "cutroom ref analyze <id> --deep" has the AI check every cut and device, label the shots and say why the edit works (cost-capped, about $1).')];
+  const f = rfps();
+  const mix = new Map();
+  for (const s of a.shots) if (s.ai && s.ai.type) mix.set(s.ai.type, (mix.get(s.ai.type) || 0) + s.dur);
+  const tot = [...mix.values()].reduce((x, y) => x + y, 0) || 1;
+  const cols = ['#2f8a8f', '#6f6ea3', '#93658e', '#8a7539', '#4d7a4a', '#7a4d4d', '#4a5f7a', '#6b6b73', '#3a3a3f', '#9a8a5a'];
+  const parts = [...mix.entries()].sort((x, y) => y[1] - x[1]).map(([k, v], i) => [k, v / tot * 100, cols[i % cols.length]]);
+  const seen = new Set();
+  const devs = (br.devices || []).filter((d) => { const k = `${d.kind}|${d.f0}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  return [
+    h('h5', 'AI breakdown', h('span.grow'), h('span.sub', `${br.agent || 'AI'}${br.cost_usd ? ` · $${(+br.cost_usd).toFixed(2)}` : ''}${br.cut_changes && br.cut_changes.length ? ` · fixed ${br.cut_changes.length} cut${br.cut_changes.length === 1 ? '' : 's'}` : ' · cuts confirmed'}`)),
+    br.summary ? h('p.ai-sum', br.summary) : null,
+    parts.length ? mixBar(parts) : null,
+    devs.length ? h('div.ai-devs', devs.map((d) => h('button.ai-dev.d-' + d.kind, { title: `${d.detail || ''}\nframes ${(d.frames || []).join(', ')}`, on: { click: () => seekRef(d.f0 / f + 0.001) } },
+      h('b', DEV_NAME[d.kind] || d.kind), h('span', tshort(d.f0 / f))))) : null,
+    (br.why_it_works || []).length ? h('div.ai-why', h('h5', 'Why it works'), h('ol', br.why_it_works.map((w) => h('li',
+      w.point, ' ', (w.frames || []).slice(0, 3).map((fr) => h('button.xt.jump', { title: 'Show this frame', on: { click: () => seekRef(fr / f + 0.001) } }, tshort(fr / f))))))) : null,
+  ];
+}
+
 // ---------------------------------------------------------------- breakdown + compare (side panel)
 function stat(label, value, sub) { return h('div.st', h('span.st-l', label), h('b.st-v', value), sub ? h('span.st-s', sub) : null); }
 function mixBar(parts) {
@@ -507,6 +548,7 @@ function drawSide() {
     h('h5', 'Captions', h('span.grow'), h('span.sub', cap.detected ? `${cap.position} · ~${cap.approx_plan_size_1080 || '?'} px at 1080p` : '')),
     captionSwatch(cap, sample),
     cap.detected ? h('p.sub', `${Math.round(cap.words_per_caption || 0)} words at a time · ${cap.outline ? 'outlined' : 'no outline'} · colour ${cap.color} · on screen ${Math.round(cap.coverage_pct || 0)}% of the time`) : null,
+    ...drawBrain(a),
     h('h5', 'Parts and colour', h('span.grow'), h('span.sub', gradeWords(a.colour && a.colour.overall))),
     h('div.secs', secs),
     h('details.readout', h('summary', 'The full read-out'), h('ul', (a.summary || []).map((l) => h('li', l)))));

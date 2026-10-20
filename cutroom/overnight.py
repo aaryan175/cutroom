@@ -6,7 +6,8 @@ unattended, resumable, inside the resource governor's limits.
     cutroom overnight --status | --stop
 
 Pipeline (each stage resumes from the database; finished work is never redone):
-    scan -> probe -> proxies -> sheets -> analyze -> dedupe -> highlights -> sessions -> transcribe (speech
+    scan -> probe -> proxies -> sheets -> analyze -> sync (multicam groups + recorder audio, by sound) -> dedupe ->
+    highlights -> sessions -> transcribe (speech
     first) -> takes -> songs -> matchcuts -> refs -> tag -> upgrade (second ASR pass, only with asr_fast_model)
 Clips the creator touched recently (searches, `cutroom clip`, plans, studio markers) go first, then
 longer clips / clips with more speech. Tagging starts as soon as analysis is done and runs next to
@@ -47,8 +48,8 @@ from pathlib import Path
 from . import agent as agentmod
 from . import db, governor
 
-STAGES = ["scan", "probe", "proxies", "sheets", "analyze", "dedupe", "highlights", "sessions", "transcribe", "takes",
-          "songs", "matchcuts", "refs", "tag", "upgrade"]
+STAGES = ["scan", "probe", "proxies", "sheets", "analyze", "sync", "dedupe", "highlights", "sessions", "transcribe",
+          "takes", "songs", "matchcuts", "refs", "tag", "upgrade"]
 RATE_STAGES = ("proxies", "sheets", "analyze", "transcribe", "highlights", "upgrade")
 EXIT_DONE, EXIT_STOPPED, EXIT_MEMORY = 0, 3, 4
 MAX_RESTARTS = 20
@@ -272,7 +273,9 @@ ENUM_MAP = {
 }
 BOOL_FIELDS = ("creator_visible", "talking_to_camera", "usable")
 LIST_FIELDS = ("actions", "mood", "topics")
-STR_FIELDS = {"summary": 300, "setting": 60, "people": 80, "shot": 30, "camera": 30, "notes": 500, "time_of_day": 20}
+STR_FIELDS = {"summary": 300, "setting": 60, "people": 80, "shot": 30, "camera": 30, "notes": 500, "time_of_day": 20,
+              "subject": 20, "framing": 10, "camera_move": 20, "faces": 80, "text_on_screen": 200}
+LOWER_FIELDS = ("shot", "camera", "subject", "framing", "camera_move")
 LIMIT_PAT = agentmod.LIMIT_PAT
 
 
@@ -306,9 +309,18 @@ def build_tag_prompt(cfg, con, rows, agent="claude") -> str:
         else:
             speech = "(not transcribed yet)" if r["has_audio"] else "(no audio track)"
         w, h = display_size(r)
+        det = ""
+        if getattr(cfg, "vision_clip_context", True):
+            try:
+                from . import vision
+                det = vision.context_line(vision.clip_context(cfg, con, r))
+            except Exception:  # noqa: BLE001 - detector numbers are a hint; never block tagging on them
+                det = ""
         lines.append(f"{n}. id: {r['id']}\n   file: {r['rel']}\n   duration: {float(r['duration'] or 0):.1f}s · "
                      f"{w}x{h}{' · LOG footage (flat colours are expected)' if r['is_log'] else ''}\n"
-                     f"   metrics: {_metrics_line(con, r['id'])}\n   speech: {speech}\n"
+                     f"   metrics: {_metrics_line(con, r['id'])}\n"
+                     + (f"   detectors: {det}\n" if det else "")
+                     + f"   speech: {speech}\n"
                      f"   contact sheet: {Path(r['sheet']).resolve()}")
     if agent == "codex":
         look = (f"The {len(rows)} contact-sheet images attached to this message are the clips below, in the same order\n"
@@ -338,6 +350,9 @@ Rules:
 - "quality" 1-5 reflects focus, exposure, framing and shake; the metrics line is a hint, the frames decide.
 - "usable": false only for accidental / broken / unflattering clips or ones where strangers are the subject.
 - Keep strings short and concrete; lists of 1-6 lowercase words.
+- "shot" / "subject" / "framing" / "camera_move" / "faces" / "text_on_screen" are what YOU see; the detectors line is a
+  hint (face counts from a face detector, possible in-clip cuts). "seen_at" lists the tile times those answers rest
+  on; answers with no seen_at tile are discarded.
 
 Clips:
 {chr(10).join(lines)}
@@ -457,6 +472,11 @@ def validate_tag(obj: dict, duration: float) -> dict:
                     items.append({"t": round(t, 2), "why": str(x.get("why", "") if isinstance(x, dict) else "")[:160]})
             if items:
                 out[k] = items[:8]
+        elif k == "seen_at":
+            ts = [_as_float(x) for x in (v if isinstance(v, list) else [v])]
+            ts = [round(t, 2) for t in ts if t is not None and 0 <= t <= dur + 0.5]
+            if ts:
+                out[k] = ts[:8]
         elif k == "avoid":
             items = []
             for x in (v if isinstance(v, list) else [v]):
@@ -471,7 +491,7 @@ def validate_tag(obj: dict, duration: float) -> dict:
             s = " ".join(str(v if not isinstance(v, list) else ", ".join(map(str, v))).split())[:STR_FIELDS[k]]
             if k == "time_of_day":
                 s = ENUM_MAP["time_of_day"].get(s.lower(), s.lower())
-            elif k in ("shot", "camera"):
+            elif k in LOWER_FIELDS:
                 s = s.lower()
             if s:
                 out[k] = s
@@ -854,6 +874,14 @@ class Pipeline:
                        workers=max(1, min(2, self.gov.heavy_slots)))
         self.stage_end("highlights")
 
+    def st_sync(self):
+        """Multicam / dual-system audio: clips recorded together on different cameras and recorders, grouped and
+        aligned by their sound (sync.py). Cached per pair, so later nights only measure new clips."""
+        from . import sync
+        self.stage_begin("sync", total=1)
+        res = sync.detect(self.cfg, self.con, echo=self.log)
+        self.stage_end("sync", done=1, groups=res["groups"], pairs=res["pairs"], matched=res["accepted"])
+
     def st_sessions(self):
         from . import analyze
         self.stage_begin("sessions", total=1)
@@ -1107,6 +1135,10 @@ class Pipeline:
             for r in batch:
                 o = got.get(r["id"])
                 data = validate_tag(o, r["duration"]) if o else {}
+                if data:
+                    from . import vision
+                    data = vision.check_clip_citations(data, r["duration"], self.cfg.sheet_every_s,
+                                                       self.cfg.sheet_max_tiles)
                 if not data:
                     self.fail_counts[f"tag:{r['id']}"] = record_failure(self.cfg, "tag", r["id"], "no valid tags in reply")
                     continue

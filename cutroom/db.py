@@ -83,6 +83,13 @@ TAG_FIELDS = {
     "avoid": "list of {t0, t1, why} ranges to never use",
     "topics": "list of keywords this clip can illustrate as b-roll",
     "notes": "free text",
+    # vision fields (vision.py): the AI reads them off the sheet; each answer is backed by `seen_at` tile times
+    "subject": "creator | speaker | crowd | people | object | place | text | none",
+    "framing": "good | ok | poor (headroom, horizon, cut-off heads, focus on the subject)",
+    "camera_move": "static | handheld | pan | tilt | push_in | pull_out | tracking | zoom | whip | drone_move",
+    "faces": "faces you see: count, size, position, e.g. '1 close centre', '3 small left' ('0' if none)",
+    "text_on_screen": "readable text in the picture (signs, screens, titles), verbatim; null if none",
+    "seen_at": "list of tile times (seconds, from the sheet labels) that show what shot/subject/faces/text describe",
 }
 
 

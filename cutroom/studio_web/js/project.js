@@ -115,7 +115,8 @@ function makeCell(row) {
   const t = row.tags || {};
   const flags = h('div.flags',
     row.has_transcript ? h('span', { title: 'Has speech (transcribed)', html: icon('speech', 11) }) : null,
-    t.creator_visible ? h('span', { title: 'Creator in frame', html: icon('person', 11) }) : null);
+    t.creator_visible ? h('span', { title: 'Creator in frame', html: icon('person', 11) }) : null,
+    row.mc ? h('span.mc', { title: `Multicam: ${row.mc.name || 'group ' + row.mc.group} · angle ${row.mc.angle}` }, `MC ${row.mc.angle}`) : null);
   const th = h('div.th', img, scrub, flags, h('span.dur', dur(row.duration)));
   const el = h('div.cell', { draggable: true, title: `${row.rel}\n${t.summary || ''}${row.shake !== undefined ? `\nshake ${(+row.shake).toFixed(1)}` : ''}` },
     th, h('div.meta', h('span.name', name(row)), qdots(row.quality ?? t.quality)));
@@ -279,7 +280,7 @@ async function loadDays() {
       const r = await api.clips({ ...params(off), limit: DAY_PAGE });
       if (gen !== days.gen) return;
       const rows = Array.isArray(r) ? r : (r.rows || []);
-      days.rows.push(...rows.map((x) => ({ id: x.id, rel: x.rel, duration: x.duration, shot_at: x.shot_at, quality: x.quality, has_transcript: x.has_transcript, tags: x.tags || {} })));
+      days.rows.push(...rows.map((x) => ({ id: x.id, rel: x.rel, duration: x.duration, shot_at: x.shot_at, quality: x.quality, has_transcript: x.has_transcript, tags: x.tags || {}, mc: x.mc })));
       days.total = r.total ?? days.rows.length;
       off += rows.length;
       renderDays();
@@ -298,7 +299,7 @@ async function loadDay(k) {
     const r = await api.clips({ ...params(0), day: k, limit: 600 });
     if (gen !== days.gen) return;
     const rows = Array.isArray(r) ? r : (r.rows || []);
-    days.byDay.set(k, rows.map((x) => ({ id: x.id, rel: x.rel, duration: x.duration, shot_at: x.shot_at, quality: x.quality, has_transcript: x.has_transcript, tags: x.tags || {} })));
+    days.byDay.set(k, rows.map((x) => ({ id: x.id, rel: x.rel, duration: x.duration, shot_at: x.shot_at, quality: x.quality, has_transcript: x.has_transcript, tags: x.tags || {}, mc: x.mc })));
   } catch (e) { days.byDay.delete(k); toast(`Couldn't load that day: ${e.message}`, 'error'); }
   renderDays();
 }
@@ -335,7 +336,9 @@ function renderDaysNow() {
     const isOpen = days.open.has(k);
     const sec = h('div.day' + (isOpen ? '.open' : ''));
     const head = h('button.day-h', h('span.chev', { html: icon('chev', 12) }), h('span.t', dayLabel(k)),
-      h('span.n', `${count} clip${count !== 1 ? 's' : ''} · ${dur(total)}` + (m && m.sessions && m.sessions.length > 1 ? ` · ${m.sessions.length} shoots` : '')));
+      h('span.n', `${count} clip${count !== 1 ? 's' : ''} · ${dur(total)}` + (m && m.sessions && m.sessions.length > 1 ? ` · ${m.sessions.length} shoots` : '')),
+      m && m.multicam && m.multicam.length ? h('span.mc-badge', { title: m.multicam.map((g) => `${g.name}: ${g.angles} angle(s), ${g.members} file(s), ${dur(g.duration)}`).join('\n') },
+        `${m.multicam.length} multicam`) : null);
     if (m && m.sessions && m.sessions.length > 1) head.title = m.sessions.map((x) => `shoot ${x.session}: ${x.start}–${x.end} · ${x.clips} clips${x.place ? ` · place ${x.place}` : ''}`).join('\n');
     head.onclick = () => { if (days.open.has(k)) days.open.delete(k); else { days.open.add(k); loadDay(k); } LS.set('daysOpen', [...days.open].slice(-50)); renderDaysNow(); };
     sec.appendChild(head);

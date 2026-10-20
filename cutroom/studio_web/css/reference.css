@@ -210,3 +210,18 @@ table.mt td.d { color: #eec784; }
 
 /* ---------------------------------------------------------------- ghost track under the timeline */
 .tl-canvas-wrap canvas.ref-ghost, .ref-ghost { position: absolute; top: auto; left: 0; right: 0; bottom: 11px; height: 20px; width: 100%; z-index: 3; pointer-events: none; border-top: 1px solid var(--line-2); }
+
+/* AI breakdown (vision.py brain pass) */
+.cs-devs { position: absolute; left: 0; top: 66px; height: 6px; width: 100%; pointer-events: none; }
+.cs-dev { position: absolute; top: 0; height: 5px; border-radius: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,.55); background: #c9a24a; pointer-events: auto; cursor: pointer; opacity: .9; }
+.cs-dev.d-burn, .cs-dev.d-flash { background: #e0703a; }
+.cs-dev.d-inset, .cs-dev.d-gate, .cs-dev.d-letterbox, .cs-dev.d-film_frame { background: #8a8ad0; }
+.cs-dev.d-scribble, .cs-dev.d-shape_wipe, .cs-dev.d-glitch { background: #d07ab8; }
+.ai-sum { margin: 2px 0 8px; font-size: 11.5px; line-height: 1.5; color: var(--text-2); }
+.ai-devs { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 4px; }
+.ai-dev { display: inline-flex; gap: 5px; align-items: baseline; padding: 2px 7px; border-radius: 10px; font-size: 10.5px; background: rgba(255, 255, 255, .05); color: var(--text-2); border: 1px solid rgba(255, 255, 255, .08); cursor: pointer; }
+.ai-dev:hover { background: rgba(255, 255, 255, .1); }
+.ai-dev span { color: var(--text-3); font-variant-numeric: tabular-nums; }
+.ai-why ol { margin: 2px 0 6px; padding-left: 16px; font-size: 11px; line-height: 1.5; color: var(--text-2); }
+.ai-why li { margin-bottom: 4px; }
+.ai-why .xt.jump { margin-left: 3px; }

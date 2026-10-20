@@ -24,6 +24,25 @@ only reads it.
   `event-recap` skill.
 - Platform files, captions, chapters, thumbnails, cutdowns, or a multi-TB library? The
   `deliverables-and-scale` skill (`cutroom export`, `cutroom cutdown`, `cutroom estimate`).
+- Several cameras, a separate audio recorder, or the edit is going to Premiere / Resolve / Final Cut? The
+  `multicam` skill (`cutroom sync`, `cutroom export-nle`, `docs/NLE_AND_MULTICAM.md`).
+
+## Multicam and the NLE hand-off
+- **Sync first, then look.** `cutroom sync list` shows the groups. A segment with
+  `"multicam": {"group": G, "angle": "camB", "audio": "auto"}` takes its picture from that angle and its sound from the
+  best source (external recorder > lav > camera), through the measured offset and drift. Never line up angles by hand.
+- **Cutting angles:**
+  - Change angle on speech emphasis: the stressed word, a new sentence, a punchline. Never mid-word.
+  - Go wide for reactions and context (laughter, applause, the room). Go close for the key line.
+  - Hold each angle about 2 s or more. Switch faster only when the pace demands it (hype montage, fast back-and-forth,
+    cold open).
+  - No A-B-A ping-pong within 4 s. A soft or blocked angle loses.
+  - The sound stays on the recorder across angle changes.
+- **Switching angles.** Use `cutroom sync switch PLAN SEC.SEG ANGLE` (or the Studio Inspector) so `clip`, `in` and
+  `out` follow the group.
+- **Hand-off.** `cutroom export-nle PLAN --format premiere --format fcpxml --zip`, then `cutroom export-nle --verify DIR`.
+  It must say OK before you give the creator the folder path and the README steps. The Premiere import has not been
+  tested on real Premiere; say so.
 
 ## The loop (short version)
 

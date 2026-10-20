@@ -17,6 +17,7 @@ every contact sheet and tagged the clip. The summary is in `overnight/REPORT.md`
 | proxies | small H.264 copies (hardware encoder) | heavy slots |
 | sheets | one contact-sheet JPEG per clip | heavy slots |
 | analyze | shots, shake, exposure, sharpness, faces (+ a smile hint and 5 perceptual hashes per clip) | heavy slots (worker processes) |
+| sync | multicam groups: registers recorder audio (WAV/BWF), reads camera make/model/serial/timecode, aligns clips recorded together by their sound (offset + drift, cached per pair; `docs/NLE_AND_MULTICAM.md`) | heavy slot per pair, one at a time |
 | dedupe | byte-identical copies and near-duplicates (perceptual hashes, same folder or close in capture time). One representative per group is tagged; the others inherit its tags | light |
 | highlights | a 0–1 score per 2 s window from audio peaks (applause / crowd, laughter / cheering, loudness that stands out), camera-motion peaks and faces | heavy slots (audio decode only) |
 | sessions | shoots (capture-time gaps over `session_gap_min`) and GPS places (`place_radius_m`) | light (one ffprobe per clip, once) |

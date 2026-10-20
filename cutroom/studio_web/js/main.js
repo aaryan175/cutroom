@@ -115,6 +115,37 @@ async function doExport(kind) {
     emit('jobs'); emit('showDock', 'jobs');
   } catch (e) { toast(`Export failed to start: ${e.message}`, 'error'); }
 }
+async function doExportNle(kind) {
+  if (!S.plan) { toast('Open a plan first.', 'warn'); return; }
+  const v = latestVersion();
+  if (!v) { toast('Save a version first (⌘S): the hand-off is made from a saved version.', 'warn'); return; }
+  const formats = kind === 'fcpxml' ? ['fcpxml', 'otio', 'edl'] : ['premiere', 'fcpxml'];
+  try {
+    const r = await api.exportNle({ plan_file: v.includes('/') ? v : `plans/${v}`, formats, zip: true });
+    toast(`Preparing the ${kind === 'fcpxml' ? 'Resolve / Final Cut' : 'Premiere'} hand-off for ${v}`, 'ok', 2400);
+    if (r && r.job) S.jobs.set(r.job, { id: r.job, kind: 'export', label: `NLE hand-off ${v}`, status: 'queued', progress: 0, started: Date.now() / 1000 });
+    emit('jobs'); emit('showDock', 'jobs');
+  } catch (e) { toast(`Hand-off failed to start: ${e.message}`, 'error'); }
+}
+function showNleDone(d) {
+  const o = $('#help');
+  o.innerHTML = '';
+  const copy = (txt) => h('button.btn.ghost', { on: { click: () => { navigator.clipboard && navigator.clipboard.writeText(txt); toast('Path copied', 'ok', 1200); } } }, 'Copy path');
+  const steps = ['File > Import… the .xml (Premiere) or the .fcpxml (Resolve: File > Import > Timeline).',
+    'Offline clips? Right-click > Link Media… and point at the footage drive; the rest relinks itself.',
+    'Import captions.srt and drag it onto the sequence.',
+    'Grade: add a video track after V2, put an adjustment layer there with Lumetri > Input LUT.',
+    'README_PREMIERE.txt in the folder has every detail.'];
+  o.appendChild(h('div.help-card', { on: { click: (e) => e.stopPropagation() } },
+    h('h3', 'Ready for your NLE', h('span.grow'), h('button.ib', { html: icon('x'), on: { click: () => { o.hidden = true; } } })),
+    h('div', { style: { fontSize: '12px', color: 'var(--text-2)', margin: '0 0 6px' } }, 'Folder'),
+    h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, h('code', { style: { flex: 1, wordBreak: 'break-all', fontSize: '11.5px' } }, d.dir || ''), copy(d.dir || '')),
+    d.zip ? h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' } }, h('code', { style: { flex: 1, wordBreak: 'break-all', fontSize: '11.5px' } }, d.zip), copy(d.zip)) : null,
+    h('ol', { style: { fontSize: '12.5px', lineHeight: '1.6', paddingLeft: '18px', margin: '12px 0 0' } }, steps.map((s) => h('li', s))),
+    (d.warnings || []).length ? h('div', { style: { marginTop: '10px', fontSize: '11.5px', color: 'var(--warn, #e7a93d)' } }, (d.warnings || []).map((w) => h('div', '• ' + w))) : null));
+  o.hidden = false;
+  o.onclick = () => { o.hidden = true; };
+}
 async function commit() {
   if (!S.plan) return;
   try {
@@ -245,7 +276,7 @@ function startEvents() {
     governor: (d) => { S.governor = normGovernor(d); renderGov(); emit('governor'); },
     overnight: (d) => { S.overnight = normOvernight(d); emit('overnight'); },
     render_done: (d) => { toast(`Render finished: ${String(d.file).split('/').pop()}`, 'ok', 5000); refreshProject().then(() => { if (S.programMode === 'render') emit('playRender', d.file); }); },
-    export_done: (d) => { const n = (d.files || []).filter((f) => /\.(mp4|jpg)$/.test(f.file)).length; toast(`Export finished: ${n} file(s) in ${d.dir}${(d.warnings || []).length ? ` · ${d.warnings[0]}` : ''}`, 'ok', 7000); refreshProject(); },
+    export_done: (d) => { if (d.nle) { showNleDone(d); refreshProject(); return; } const n = (d.files || []).filter((f) => /\.(mp4|jpg)$/.test(f.file)).length; toast(`Export finished: ${n} file(s) in ${d.dir}${(d.warnings || []).length ? ` · ${d.warnings[0]}` : ''}`, 'ok', 7000); refreshProject(); },
     notes: () => { loadMarkers(); },
     markers: (d) => { if (!d.plan || !S.plan || d.plan === S.plan.slug) loadMarkers(); },
     ref: (d) => emit('ref', d),
@@ -291,6 +322,8 @@ async function boot() {
   $('#btn-render').onclick = () => doRender(true);
   $('#btn-render-more').onclick = (e) => { e.stopPropagation(); const m = $('#render-menu'); m.hidden = !m.hidden; };
   $('#render-menu').addEventListener('click', (e) => {
+    const nl = e.target.closest('button[data-nle]');
+    if (nl) { $('#render-menu').hidden = true; doExportNle(nl.dataset.nle); return; }
     const x = e.target.closest('button[data-export]');
     if (x) { $('#render-menu').hidden = true; doExport(x.dataset.export); return; }
     const b = e.target.closest('button[data-render]'); if (!b) return; $('#render-menu').hidden = true; doRender(b.dataset.render === 'preview');

@@ -1315,10 +1315,28 @@ def op_add_overlay(st, plan, tl, op):
     _get_seg(plan, si, gi).setdefault("overlays", []).append(o)
 
 
+def op_multicam_angle(st, plan, tl, op):
+    """Switch a multicam segment to another angle (and optionally another sound source): clip, in and out follow
+    the group's measured offsets, so the cut stays on the same moment."""
+    from . import sync as MC
+    si, gi = _seg_ref(op)
+    seg = _get_seg(plan, si, gi)
+    if not seg.get("multicam"):
+        raise ApiError(400, "this segment is not a multicam segment")
+    angle = op.get("angle") or (seg["multicam"] or {}).get("angle")
+    try:
+        with st.pool.get() as con:
+            new = MC.switch_angle(con, seg, angle, audio=op.get("audio"))
+    except (KeyError, ValueError) as e:
+        raise ApiError(400, str(e)) from None
+    seg.clear()
+    seg.update(new)
+
+
 OPS = {"move": op_move, "trim": op_trim, "split": op_split, "delete": op_delete, "insert": op_insert,
        "overwrite": op_overwrite, "freeze": op_freeze, "set": op_set, "set_style": op_set_style,
        "add_section": op_add_section, "set_music": op_set_music, "add_cutaway": op_add_cutaway,
-       "add_overlay": op_add_overlay}
+       "add_overlay": op_add_overlay, "multicam_angle": op_multicam_angle}
 
 
 # ================================================================================================ jobs
@@ -2426,8 +2444,26 @@ class Studio:
         out = self.work / "frames" / "thumbs" / f"{row['id']}_{int(round(t * 10)):07d}.jpg"
         if out.exists():
             return out
+        if not row.get("width") and row.get("status") == "audio":      # recorder audio: a waveform tile
+            return self._wave(row, self.work / "frames" / "thumbs" / f"{row['id']}_wave.jpg")
         src = row.get("proxy") if row.get("proxy") and os.path.exists(row["proxy"]) else row["path"]
         return self._extract(src, round(t, 1), out, 320, quality=5)
+
+    def _wave(self, row, out):
+        if out.exists() and out.stat().st_size > 0:
+            return out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(f".{out.stem}.{threading.get_ident()}.tmp.jpg")
+        args = [self.cfg.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", str(row["path"]),
+                "-filter_complex", "aformat=channel_layouts=mono,showwavespic=s=320x180:colors=0x6fb3ff",
+                "-frames:v", "1", "-q:v", "4", str(tmp)]
+        with light_slot(self.cfg, label=f"wave {row['id']}"):
+            r = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            os.replace(tmp, out)
+            return out
+        tmp.unlink(missing_ok=True)
+        return self._black(out, Path(row.get("rel") or "").name)
 
     def frame(self, cid, t, w=1280):
         row = self.clip_row(cid)
@@ -2795,10 +2831,19 @@ class Handler(BaseHTTPRequestHandler):
                              dedupe=bool(flag("dedupe")),
                              session=int(num("session")) if num("session") is not None else None,
                              near=q.get("near") or None)
+        mc = {}
+        try:
+            from . import sync as MC
+            with self.studio.pool.get() as con:
+                mc = MC.clip_groups(con)
+        except Exception:  # noqa: BLE001 - library without sync tables yet
+            mc = {}
         for r in res["rows"]:
             r["thumb"] = f"/media/thumb/{r['id']}"
             r["proxy_url"] = f"/media/proxy/{r['id']}" if r["has_proxy"] else None
             r["sheet_url"] = f"/media/sheet/{r['id']}" if r["has_sheet"] else None
+            if r["id"] in mc:
+                r["mc"] = mc[r["id"]]                   # multicam group badge (cutroom sync)
         self._json(res)
 
     def api_clip(self, cid):
@@ -3406,7 +3451,80 @@ class Handler(BaseHTTPRequestHandler):
     def api_days(self):
         from . import tags
         with self.studio.pool.get() as con:
-            self._json(tags.days(con))
+            days = tags.days(con)
+            try:
+                from . import sync as MC
+                by = MC.groups_by_day(con)
+            except Exception:  # noqa: BLE001
+                by = {}
+        for d in days:
+            if by.get(d["day"]):
+                d["multicam"] = by[d["day"]]
+        self._json(days)
+
+    def api_multicam(self):
+        """Synced multicam groups (cutroom sync): members, angles, offsets, drift; and the devices."""
+        from . import sync as MC
+        with self.studio.pool.get() as con:
+            self._json({"groups": MC.groups(con), "devices": MC.devices(con)})
+
+    def api_export_nle(self):
+        """Open in Premiere: {plan_file?, formats?: ["premiere", "fcpxml", ...], zip?: true} -> a job running
+        `cutroom export-nle`; the `export_done` event carries {nle: true, dir, zip, howto}."""
+        st = self.studio
+        body = self._body() or {}
+        if body.get("plan_file"):
+            target = self._plan_file(body["plan_file"])
+        else:
+            slug = str(body.get("slug") or "").strip()
+            if not slug:
+                raise ApiError(400, "pass plan_file or slug")
+            vs = sorted(st.plans.dir.glob(f"{slug}_v*.json"), key=lambda p: int(re.search(r"_v(\d+)$", p.stem).group(1))
+                        if re.search(r"_v(\d+)$", p.stem) else -1) if slug else []
+            if not vs:
+                raise ApiError(400, "save a version first (Cmd/Ctrl+S): the hand-off is made from a saved version")
+            target = vs[-1]
+        fmts = body.get("formats") or ["premiere", "fcpxml"]
+        fmts = [fmts] if isinstance(fmts, str) else list(fmts)
+        from . import nle as NL
+        try:
+            NL.formats(fmts)
+        except ValueError as e:
+            raise ApiError(400, str(e)) from None
+        args = ["export-nle", target, "--json"]
+        for f in fmts:
+            args += ["--format", f]
+        if body.get("zip", True):
+            args.append("--zip")
+        if body.get("clean_render"):
+            args.append("--clean-render")
+        cmd = _cli_cmd(*args)
+
+        def parse(job, line):
+            s_ = line.strip()
+            if s_.startswith("export-nle:"):
+                job.stage = s_[:100]
+                job.progress = min(0.95, job.progress + 0.2)
+            job.meta.setdefault("out", []).append(line)
+
+        def done(job):
+            try:
+                txt = "\n".join(job.meta.get("out", []))
+                man = json.loads(txt[txt.index("{"):])
+            except (ValueError, KeyError):
+                man = {}
+            d = Path(man.get("dir") or "")
+            rel = lambda x: Path(x).relative_to(st.work / "renders").as_posix() if str(x).startswith(str(st.work / "renders")) else str(x)  # noqa: E731
+            files = [{"file": rel(f), "url": f"/media/render/{quote(rel(f))}"} for f in man.get("outputs", [])]
+            howto = ("Premiere Pro: File > Import... the .xml in this folder (the zip holds the same files). Relink "
+                     "with Link Media... if the footage drive moved. Import captions.srt the same way. Put the LUT "
+                     "on an adjustment layer between V2 and the graphics. README_PREMIERE.txt has the details.")
+            job.meta.update(dir=str(d), zip=man.get("zip"), files=files, warnings=man.get("warnings", []), howto=howto)
+            st.bus.publish("export_done", {"job": job.id, "nle": True, "dir": str(d), "zip": man.get("zip"),
+                                           "files": files, "warnings": man.get("warnings", []), "howto": howto})
+        job = st.jobs.submit("export", cmd, title=f"Open in Premiere: {target.name}", parse=parse, on_done=done,
+                             meta={"target": target.name, "formats": fmts})
+        self._json({"job": job.id, "status": job.status})
 
     def api_bins(self):
         self._json(bins_load(self.studio.cfg))
@@ -4101,6 +4219,8 @@ ROUTES = [
     _r("POST", r"/api/render", Handler.api_render),
     _r("POST", r"/api/qa", Handler.api_qa),
     _r("POST", r"/api/export", Handler.api_export),
+    _r("POST", r"/api/export_nle", Handler.api_export_nle),
+    _r("GET", r"/api/multicam", Handler.api_multicam),
     _r("GET", r"/api/jobs", Handler.api_jobs),
     _r("GET", rf"/api/jobs/{ID}", Handler.api_job),
     _r("POST", rf"/api/jobs/{ID}/stop", Handler.api_job_stop),

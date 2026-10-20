@@ -51,6 +51,7 @@ from . import governor, media
 
 VERSION = 2
 SCAN_W = 320                    # picture scan width (every frame)
+SCAN_VERSION = 2                # 2: + vision.ShotFeatures (colour hist, edge change, motion-compensated diff, same-picture)
 THUMB_BOX = (480, 270)          # thumbnails fit in this box
 TEXT_EVERY = 2                  # text-band score on every Nth frame
 TEXT_BANDS = {"top": (0.0, 0.25), "middle": (0.38, 0.62), "bottom": (0.62, 1.0)}
@@ -485,6 +486,8 @@ def scan_video(cfg, video, fps, out_npz, prog=None, label="scan") -> dict:
                                "-map", "0:v:0", "-an", "-vf", f"scale={w}:{h}:flags=area", "-fps_mode", "passthrough",
                                "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
     cd, ad = _detectors(fps)
+    from .vision import ShotFeatures
+    sfeat = ShotFeatures()
     fsize = w * h * 3
     bands = {k: (int(round(a * h)), max(int(round(a * h)) + 4, int(round(b * h)))) for k, (a, b) in TEXT_BANDS.items()}
     L = {k: [] for k in ("luma", "std", "sat", "warm", "mafd", "hd", "d2", "vx", "vy", "tx_top", "tx_middle", "tx_bottom")}
@@ -524,6 +527,7 @@ def scan_video(cfg, video, fps, out_npz, prog=None, label="scan") -> dict:
                     L["d2"].append(0.0)
                 c_cuts += _feed(cd, i, fr, fps)
                 a_cuts += _feed(ad, i, fr, fps)
+                sfeat.feed(fr, grey)
                 if i % TEXT_EVERY == 0:
                     for k, (a, b) in bands.items():
                         L[f"tx_{k}"].append(_text_score(cv2, grey[a:b]))
@@ -564,6 +568,8 @@ def scan_video(cfg, video, fps, out_npz, prog=None, label="scan") -> dict:
     arr["n"] = np.asarray([i])
     arr["g32"] = np.asarray(g32[:i], np.uint8).reshape(-1, 18, 32)
     arr["dims"] = np.asarray([w, h, W, H])
+    arr.update(sfeat.arrays(i))
+    arr["scan_version"] = np.asarray([SCAN_VERSION])
     out_npz = Path(out_npz)
     out_npz.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_npz.with_name(out_npz.stem + ".tmp.npz")
@@ -591,6 +597,25 @@ def _is_spike(mafd, hd, i) -> bool:
 
 
 def find_cuts(arr, fps) -> tuple:
+    """(cut frames, flashes). Uses vision.detect_shots (the combined detector with flash / burn suppression and
+    gradual transitions) when the scan has its features; scans from before that use the legacy detector."""
+    if "same1" in arr and "chd" in arr:
+        from .vision import detect_shots
+        r = detect_shots(arr, fps)
+        return r["cuts"], r["flashes"]
+    return find_cuts_legacy(arr, fps)
+
+
+def find_shots(arr, fps) -> dict:
+    """The full detector result: cuts, flashes, gradual transitions and the rejected candidates."""
+    if "same1" in arr and "chd" in arr:
+        from .vision import detect_shots
+        return detect_shots(arr, fps)
+    cuts, flashes = find_cuts_legacy(arr, fps)
+    return {"cuts": cuts, "flashes": flashes, "gradual": [], "rejected": [], "legacy": True}
+
+
+def find_cuts_legacy(arr, fps) -> tuple:
     """(cut frames, flashes). A cut frame is the first frame of a new shot. Merges PySceneDetect's
     Content + Adaptive detectors with frame-difference spikes (which catch 1-frame shots), black-run
     edges and white-flash edges; refines every candidate to the exact frame of the jump."""
@@ -1524,7 +1549,8 @@ def _work_sig(src, extra=""):
     return hashlib.sha1(f"{VERSION}|{Path(src).resolve()}|{st.st_size}|{st.st_mtime_ns}|{extra}".encode()).hexdigest()[:12]
 
 
-def measure(cfg, d, picture, audio_src, fps, title, prog, asr=True, sidecar=None, ref_label="") -> dict:
+def measure(cfg, d, picture, audio_src, fps, title, prog, asr=True, sidecar=None, ref_label="", cuts_override=None,
+            brain=None) -> dict:
     """Run scan -> frames -> audio -> asr -> assemble for one video into directory d. Resumable."""
     d = Path(d)
     wd = d / "work"
@@ -1538,12 +1564,18 @@ def measure(cfg, d, picture, audio_src, fps, title, prog, asr=True, sidecar=None
     # scan
     prog.begin("scan")
     npz = wd / "scan.npz"
-    if npz.exists():
-        arr = dict(np.load(npz))
-    else:
+    arr = dict(np.load(npz)) if npz.exists() else None
+    if arr is not None and int(arr.get("scan_version", [1])[0]) < SCAN_VERSION:
+        arr = None                                  # an older scan without the vision features: rescan
+    if arr is None:
         arr = scan_video(cfg, picture, fps, npz, prog, label=f"scan {ref_label}")
     n = int(arr["n"][0])
-    cuts, flashes = find_cuts(arr, fps)
+    shot_det = find_shots(arr, fps)
+    cuts, flashes = shot_det["cuts"], shot_det["flashes"]
+    if cuts_override is None and brain and brain.get("detector_cuts") == [int(c) for c in cuts]:
+        cuts_override = brain.get("cuts")           # an earlier brain pass reviewed exactly these detector cuts
+    if cuts_override is not None:                   # the brain pass decided (vision.final_cuts)
+        cuts = sorted(int(c) for c in cuts_override if 0 < int(c) < n)
     shots = _shots_from_cuts(cuts, n, fps)
     for s in shots:
         s["_stats"] = _shot_stats(arr, s)
@@ -1552,9 +1584,12 @@ def measure(cfg, d, picture, audio_src, fps, title, prog, asr=True, sidecar=None
     prog.begin("frames")
     fj = wd / "frames.json"
     frames = _jload(fj)
+    starts = [int(s["f0"]) for s in shots]
+    if isinstance(frames, dict):                    # {"starts": [...], "frames": [...]}: keyed by the shot list
+        frames = frames.get("frames") if frames.get("starts") == starts else None
     if not frames or len(frames) != len(shots):
         frames = frames_stage(cfg, picture, arr, shots, fps, d, prog, label=f"frames {ref_label}")
-        _jsave(fj, frames)
+        _jsave(fj, {"starts": starts, "frames": frames})
     prog.end()
     # devices (burns, frames, cards, typed titles) in the opening
     dj = wd / "devices.json"
@@ -1601,10 +1636,22 @@ def measure(cfg, d, picture, audio_src, fps, title, prog, asr=True, sidecar=None
                "transcript_note": (transcript or {}).get("skipped"),
                "tools": {"tesseract": bool(shutil.which("tesseract")), "faces": _faces_available(),
                          "asr_model": (transcript or {}).get("model"),
-                         "detectors": ["ContentDetector", "AdaptiveDetector", "frame-difference spikes", "black/flash runs"]},
+                         "detectors": (["ContentDetector", "AdaptiveDetector", "frame-difference spikes", "black/flash runs"]
+                             if shot_det.get("legacy") else
+                             ["vision.detect_shots: content + luma/colour histograms + edge change + motion-compensated "
+                              "diff, flash/burn suppression by block structure, gradual-transition fit",
+                              "ContentDetector", "AdaptiveDetector"]),
+               "face_backend": _face_backend()},
                "detector_counts": {"content": int(len(arr["content_cuts"])), "adaptive": int(len(arr["adaptive_cuts"]))}})
     an["devices"] = dev
+    an["shot_detector"] = {"flashes": shot_det.get("flashes") or [], "gradual": shot_det.get("gradual") or [],
+                           "rejected": (shot_det.get("rejected") or [])[:400], "legacy": bool(shot_det.get("legacy")),
+                           "effects": (shot_det.get("effects") or [])[:1000],
+                           "cuts": [int(c) for c in shot_det["cuts"]], "ai_cuts": cuts_override is not None}
     _tag_shots(an)
+    if brain:
+        from .vision import merge_brain
+        merge_brain(an, brain)
     an["sheets"] = _sheets(d, an["shots"], fps, title or d.name, n)
     an["summary"] = summary_lines(an)
     an["seconds"] = round(time.time() - t0, 1)
@@ -1612,15 +1659,23 @@ def measure(cfg, d, picture, audio_src, fps, title, prog, asr=True, sidecar=None
     return an
 
 
+def _face_backend():
+    try:
+        from .vision import face_detector
+        return face_detector().backend
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _faces_available():
     try:
-        from .qa import _faces_detector
-        return _faces_detector() is not None
+        from .qa import face_backend
+        return face_backend() is not None
     except Exception:  # noqa: BLE001
         return False
 
 
-def analyze(cfg, rid, force=False, asr=True, echo=print) -> dict:
+def analyze(cfg, rid, force=False, asr=True, echo=print, cuts_override=None) -> dict:
     """Measure reference `rid` and write refs/<id>/analysis.json. Resumable: finished stages are kept."""
     rid = resolve_id(cfg, rid)
     d = ref_dir(cfg, rid)
@@ -1632,7 +1687,8 @@ def analyze(cfg, rid, force=False, asr=True, echo=print) -> dict:
     out = d / "analysis.json"
     if out.exists() and not force:
         an = _jload(out, {})
-        if an.get("version") == VERSION and an.get("_sig") == _work_sig(src, "final"):
+        if (an.get("version") == VERSION and an.get("_sig") == _work_sig(src, "final") and an.get("shot_detector")
+                and cuts_override is None):
             save_meta(cfg, rid, status="analyzed", stage=None, progress=1.0, error=None)
             return an
     if force:
@@ -1645,7 +1701,8 @@ def analyze(cfg, rid, force=False, asr=True, echo=print) -> dict:
         prog.end()
         fields = _probe_fields(cfg, proxy)
         fps = float(Fraction(fields["fps_rational"]))
-        an = measure(cfg, d, proxy, src, fps, meta.get("title") or rid, prog, asr=asr, ref_label=rid)
+        an = measure(cfg, d, proxy, src, fps, meta.get("title") or rid, prog, asr=asr, ref_label=rid,
+                     cuts_override=cuts_override, brain=_jload(d / "brain.json"))
     except BaseException as e:
         save_meta(cfg, rid, status="error" if not isinstance(e, KeyboardInterrupt) else "added",
                   error=f"{type(e).__name__}: {str(e)[-500:]}", stage=prog.stage)
@@ -1767,6 +1824,21 @@ def summary_lines(an) -> list:
         out.append("no on-screen text detected")
     c = an["colour"]["overall"]
     out.append(f"picture: luma {c['luma']} · contrast {c['contrast']} · saturation {c['sat']} · warmth {c['warmth']}")
+    br = an.get("brain")
+    if br:
+        mix = {}
+        for s in an["shots"]:
+            k = (s.get("ai") or {}).get("type")
+            if k:
+                mix[k] = mix.get(k, 0) + s["dur"]
+        tot = sum(mix.values()) or 1.0
+        out.append(f"AI breakdown ({br.get('agent')}): " + (" · ".join(f"{k} {100 * v / tot:.0f}%" for k, v in
+                                                                       sorted(mix.items(), key=lambda x: -x[1]))
+                                                          or "no shot labels")
+                   + f" · devices: {', '.join(sorted({d['kind'] for d in br.get('devices') or []})) or 'none'}"
+                   + f" · {len(br.get('cut_changes') or [])} detector cuts corrected")
+        for w in (br.get("why_it_works") or [])[:4]:
+            out.append(f"why it works: {w['point']}")
     return out
 
 
@@ -1781,11 +1853,14 @@ def cutmap_rows(an) -> list:
     rows = []
     for s in an["shots"]:
         t = s.get("text") or {}
+        ai = s.get("ai") or {}
         rows.append({"i": s["i"], "start": s["start"], "dur": s["dur"], "frames": s["frames"],
                      "kind": s["kind"] + ("/montage" if s.get("montage") else ""), "beat": s.get("beat"),
-                     "text": (t.get("words") or ("(text)" if t.get("present") else "")) if t else "",
+                     "text": (t.get("words") or ("(text)" if t.get("present") else "")) if t else (ai.get("text") or ""),
                      "luma": s["luma"], "faces": s["faces"], "section": secs.get(s.get("section"), ""),
-                     "devices": s.get("devices") or [], "thumb": s.get("thumb")})
+                     "devices": s.get("devices") or [], "thumb": s.get("thumb"),
+                     "shot_type": ai.get("type"), "subject": ai.get("subject"), "camera": ai.get("camera"),
+                     "framing": ai.get("framing"), "note": ai.get("note")})
     return rows
 
 
@@ -1978,10 +2053,13 @@ def compare(cfg, rid, target, echo=print, style=None, out_h=None) -> dict:
 
 
 def _compare_devices(ref, yours, row, gap, window_s=15.0):
-    """Rows + gaps for the reference's devices (card, burns, frames, typed title) in the opening."""
+    """Rows + gaps for the reference's devices (card, burns, frames, typed title) in the opening, plus the
+    devices only the AI brain pass names."""
     rd, yd = ref.get("devices"), yours.get("devices")
     if not rd:
-        return
+        rd = {}
+        if not ref.get("brain"):
+            return
     yd = yd or {}
     rc, yc = rd.get("card"), yd.get("card")
     row("card", "Title card at the start", f"{rc['t1']:.2f}s" if rc else "none", f"{yc['t1']:.2f}s" if yc else "none")
@@ -1999,13 +2077,29 @@ def _compare_devices(ref, yours, row, gap, window_s=15.0):
         gap("burns", "big" if not yb else "small",
             f"the reference has {len(rb)} two-frame film burns in its first {window_s:.0f} s ("
             + ", ".join(f"{b['t']:.2f}s" for b in rb) + f"); yours has {len(yb)}")
-    for kind in ("inset", "gate"):
+    for kind in ("inset", "gate", "letterbox"):
         rr = sum(r["t1"] - r["t0"] for r in rd.get("frames") or [] if r["kind"] == kind and r["t0"] < window_s)
         yy = sum(r["t1"] - r["t0"] for r in yd.get("frames") or [] if r["kind"] == kind and r["t0"] < window_s)
         row(f"frame_{kind}", f"{kind.capitalize()} frame time (first {window_s:.0f} s)", round(rr, 2), round(yy, 2), "s")
         if rr >= 0.3 and yy < 0.5 * rr:
             gap(f"frame_{kind}", "big" if yy == 0 else "small",
                 f"the reference spends {rr:.1f}s in a{'n' if kind == 'inset' else ''} {kind} frame in its opening; yours {yy:.1f}s")
+    # devices only the AI brain pass can name (scribbles, shape wipes, glitches, picture-in-picture, film frames)
+    rb_ = ref.get("brain") or {}
+    fps_ = float((ref.get("source") or {}).get("fps") or 25)
+    measurable = {"card", "burn", "inset", "gate", "letterbox", "typed_title", "title", "flash"}
+    ai_only = {}
+    for d in rb_.get("devices") or []:
+        t0 = d["f0"] / fps_
+        if d["kind"] not in measurable and t0 < window_s and (d["f1"] - d["f0"]) / fps_ < 30:
+            ai_only.setdefault(d["kind"], []).append(t0)
+    yb_ = {d["kind"] for d in (yours.get("brain") or {}).get("devices") or []}
+    for k, ts in sorted(ai_only.items()):
+        row(f"ai_{k}", f"{k.replace('_', ' ').capitalize()} (AI-read)", ", ".join(f"{t:.2f}s" for t in ts[:6]),
+            "yes" if k in yb_ else ("not measured" if not yours.get("brain") else "none"))
+        if k not in yb_:
+            gap(f"ai_{k}", "info", f"the reference uses {k.replace('_', ' ')} at " + ", ".join(f"{t:.2f}s" for t in ts[:4])
+                + " (read by the AI pass; cutroom can't measure it in yours automatically, so look)", ts[0])
     rt = [t for t in rd.get("titles") or [] if t.get("type_on") and t["t0"] < window_s]
     yt = [t for t in yd.get("titles") or [] if t.get("type_on") and t["t0"] < window_s]
     row("typed_title", "Typed title", f"{rt[0]['t0']:.2f}s" if rt else "none", f"{yt[0]['t0']:.2f}s" if yt else "none")
@@ -2136,7 +2230,7 @@ def compare_analyses(ref, yours, mode="render", label="") -> dict:
 # ==================================================================================================
 # devices: film burns, frame changes (inset / window-box gate / letterbox), title cards, type-on titles
 # ==================================================================================================
-DEV_VERSION = 1
+DEV_VERSION = 2                  # 2: scope letterboxes nested inside a gate are their own run
 DEV_W, DEV_H = 320, 180
 DEV_WINDOW_S = 60.0              # devices are measured in the opening minute (where intros live)
 
@@ -2224,7 +2318,9 @@ def _frame_kind(f):
         return "gate"
     tinted = f["ring"][0] - f["ring"][2] >= 6          # the gate's maroon-black, not a pure black surround
     if tinted and (w < 0.985 or h < 0.985):
-        return "gate_inner"                              # a matte / letterbox nested inside the gate
+        if w >= 0.85 and h > 0 and (w / h) * 16 / 9 >= 2.2:
+            return "letterbox"                           # a scope letterbox (2.2:1 and wider) nested inside the gate
+        return "gate_inner"                              # a matte nested inside the gate
     if w < 0.92 and h < 0.92 and 0.04 < x0 and 0.04 < y0:
         return "inset"
     return "full"

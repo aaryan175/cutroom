@@ -30,13 +30,20 @@
                                                                      platform files, 9:16 reframe, .srt/.vtt,
                                                                      chapters, thumbnails (docs/WORKFLOW.md)
   cutroom cutdown PLAN.json --len 30                                 a 15/30/60 s plan from an edit
+  cutroom export-nle PLAN.json [--format premiere|fcpxml|resolve|otio|edl|all] [--zip] [--clean-render]
+                                                                     Premiere / Resolve / FCP hand-off on the masters
+  cutroom export-nle --verify DIR                                    re-read it, compare every clip frame-exactly
+  cutroom sync [--clips A B ...] | sync list | devices | name DEV "Cam A wide" | map G T --from A --to B
+                                                                     multicam + recorder sync by audio
+  cutroom sync switch PLAN SEC.SEG ANGLE [--audio CODE]              change a multicam segment's angle
   cutroom board [--port 8600]                                        review page for renders (phone friendly)
   cutroom notes [--since VERSION]                                    review notes captured on the board
   cutroom studio [--port 8600] [--host 127.0.0.1] [--open]           the browser editor (docs/STUDIO.md)
   cutroom comments [list|done|needs|reply|open ID] [--reply TEXT]    studio review comments (alias: markers)
          [--plan SLUG] [--all] [--json]                              done --reply "what changed" / needs --reply "Needs you: ..."
   cutroom ref add FILE|URL [--title T] [--no-analyze] [--link]        add a reference video and measure it
-  cutroom ref list | ref show ID | ref analyze ID [--force]           references: status, summary + sheets
+  cutroom ref list | ref show ID | ref analyze ID [--force] [--deep]  references: status, summary + sheets
+                                                                     (--deep: AI brain pass, cost-capped --budget)
   cutroom ref cutmap ID [--json]                                     one row per shot, to rebuild one-to-one
   cutroom ref compare ID RENDER.mp4 [--json]                         your render vs the reference, gaps in words
   cutroom factory run|tick|status|orders|order ID|send|stop ID|retry ID|pause|resume
@@ -370,6 +377,105 @@ def cmd_cutdown(a):
         print(export.build_cutdown(cfg, con, a.plan, L))
 
 
+def cmd_export_nle(a):
+    from . import nle
+    cfg, con = _cfg_con()
+    if a.verify:
+        rep = nle.verify(cfg, con, a.verify, plan_path=a.plan)
+        if a.json:
+            print(json.dumps(rep, indent=1, default=str))
+        else:
+            print(f"verify {a.verify}: {'OK' if rep['ok'] else 'FAILED'} · {rep['frames']} frames @ {rep['fps']:g}")
+            for k, c in rep["checks"].items():
+                what = ("structure " + ("clean" if c["ok"] else "problems")) if k.endswith("_schema") else \
+                    f"{c['matched']}/{c['expected']} clips frame-exact"
+                tag = "ok " if c["ok"] else ("inf" if c.get("informational") else "BAD")
+                print(f"  {tag} {k:24s} {what}{' (informational: third-party reader limits)' if c.get('informational') else ''}"
+                      + "".join(f"\n      ! {p}" for p in c["problems"][:12]))
+        sys.exit(0 if rep["ok"] else 1)
+    if not a.plan:
+        sys.exit("export-nle: pass a plan (or --verify DIR)")
+    m = nle.export(cfg, con, a.plan, fmts=a.format or ["premiere"], out=a.out, render=a.render,
+                   clean_render=a.clean_render, preview=a.preview, graphics=not a.no_graphics, make_zip=a.zip)
+    if a.json:
+        print(json.dumps({k: m[k] for k in ("dir", "outputs", "warnings", "formats") if k in m} | {"zip": m.get("zip")},
+                         indent=1, default=str))
+        return
+    print(f"export-nle -> {m['dir']}")
+    for o in m["outputs"]:
+        print(f"  {Path(o).name}")
+    print(f"  {len(m.get('graphics_media', []))} graphic(s) on V3 · {len(m.get('fx_media', []))} rendered segment(s) on V4"
+          f" · {len(m.get('groups') or [])} multicam source sequence(s)")
+    if m.get("zip"):
+        print(f"  zip {m['zip']}")
+    for w in m.get("warnings", []):
+        print(f"  ! {w}")
+    print("  Premiere: File > Import the .xml; README_PREMIERE.txt has the steps. Check: cutroom export-nle --verify DIR")
+
+
+def cmd_sync(a):
+    from . import sync
+    cfg, con = _cfg_con()
+    act = a.action or "detect"
+    args = a.args or []
+    if act == "detect":
+        st = sync.detect(cfg, con, clips=a.clips, force=a.force)
+        if a.json:
+            print(json.dumps(st, indent=1))
+        return
+    if act == "list":
+        gs = sync.groups(con)
+        if a.json:
+            print(json.dumps(gs, indent=1, default=str))
+            return
+        if not gs:
+            print("no synced groups (run: cutroom sync)")
+        for g in gs:
+            print(f"group {g['id']} · {g['name']} · {g['duration']:.1f}s · {len(g['members'])} members · "
+                  f"loop error {g['loop_err_ms'] or 0:.2f} ms")
+            for m in g["members"]:
+                print(f"   {m['angle']:7s} {'video' if m['video'] else 'audio'} {m['kind']:8s} offset {m['offset']:+10.4f}s "
+                      f"drift {m['drift_ppm']:+7.1f} ppm conf {m['confidence']:.2f}  {m['device_name'] or ''} · {m['rel']}")
+        return
+    if act == "show":
+        g = sync.group(con, args[0])
+        print(json.dumps(g, indent=1, default=str))
+        return
+    if act == "devices":
+        for d in sync.devices(con):
+            print(f"{d['id']:3d} {d['code']:6s} {d['kind']:8s} {d['name'] or '':28s} {d['make'] or ''} {d['model'] or ''} "
+                  f"{('sn ' + d['serial']) if d['serial'] else ''} · {d['clips']} clip(s)")
+        return
+    if act == "name":
+        if len(args) < 1:
+            sys.exit('usage: cutroom sync name DEVICE "Cam A wide" [--kind camera|recorder|lav] [--code camA]')
+        d = sync.name_device(con, args[0], name=args[1] if len(args) > 1 else None, kind=a.kind, code=a.code,
+                             tc_sync=(a.tc_sync == "on") if a.tc_sync else None)
+        print(f"{d['code']} = {d['name']} ({d['kind']})")
+        return
+    if act == "rename":
+        sync.rename_group(con, args[0], " ".join(args[1:]))
+        return
+    if act == "map":
+        t = sync.map_time(con, args[0], float(args[1]), frm=a.frm, to=a.to)
+        print(f"{t:.4f}")
+        return
+    if act == "switch":
+        from . import plan as P
+        if len(args) < 3:
+            sys.exit("usage: cutroom sync switch PLAN SEC.SEG ANGLE [--audio CODE]")
+        path = Path(args[0])
+        plan = P.load(path)
+        si, gi = (int(x) for x in args[1].split("."))
+        seg = plan["sections"][si]["segments"][gi]
+        plan["sections"][si]["segments"][gi] = sync.switch_angle(con, seg, args[2], audio=a.audio)
+        path.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + "\n")
+        s2 = plan["sections"][si]["segments"][gi]
+        print(f"section {si} segment {gi}: angle {args[2]} · clip {s2['clip']} {s2['in']}-{s2['out']}")
+        return
+    sys.exit(f"unknown sync action {act!r}")
+
+
 def cmd_detect(a):
     from . import analyze
     cfg, con = _cfg_con()
@@ -686,6 +792,12 @@ def cmd_ref(a):
             need(1, "analyze ID [--force]")
             rid = R.resolve_id(cfg, args[0])
             R.analyze(cfg, rid, force=a.force, asr=not a.no_asr, echo=_echo)
+            if a.deep:
+                from . import vision
+                _, brain = vision.deep_analyze(cfg, rid, budget_usd=a.budget, agent=a.agent, echo=_echo,
+                                               force=a.force)
+                for ln in vision.brain_lines(brain):
+                    print(ln)
             _ref_show(cfg, rid)
         elif a.action == "list":
             R.sync_reference_folder(cfg)
@@ -799,7 +911,7 @@ def cmd_governor(a):
     print(f"  limits: {st['limits']}")
 
 
-FACTORY_REFUSED = ("render", "transcribe", "export", "cutdown", "overnight", "index", "studio", "factory")
+FACTORY_REFUSED = ("render", "transcribe", "export", "cutdown", "overnight", "index", "studio", "factory", "export-nle")
 
 
 def main(argv=None):
@@ -884,6 +996,26 @@ def main(argv=None):
     p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_export)
     p = sp.add_parser("cutdown"); p.add_argument("plan"); p.add_argument("--len", default="30")
     p.set_defaults(fn=cmd_cutdown)
+    p = sp.add_parser("export-nle", help="Premiere XML / FCPXML / OTIO / EDL hand-off (docs/NLE_AND_MULTICAM.md)")
+    p.add_argument("plan", nargs="?"); p.add_argument("--format", action="append",
+                                                     help="premiere (default), fcpxml (= resolve), otio, edl, all")
+    p.add_argument("--out", help="folder (default renders/nle/<slug>_vN)")
+    p.add_argument("--render", help="a cutroom render of this plan to cut the V4 effect segments from")
+    p.add_argument("--clean-render", action="store_true", help="cut effects from a caption-free render (renders one)")
+    p.add_argument("--preview", action="store_true", help="with --clean-render: a 720p preview is enough")
+    p.add_argument("--no-graphics", action="store_true", help="skip the ProRes 4444 overlay graphics")
+    p.add_argument("--zip", action="store_true", help="also pack the folder as a zip")
+    p.add_argument("--verify", metavar="DIR", help="re-read an export and compare every clip to the plan")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_export_nle)
+    p = sp.add_parser("sync", help="multicam + dual-system audio sync (docs/NLE_AND_MULTICAM.md)")
+    p.add_argument("action", nargs="?", default="detect",
+                   choices=["detect", "list", "show", "devices", "name", "rename", "map", "switch"])
+    p.add_argument("args", nargs="*"); p.add_argument("--clips", nargs="+", help="detect: align just these clips")
+    p.add_argument("--force", action="store_true", help="detect: re-measure cached pairs")
+    p.add_argument("--kind", choices=["camera", "recorder", "lav"]); p.add_argument("--code")
+    p.add_argument("--tc-sync", choices=["on", "off"], help="name: jam-synced timecode decides when audio can't")
+    p.add_argument("--from", dest="frm"); p.add_argument("--to"); p.add_argument("--audio")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_sync)
     p = sp.add_parser("board"); p.add_argument("--port", type=int, default=8600)
     p.add_argument("--host", default="127.0.0.1"); p.set_defaults(fn=cmd_board)
     p = sp.add_parser("notes"); p.add_argument("--since", type=int); p.set_defaults(fn=cmd_notes)
@@ -900,7 +1032,12 @@ def main(argv=None):
     p.add_argument("args", nargs="*"); p.add_argument("--title"); p.add_argument("--no-analyze", action="store_true")
     p.add_argument("--link", action="store_true", help="add: symlink the file instead of copying it")
     p.add_argument("--json", action="store_true"); p.add_argument("--force", action="store_true")
-    p.add_argument("--no-asr", action="store_true", help="skip speech-to-text"); p.set_defaults(fn=cmd_ref)
+    p.add_argument("--no-asr", action="store_true", help="skip speech-to-text")
+    p.add_argument("--deep", action="store_true", help="analyze: + the AI brain pass (vision.py): reviews every cut and "
+                                                       "device, labels shots, reads text, explains why it works")
+    p.add_argument("--budget", type=float, default=None, help="--deep: cost cap in USD (default vision_ref_budget_usd, $1)")
+    p.add_argument("--agent", default=None, help="--deep: claude | codex (default: the configured agent)")
+    p.set_defaults(fn=cmd_ref)
     p = sp.add_parser("studio"); p.add_argument("--port", type=int, default=8600)
     p.add_argument("--host", default="127.0.0.1"); p.add_argument("--open", action="store_true")
     p.set_defaults(fn=cmd_studio)

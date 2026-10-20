@@ -32,6 +32,9 @@ Segment types (field "type"):
             "cutaways": [{"clip", "in", "at", "dur"}],                          # b-roll over the voice; "at" = seconds into the segment
             "overlays": [<overlay>]}
   broll    {"clip", "in", "out", "speed": 1.0, "audio": "music"|"natural"|"mix", "stabilize": false}
+  (talk/broll) + "multicam": {"group": 3, "angle": "camB", "audio": "auto"|"camera"|<angle>}  synced group
+           (cutroom sync): picture from the angle, sound from the best source (recorder > lav > camera).
+           With "clip", in/out are that clip's seconds (mapped to the angle); without, group seconds.
   montage  {"shots": [{"clip", "in", "out"?}], "beat_sync": true, "beats_per_cut": 1,
             "max_shot": 1.6, "min_shot": 0.4, "audio": "music"}
   matchcut {"a": {"clip", "t"}, "b": {"clip", "t"}, "pre": 0.8, "post": 1.4}  # A ends exactly at a.t, B starts exactly at b.t
@@ -249,7 +252,11 @@ def validate(plan: dict, con=None) -> list:
             if t in ("talk", "broll"):
                 if s.get("in") is None or s.get("out") is None or float(s["out"]) <= float(s["in"]):
                     errs.append(f"{w}: needs in < out")
-                chk_clip(w, s.get("clip"), s.get("in"), s.get("out"))
+                if s.get("multicam"):                         # angle + best sound from a synced group (sync.py)
+                    from .sync import validate_segment
+                    errs += validate_segment(con, w, s)
+                else:
+                    chk_clip(w, s.get("clip"), s.get("in"), s.get("out"))
                 for k, c in enumerate(s.get("cutaways", [])):
                     chk_clip(f"{w} cutaway {k}", c.get("clip"), c.get("in"))
                     if c.get("dur", 0) <= 0:

@@ -712,3 +712,10 @@ details.xcode summary::-webkit-details-marker { display: none; }
 input, textarea, select, [contenteditable="true"], pre, code, .fx-log, .fx-ledger, .fx-q-t, .fx-why, .fx-otext,
 .fx-rlast, .fx-lrule, .selectable {
   -webkit-user-select: text; user-select: text; }
+
+/* multicam (cutroom sync): library badges + inspector angle picker */
+.cell .flags span.mc { background: rgba(70, 120, 255, .85); color: #fff; font-size: 9.5px; font-weight: 600; letter-spacing: .02em; }
+.day-h .mc-badge { margin-left: 8px; font-size: 10.5px; padding: 1px 6px; border-radius: 8px; background: rgba(70, 120, 255, .18); color: #a9c1ff; }
+.mc-angles { display: flex; flex-wrap: wrap; gap: 4px; }
+.mc-angles button { font-size: 11px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line, #333); background: transparent; color: var(--text-2); cursor: pointer; }
+.mc-angles button.on { background: rgba(70, 120, 255, .85); border-color: transparent; color: #fff; }

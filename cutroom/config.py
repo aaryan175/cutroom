@@ -83,6 +83,10 @@ class Config:
     tag_sleep_s: float = 20.0                              # pause between tagging calls
     tag_model: str = ""                                    # Claude model alias for tagging ("" = your default)
     tag_timeout_s: float = 900.0                           # one tagging call may take this long
+    # -- vision (vision.py): YuNet faces, the combined shot detector, the AI brain pass
+    vision_model: str = ""                                 # model for `ref analyze --deep` ("" = tag_model / your default)
+    vision_ref_budget_usd: float = 1.0                     # cost cap of one reference brain pass
+    vision_clip_context: bool = True                       # tagging prompts carry YuNet face numbers + in-clip cuts
     # -- scale: tagging cost control + library structure (analyze.py, docs/OVERNIGHT.md "Big libraries")
     tag_gate: bool = True                                  # skip clips that can't be useful (short / black / very shaky)
     tag_min_dur: float = 1.0                               # gate: shorter clips are not sent to the AI
@@ -93,6 +97,17 @@ class Config:
                                                            # many hours of capture time
     session_gap_min: float = 45.0                          # a capture-time gap this long starts a new shoot ("session")
     place_radius_m: float = 150.0                          # clips with GPS within this radius share a place
+    # -- multicam / dual-system audio sync (sync.py, docs/NLE_AND_MULTICAM.md)
+    sync_window_s: float = 300.0                           # clips whose capture times overlap within this slack are
+                                                           # tried against each other (camera clocks drift)
+    sync_tz_slop: bool = True                              # also try whole-hour clock offsets (a device left on UTC
+                                                           # or home time); the audio still has to agree
+    sync_min_conf: float = 0.25                            # audio match acceptance: normalised correlation peak
+    sync_min_ratio: float = 1.35                           # ... and peak / best rival peak
+    sync_device_hint: str = r"(?i)^(cam(era)?[ _-]?[a-z0-9]{1,3}|[a-z][ _-]?cam|angle[ _-]?\w+|rec(order)?[ _-]?\w*|" \
+                            r"zoom\w*|tascam\w*|h[456]n?|lav\w*|audio\w*)$"
+                                                           # a folder name matching this names the device when the
+                                                           # camera writes no serial number (two identical bodies)
 
     # -- paths ---------------------------------------------------------------------------------
     def p(self, *parts) -> Path:

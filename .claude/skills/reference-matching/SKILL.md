@@ -17,7 +17,14 @@ cutroom ref add <file-or-link> --title "short name"   # copies it into refs/<id>
 cutroom ref list                                       # anything in renders/reference/ shows up here too
 cutroom ref show <id>                                  # the summary + the contact-sheet paths
 cutroom ref cutmap <id>                                # one row per shot: start, length, kind, beat, text, luma
+cutroom ref analyze <id> --deep [--budget 1.0]         # + the AI brain pass (vision.py): reviews every cut and
+                                                       #   device in the opening, labels shot type / subject /
+                                                       #   camera, reads on-screen text, explains why it works
 ```
+- `--deep` costs money (default cap $1, `vision_ref_budget_usd`; model `vision_model`, default Sonnet). Its result is
+  cached by content hash, so re-running is free. Every AI claim cites frame numbers it was shown; uncited claims are
+  dropped (`refs/<id>/brain.json` lists them). The cut map gains `shot_type`, `subject`, `camera`, `framing`, and
+  devices the detectors can't measure (scribbles, shape wipes, glitches, picture-in-picture).
 - Links need `yt-dlp` installed. If it isn't, say so in one line and ask for the file.
 - A 10-minute reference takes a few minutes (most of it is speech-to-text). Re-running continues where it stopped.
 - In the studio, `POST /api/refs` does the same as a job. The overnight run measures any reference that

@@ -118,6 +118,8 @@ All JSON unless noted. Media routes support byte ranges (206).
 | POST | `/api/plan/new` | `{title}` → empty draft |
 | POST | `/api/render` | `{plan_file, preview}` → job id (queued behind the governor) |
 | POST | `/api/qa` | `{video}` → job id |
+| POST | `/api/export_nle` | `{plan_file \| slug, formats: ["premiere", "fcpxml", ...], zip: true, clean_render}` → job id; runs `cutroom export-nle` on the plan (default: the latest saved version); event `export_done {nle: true, dir, zip, files, warnings, howto}`. The Render menu's **Open in Premiere…** / **Open in Resolve / Final Cut…** items call it and show the folder, zip and steps |
+| GET | `/api/multicam` | `{groups: [{id, name, day, members: [{clip_id, angle, offset, drift_ppm, confidence, kind, video, device_name, rel}], angles, audio_sources}], devices}` (cutroom sync). `/api/clips` rows carry `mc: {group, angle, name}`, `/api/days` rows `multicam: [{group, name, angles, members, duration}]` |
 | POST | `/api/export` | `{video: "renders/x.mp4"` or `plan_file, preset: "reels" \| [..] \| "all", cutdown: [15, 30, 60], thumbs, captions}` → job id; runs `cutroom export`; outputs in `renders/exports/<stem>/`; event `export_done {dir, files, warnings}`. The Render menu's Export items call it for the selected (or latest) render |
 | GET | `/api/jobs` | list jobs (render/qa/overnight/chat) with progress, log tail |
 | GET | `/api/events` | **SSE**: `plan_changed`, `job`, `governor`, `render_done`, `notes`, `ref`, `library_changed` |
@@ -160,7 +162,9 @@ All JSON unless noted. Media routes support byte ranges (206).
 seconds) · `{op: "split", t}` (timeline seconds) · `{op: "delete", seg, ripple: true}` · `{op: "insert",
 at_t, segment}` · `{op: "overwrite", at_t, segment}` · `{op: "freeze", t, dur: 1.0}` · `{op: "set", seg,
 fields}` · `{op: "set_style", fields}` · `{op: "add_section", at, name, music}` · `{op: "set_music",
-sec, music}` · `{op: "add_cutaway", seg, cutaway}` · `{op: "add_overlay", seg, overlay}`. Times inside
+sec, music}` · `{op: "add_cutaway", seg, cutaway}` · `{op: "add_overlay", seg, overlay}` ·
+`{op: "multicam_angle", seg, angle, audio?}` (a multicam segment onto another angle / sound source; clip, in and
+out follow the synced group: the Inspector's Angle buttons and Sound picker). Times inside
 talk segments are mapped back from timeline to source through the resolved pieces (tightened gaps
 included).
 

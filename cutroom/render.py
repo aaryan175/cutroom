@@ -672,6 +672,9 @@ def _resolve_line(ctx, plan, ln):
     segs = sec.get("segments", [])
     cands = [segs[gi]] if gi is not None and gi < len(segs) else [s for s in segs if s.get("type") == "talk"]
     for seg in cands:
+        if seg.get("multicam"):
+            from . import sync as MC
+            seg = MC.concrete(ctx.con, seg)
         src = seg if seg.get("type") == "talk" else (seg.get("voiceover") or {})
         if not src.get("clip"):
             continue
@@ -1311,6 +1314,14 @@ def _words(ctx, cid):
         return []
 
 
+def _has_words(ctx, cid):
+    from . import asr
+    try:
+        return bool(asr.words(ctx.cfg, cid))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _tighten(ctx, cid, a, b, gap):
     from . import asr
     w = _words(ctx, cid)
@@ -1415,6 +1426,9 @@ def expand(ctx, sections):
                    "generated": sec.get("_generated")}
         seglist = sec.get("segments", [])
         for gi, seg in enumerate(seglist):
+            if seg.get("multicam") and seg.get("type") in ("talk", "broll"):
+                from . import sync as MC                   # the angle's clip for picture, the best sound for audio
+                seg = MC.concrete(ctx.con, seg)
             t = seg["type"]
             rec = {"sec": si, "seg": gi, "type": t, "spec": seg, "atoms": [], "src_map": [],
                    "transition": _seg_transition(sec, gi, seg), "teaser": bool(seg.get("teaser") or teaser_sec),
@@ -1424,8 +1438,19 @@ def expand(ctx, sections):
             F0 = tl.F
             if t == "talk":
                 row = ctx.clip(seg["clip"])
-                pieces = _tighten(ctx, row["id"], float(seg["in"]), float(seg["out"]), float(seg.get("gap", 0.35))) \
-                    if seg.get("tighten", True) else [(float(seg["in"]), float(seg["out"]))]
+                # multicam: sound from another member (external recorder / lav), audio time = k * picture time + b
+                mca = seg.get("_mc_audio")
+                arow = ctx.clip(mca["clip"]) if mca else row
+                mk, mb = (float(mca["k"]), float(mca["b"])) if mca else (1.0, 0.0)
+                wid = arow["id"] if (mca and _has_words(ctx, arow["id"])) else row["id"]
+                if not seg.get("tighten", True):
+                    pieces = [(float(seg["in"]), float(seg["out"]))]
+                elif wid != row["id"]:                      # tighten on the words heard on the recorder
+                    pieces = [((a - mb) / mk, (b - mb) / mk) for a, b in
+                              _tighten(ctx, wid, mk * float(seg["in"]) + mb, mk * float(seg["out"]) + mb,
+                                       float(seg.get("gap", 0.35)))]
+                else:
+                    pieces = _tighten(ctx, row["id"], float(seg["in"]), float(seg["out"]), float(seg.get("gap", 0.35)))
                 unit = ("talk", si, gi)
                 cmode, _ = _conform(ctx, row, ctx.source(row), seg, sync=True)
                 # J / L cuts: the voice starts under the previous shot / runs on under the next one
@@ -1445,7 +1470,7 @@ def expand(ctx, sections):
                 # the picture never moves: the voice's audio window reaches `lead` s before the piece into
                 # the source (it plays under the previous shot) and `tail` s past its end (under the next)
                 prev_n = tl.atoms[-1]["n"] / fps if tl.atoms else 0.0
-                lead = round(max(0.0, min(float(lead), pieces[0][0], max(0.0, prev_n - 2.0 / fps))) * fps) / fps
+                lead = round(max(0.0, min(float(lead), mk * pieces[0][0] + mb, max(0.0, prev_n - 2.0 / fps))) * fps) / fps
                 tail = round(max(0.0, min(float(tail), 2.0)) * fps) / fps
                 rec["lead_in"], rec["tail"] = lead, tail
                 for k, (a, b) in enumerate(pieces):
@@ -1453,13 +1478,14 @@ def expand(ctx, sections):
                     post = tail if k == len(pieces) - 1 else 0.0
                     at = _base_atom(ctx, si, sec, gi, seg, "clip", row)
                     at.update(a=a, unit=unit, conform=cmode,
-                              audio={"mode": "voice", "clip": row, "a": a, "pre": pre, "post": post,
+                              audio={"mode": "voice", "clip": arow, "a": mk * a + mb, "pre": pre, "post": post,
                                      "fi": 0.05 if pre else 0.012, "fo": 0.08 if post else 0.015})
                     tl.add(at, dur=b - a)
                     rec["src_map"].append((a, a + at["n"] / fps, at["f0"] / fps))
                     rec["atoms"].append(at["i"])
                     if cs.get("enabled", True) and seg.get("captions", True):
-                        at["cue_src"] = (row["id"], a - pre, b + post)
+                        at["cue_src"] = ((arow["id"], mk * a + mb - pre, mk * b + mb + post) if wid != row["id"]
+                                         else (row["id"], a - pre, b + post))
                         at["cue_shift"] = pre
             elif t == "broll":
                 row = ctx.clip(seg["clip"])
@@ -1483,8 +1509,11 @@ def expand(ctx, sections):
                 else:
                     sp *= cf
                     mode = seg.get("audio", "natural")
-                    at["audio"] = {"mode": mode if mode in ("natural", "mix") else "none", "clip": row,
-                                   "a": float(seg["in"]), "speed": sp}
+                    mca = seg.get("_mc_audio")                  # multicam: the group's best sound
+                    at["audio"] = {"mode": mode if mode in ("natural", "mix") else "none",
+                                   "clip": ctx.clip(mca["clip"]) if mca else row,
+                                   "a": (float(mca["k"]) * float(seg["in"]) + float(mca["b"])) if mca else float(seg["in"]),
+                                   "speed": sp}
                 at.update(a=float(seg["in"]), speed=sp, unit=("seg", si, gi), conform=cmode)
                 if seg.get("ramp"):
                     at["ramp"] = {"to": float(seg["ramp"]["to"]), "over": float(seg["ramp"].get("over", 0.4))}

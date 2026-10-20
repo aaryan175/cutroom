@@ -32,6 +32,31 @@ function chk(value, onCommit) {
   return h('div', { style: { display: 'flex', alignItems: 'center', height: '22px' } }, el);
 }
 
+// multicam groups (cutroom sync), loaded once for the angle picker
+let MCG = null, mcLoading = false;
+function multicamGroups() {
+  if (MCG || mcLoading) return MCG;
+  mcLoading = true;
+  api.multicam().then((r) => { MCG = (r && r.groups) || []; }).catch(() => { MCG = []; })
+    .finally(() => { mcLoading = false; if (current === 'inspector') renderInspector(); });
+  return null;
+}
+function multicamField(seg, key) {
+  const mc = seg.multicam || {};
+  const gs = multicamGroups();
+  if (!gs) return field('Angle', h('span', { style: { color: 'var(--text-3)' } }, 'loading…'));
+  const g = gs.find((x) => String(x.id) === String(mc.group));
+  if (!g) return field('Angle', h('span', { style: { color: 'var(--warn, #e7a93d)' } }, `group ${mc.group} not found (run cutroom sync)`));
+  const vids = g.members.filter((m) => m.video);
+  const angles = h('div.mc-angles', vids.map((m) => h('button' + (m.angle === mc.angle ? '.on' : ''), {
+    title: `${m.device_name || m.angle} · ${m.rel}\noffset ${(+m.offset).toFixed(3)} s · drift ${m.drift_ppm} ppm`,
+    on: { click: () => { if (m.angle !== mc.angle) op({ op: 'multicam_angle', seg: key, angle: m.angle }); } } }, m.device_name ? `${m.angle} · ${m.device_name}` : m.angle)));
+  const sounds = ['auto', 'camera', ...g.audio_sources.filter((a) => a)];
+  const snd = sel(mc.audio || 'auto', [...new Set(sounds)], (v) => op({ op: 'multicam_angle', seg: key, angle: mc.angle, audio: v }));
+  return h('div', field('Angle', angles), field('Sound', snd),
+    h('div', { style: { color: 'var(--text-3)', fontSize: '11px', margin: '-2px 0 4px 0' } }, `${g.name} · sound "auto" = recorder > lav > camera`));
+}
+
 function renderInspector() {
   const p0 = pane();
   const sel0 = selectedPieces();
@@ -65,6 +90,7 @@ function renderInspector() {
     col1.appendChild(field('Tighten', h('div.pair', chk(seg.tighten !== false, (v) => set({ tighten: v })), h('span', { style: { color: 'var(--text-3)', fontSize: '11px' } }, 'gap'), inp(seg.gap ?? 0.35, (v) => set({ gap: v }), { type: 'number', step: 0.05 }))));
     col1.appendChild(field('Captions', chk(seg.captions !== false, (v) => set({ captions: v }))));
   }
+  if ((t === 'talk' || t === 'broll') && seg.multicam) col1.appendChild(multicamField(seg, key));
   if (t === 'broll') col1.appendChild(field('Audio', sel(seg.audio || 'music', ['music', 'natural', 'mix'], (v) => set({ audio: v }))));
   if (t === 'title') {
     col1.appendChild(field('Text', inp(seg.text, (v) => set({ text: v }), { mono: false })));
@@ -423,6 +449,7 @@ export function initDock(el) {
     const bq = document.getElementById('badge-qa'); bq.textContent = qa && qa.fail ? qa.fail : ''; bq.className = 'badge' + (qa && qa.fail ? ' bad' : '');
   };
   let insTimer = null;
+  on('libraryChanged', () => { MCG = null; });
   on('selection', () => { if (current === 'inspector') { clearTimeout(insTimer); insTimer = setTimeout(renderInspector, 30); } });
   on('plan', () => { if (current === 'inspector') { const a = document.activeElement; if (!(a && body.contains(a) && /INPUT|TEXTAREA|SELECT/.test(a.tagName))) renderInspector(); } });
   on('plan', () => { if (current === 'story') renderStory(); });

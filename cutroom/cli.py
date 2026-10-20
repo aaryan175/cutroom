@@ -143,10 +143,170 @@ def cmd_doctor(a):
     except SystemExit:
         cfg = Config()
     bad = 0
-    for name, ok, detail in doctor(cfg) + _agent_checks(cfg) + _factory_checks(cfg):
+    for name, ok, detail in doctor(cfg) + _agent_checks(cfg) + _factory_checks(cfg) + _camera_checks(cfg):
         print(f"  {'ok ' if ok else 'MISSING'}  {name:34s} {detail}")
         bad += (not ok) and "optional" not in detail
     sys.exit(1 if bad else 0)
+
+
+def _camera_checks(cfg):
+    """doctor: camera RAW decoding and the colour pipeline's LUTs (all optional: what is missing only limits matching)."""
+    from . import cameras as CAM
+    out = []
+    st = CAM.braw_sdk_status()
+    if st["decoder"]:
+        out.append(("Blackmagic RAW decoder", True, st["helper"]))
+    else:
+        why = ("framework present (" + st["framework"][0] + ") but no SDK headers to build a decoder"
+               if st["framework"] else "no Blackmagic RAW SDK")
+        alt = [x for x, ok in (("DaVinci Resolve proxies (tools/resolve_braw_proxies.py)", st["resolve"]),
+                               ("Blackmagic Proxy Generator", st["proxy_generator"])) if ok]
+        out.append(("Blackmagic RAW (.braw) decode", False, f"optional: {why}; .braw needs a ProRes stand-in"
+                    + (f" via {' or '.join(alt)}" if alt else " (record ProRes / proxies in camera)")))
+    out.append(("ARRIRAW (.ari/.arx/.mxf) decode", False, "optional: unsupported; record ProRes (the AMIRA default)"))
+    if cfg.work:
+        try:
+            show = CAM.show_transform(cfg, {})
+            out.append(("show LUT (ARRI LogC3 -> Rec.709)", show["kind"] == "lut",
+                        (show["path"] + f" [{show['src']}]") if show["path"] else f"optional: {show['src']}"))
+        except Exception as e:  # noqa: BLE001
+            out.append(("show LUT (ARRI LogC3 -> Rec.709)", False, f"optional: {e}"))
+        v = CAM.vendor_lut("bmd_film_gen5") or CAM._user_lut(cfg, ["bmd.cube", "bmd_film_gen5.cube"])
+        out.append(("Blackmagic Film Gen 5 LUT", bool(v), v or "optional: put Blackmagic's Gen 5 Film to Video LUT at "
+                                                              "luts/bmd.cube (no public formula)"))
+        try:
+            from . import db as DB
+            con = DB.connect(cfg.db_path)
+            raw = CAM.raw_report(cfg, con)
+            nb = len(raw["braw"])
+            miss = sum(1 for x in raw["braw"] if not x["standin"])
+            if nb:
+                out.append((f"{nb} .braw clip(s) in the library", miss == 0,
+                            "all have a stand-in" if not miss else f"optional: {miss} without a stand-in (cutroom braw)"))
+            if raw["arriraw"]:
+                out.append((f"{len(raw['arriraw'])} ARRIRAW clip(s)", False, "optional: need ProRes stand-ins"))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def cmd_cameras(a):
+    from . import cameras as CAM
+    cfg, con = _cfg_con()
+    act = a.action or "list"
+    if act == "identify" or (act == "list" and not CAM.all_clips(con)):
+        r = CAM.identify_all(cfg, con, force=a.force, echo=print)
+        if act == "identify":
+            print(f"cameras: {r['identified']} clip(s) identified")
+            return
+    if act == "list":
+        cams = CAM.cameras(con)
+        if a.json:
+            print(json.dumps(cams, indent=1, default=str))
+            return
+        if not cams:
+            print("no cameras identified yet (cutroom index, then cutroom cameras identify)")
+        for c in cams:
+            print(f"{c['key']:28s} {c['label']:34s} {c['clips']:5d} clip(s) {c['seconds'] / 60:7.1f} min · "
+                  f"days {', '.join(c['days'][:4])}{' ...' if len(c['days']) > 4 else ''} · conf {c['confidence']:.2f}")
+            print(f"{'':28s} profiles: " + ", ".join(f"{k}: {v}" for k, v in c["profiles"].items())
+                  + (f" · serials {', '.join(c['serials'][:3])}" if c["serials"] else "")
+                  + (f" · {c['slowmo']} slow-mo candidate(s) (50p)" if c["slowmo"] else "")
+                  + (f" · {c['raw']} RAW ({c['raw_missing']} without stand-in)" if c["raw"] else ""))
+            st = CAM.ct_settings({})
+            it = CAM.input_transform(cfg, {"cam_key": c["key"], "family": c["family"],
+                                           "log_profile": max(c["profiles"], key=c["profiles"].get).split(" (")[0]}, st)
+            print(f"{'':28s} transform: {it['kind']}" + (f" ({it.get('path')})" if it.get("path") else "")
+                  + (f" · {it['why']}" if it.get("why") else ""))
+            for row in con.execute("SELECT day, data FROM camera_match WHERE cam_key=?", (c["key"],)):
+                d = json.loads(row["data"])
+                print(f"{'':28s} match {row['day']}: ΔE00 {d.get('de_before')} -> {d.get('de_after')} · gains {d.get('gains')}"
+                      f" sat {d.get('sat')}{' (left off)' if d.get('disabled') else ''}")
+        return
+    if act == "clips":
+        rows = con.execute("""SELECT k.*, c.rel, c.shot_at, c.fps FROM clip_camera k JOIN clips c ON c.id=k.clip_id
+                              ORDER BY c.shot_at, c.rel""").fetchall()
+        from . import sync as SY
+        out = []
+        for r in rows:
+            if a.camera and a.camera not in (r["cam_key"], r["family"]):
+                continue
+            cs = None
+            try:
+                cs = SY.corrected_start(con, r["clip_id"])
+            except Exception:  # noqa: BLE001
+                cs = None
+            out.append({**dict(r), "corrected_start": cs})
+        out.sort(key=lambda r: (r["corrected_start"] or 0, r["rel"]))
+        if a.json:
+            print(json.dumps(out, indent=1, default=str))
+            return
+        import datetime as _dt
+        for r in out:
+            ts = _dt.datetime.fromtimestamp(r["corrected_start"]).strftime("%Y-%m-%d %H:%M:%S") if r["corrected_start"] else "-"
+            print(f"{ts}  {r['cam_key']:24s} {r['log_profile'] or '?':14s} {r['profile_src'] or '-':9s} "
+                  f"conf {r['confidence'] or 0:.2f}{' 50p' if (r['fps'] or 0) >= 47 else ''}  {r['rel']}")
+        return
+    if act == "show":
+        from . import db
+        r = CAM.get(con, db.get_clip(con, a.args[0])["id"])
+        print(json.dumps(r, indent=1, default=str))
+        return
+    if act == "set":
+        if not a.args:
+            sys.exit("usage: cutroom cameras set CLIP --profile P [--family F] [--model M] [--all]")
+        ids = CAM.set_override(con, a.args[0], family=a.family, model=a.model, profile=a.profile,
+                               scope="camera" if a.all else "clip")
+        print(f"corrected {len(ids)} clip(s)")
+        return
+    if act == "match":
+        res = CAM.match_all(cfg, con, matrix=a.matrix, echo=print)
+        bad = [r for r in res if not r.get("ok")]
+        for r in bad:
+            print(f"  {r['cam_key']} {r.get('day') or ''}: not matched: {r.get('why')}")
+        if a.json:
+            print(json.dumps(res, indent=1, default=str))
+        return
+    if act == "luts":
+        out = Path(a.out or cfg.p("renders", "camera_luts"))
+        res = CAM.export_luts(cfg, con, out)
+        for x in res:
+            print(f"{Path(x['file']).name:40s} {len(x['clips'])} clip(s) · {x['profile']} ({x['profile_src']}) · {x['input']}"
+                  + (" · matched" if x["match"] else "") + (f" · + {Path(x['logc3_file']).name}" if x.get("logc3_file") else ""))
+        print(f"-> {out}")
+        return
+    sys.exit(f"unknown cameras action {act!r}")
+
+
+def cmd_braw(a):
+    from . import cameras as CAM
+    cfg, con = _cfg_con()
+    rep = CAM.raw_report(cfg, con)
+    if a.json:
+        print(json.dumps(rep, indent=1, default=str))
+        return
+    sdk = rep["sdk"]
+    print("Blackmagic RAW decode on this machine:")
+    print(f"  framework: {', '.join(sdk['framework']) or 'none'}")
+    print(f"  SDK headers: {', '.join(sdk['headers']) or 'not installed (Blackmagic RAW SDK)'}")
+    print(f"  decoder helper: {sdk['helper'] or 'not built'} · DaVinci Resolve: {'yes' if sdk['resolve'] else 'no'}"
+          f" · Proxy Generator: {'yes' if sdk['proxy_generator'] else 'no'}")
+    for kind, label in (("braw", "Blackmagic RAW"), ("arriraw", "ARRIRAW")):
+        rows = rep[kind]
+        if not rows:
+            continue
+        miss = [r for r in rows if not r["standin"]]
+        print(f"{label}: {len(rows)} clip(s), {len(miss)} without a stand-in")
+        for r in rows[: a.limit]:
+            print(f"  {'ok ' if r['standin'] else 'MISSING'} {r['rel']}" + (f" <- {r['standin']}" if r["standin"] else ""))
+    if any(not r["standin"] for r in rep["braw"]):
+        tool = Path(__file__).resolve().parents[1] / "tools" / "resolve_braw_proxies.py"
+        print("\nMake stand-ins (ProRes, same clip name) in <work>/raw_proxies/, then run cutroom index again:")
+        print(f"  DaVinci Resolve Studio (scripting): python3 {tool} --work {cfg.work}")
+        print("  DaVinci Resolve (free): Media pool > select the clips > Generate Proxy Media; or a Deliver page render "
+              "('Individual clips', ProRes 422 Proxy, file name = source name) into that folder")
+        print("  or Blackmagic Proxy Generator (writes a Proxy folder beside the clips; cutroom finds it)")
+        print("  or record ProRes / camera proxies on the Pocket 6K Pro")
 
 
 def cmd_index(a):
@@ -165,6 +325,8 @@ def cmd_index(a):
         print(f"index-files {len(ids)} clips · {steps} steps", flush=True)
     else:
         ingest.scan(cfg, con)
+        from . import cameras as CAM
+        CAM.raw_report(cfg, con)                         # RAW clips whose ProRes stand-in appeared get indexed now
     print("index-step probe", flush=True)
     ingest.probe_all(cfg, con, ids=ids)
     if not a.skip_proxies:
@@ -455,6 +617,24 @@ def cmd_sync(a):
         return
     if act == "rename":
         sync.rename_group(con, args[0], " ".join(args[1:]))
+        return
+    if act == "clocks":
+        rows = sync.estimate_clocks(cfg, con) if a.force else [dict(r) for r in con.execute("SELECT * FROM device_clock")]
+        names = {d["id"]: d for d in sync.devices(con)}
+        if a.json:
+            print(json.dumps(rows, indent=1, default=str))
+            return
+        if not rows:
+            print("no clock offsets measured yet (they come from matched sync pairs: cutroom sync)")
+        for r in sorted(rows, key=lambda r: (r["day"], r["device_id"])):
+            d, ref = names.get(r["device_id"], {}), names.get(r["ref_device"], {})
+            print(f"{r['day']}  {d.get('code', r['device_id'])!s:6s} {d.get('name') or '':30s} clock {r['offset_s']:+9.2f}s "
+                  f"vs {ref.get('code', r['ref_device'])} · {r['n']} pair(s) · spread {r['spread_s']:.2f}s")
+        return
+    if act == "recordings":
+        for ch in sync.logical_recordings(con):
+            rels = [con.execute("SELECT rel FROM clips WHERE id=?", (c,)).fetchone()[0] for c in ch]
+            print(f"{len(ch)} files: " + " + ".join(rels))
         return
     if act == "map":
         t = sync.map_time(con, args[0], float(args[1]), frm=a.frm, to=a.to)
@@ -1009,13 +1189,26 @@ def main(argv=None):
     p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_export_nle)
     p = sp.add_parser("sync", help="multicam + dual-system audio sync (docs/NLE_AND_MULTICAM.md)")
     p.add_argument("action", nargs="?", default="detect",
-                   choices=["detect", "list", "show", "devices", "name", "rename", "map", "switch"])
+                   choices=["detect", "list", "show", "devices", "name", "rename", "map", "switch", "clocks",
+                            "recordings"])
     p.add_argument("args", nargs="*"); p.add_argument("--clips", nargs="+", help="detect: align just these clips")
     p.add_argument("--force", action="store_true", help="detect: re-measure cached pairs")
     p.add_argument("--kind", choices=["camera", "recorder", "lav"]); p.add_argument("--code")
     p.add_argument("--tc-sync", choices=["on", "off"], help="name: jam-synced timecode decides when audio can't")
     p.add_argument("--from", dest="frm"); p.add_argument("--to"); p.add_argument("--audio")
     p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_sync)
+    p = sp.add_parser("cameras", help="camera identity, log profiles, matching to the hero camera (docs/NLE_AND_MULTICAM.md)")
+    p.add_argument("action", nargs="?", default="list", choices=["list", "identify", "clips", "show", "set", "match", "luts"])
+    p.add_argument("args", nargs="*"); p.add_argument("--camera", help="clips: only this camera key or family")
+    p.add_argument("--profile", help="set: " + ", ".join(__import__("cutroom.colorsci", fromlist=["x"]).ALL_PROFILES))
+    p.add_argument("--family", choices=["arri", "bmd", "fuji", "sony", "other"]); p.add_argument("--model")
+    p.add_argument("--all", action="store_true", help="set: every clip of this clip's camera")
+    p.add_argument("--matrix", action="store_true", help="match: also fit a full 3x3 (Monge-Kantorovich)")
+    p.add_argument("--force", action="store_true", help="identify: redo every clip")
+    p.add_argument("--out", help="luts: output folder"); p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_cameras)
+    p = sp.add_parser("braw", help="Blackmagic RAW / ARRIRAW clips and their decodable stand-ins")
+    p.add_argument("--limit", type=int, default=50); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_braw)
     p = sp.add_parser("board"); p.add_argument("--port", type=int, default=8600)
     p.add_argument("--host", default="127.0.0.1"); p.set_defaults(fn=cmd_board)
     p = sp.add_parser("notes"); p.add_argument("--since", type=int); p.set_defaults(fn=cmd_notes)

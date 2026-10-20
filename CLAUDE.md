@@ -40,6 +40,9 @@ only reads it.
   - The sound stays on the recorder across angle changes.
 - **Switching angles.** Use `cutroom sync switch PLAN SEC.SEG ANGLE` (or the Studio Inspector) so `clip`, `in` and
   `out` follow the group.
+- **Mixed cameras.** Each clip's camera and log profile come from its metadata (`cutroom cameras`); every camera gets
+  one combined LUT that matches it to the hero camera (the ARRI). Check `assumed` profiles on a frame before trusting
+  them, and never stack extra LUTs to fix a camera: `cutroom cameras match`, then QA `camera_match`.
 - **Hand-off.** `cutroom export-nle PLAN --format premiere --format fcpxml --zip`, then `cutroom export-nle --verify DIR`.
   It must say OK before you give the creator the folder path and the README steps. The Premiere import has not been
   tested on real Premiere; say so.

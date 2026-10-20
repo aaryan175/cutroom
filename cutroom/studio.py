@@ -2830,15 +2830,23 @@ class Handler(BaseHTTPRequestHandler):
                              day=q.get("day") or None, highlights=bool(flag("highlights")),
                              dedupe=bool(flag("dedupe")),
                              session=int(num("session")) if num("session") is not None else None,
-                             near=q.get("near") or None)
-        mc = {}
+                             near=q.get("near") or None, body=q.get("cam") or None)
+        mc, cams = {}, {}
         try:
             from . import sync as MC
             with self.studio.pool.get() as con:
                 mc = MC.clip_groups(con)
         except Exception:  # noqa: BLE001 - library without sync tables yet
             mc = {}
+        try:
+            from . import cameras as CAM
+            with self.studio.pool.get() as con:
+                cams = CAM.badges(con)
+        except Exception:  # noqa: BLE001
+            cams = {}
         for r in res["rows"]:
+            if r["id"] in cams:
+                r["cam"] = cams[r["id"]]                # camera badge (cameras.py): label, profile, assumed
             r["thumb"] = f"/media/thumb/{r['id']}"
             r["proxy_url"] = f"/media/proxy/{r['id']}" if r["has_proxy"] else None
             r["sheet_url"] = f"/media/sheet/{r['id']}" if r["has_sheet"] else None
@@ -3461,6 +3469,60 @@ class Handler(BaseHTTPRequestHandler):
             if by.get(d["day"]):
                 d["multicam"] = by[d["day"]]
         self._json(days)
+
+    def api_cameras(self):
+        """Cameras found in the library (cameras.py) + the profiles a clip can be corrected to."""
+        from . import cameras as CAM
+        from . import colorsci as CS
+        with self.studio.pool.get() as con:
+            cams = CAM.cameras(con)
+        self._json({"cameras": cams, "profiles": CS.ALL_PROFILES, "families": CAM.FAMILIES})
+
+    def api_clip_camera(self, cid):
+        """Correct a clip's camera / log profile: {profile?, family?, model?, scope: clip|camera}."""
+        from . import cameras as CAM
+        body = self._body() or {}
+        scope = body.get("scope", "clip")
+        if scope not in ("clip", "camera"):
+            raise ApiError(400, "scope must be clip or camera")
+        row = self.studio.clip_row(cid)
+        with self.studio.pool.get() as con:
+            try:
+                ids = CAM.set_override(con, row["id"], family=body.get("family") or None, model=body.get("model"),
+                                       profile=body.get("profile") or None, scope=scope)
+            except (ValueError, KeyError) as e:
+                raise ApiError(400, str(e)) from None
+            badge = CAM.badges(con).get(row["id"])
+        self._json({"ok": True, "clips": ids, "cam": badge})
+
+    def api_camera_match(self):
+        """Before / after of the camera match on the frame under the playhead (?plan=&t= or ?clip=&t=)."""
+        from PIL import Image
+        from . import cameras as CAM
+        st = self.studio
+        clip, t, style, where = self._look_frame()
+        with st.pool.get() as con:
+            row = dict(db.get_clip(con, clip))
+            cam = CAM.get(con, row["id"])
+            pv = CAM.preview_pair(st.cfg, con, row["id"], t, style=style or {}, width=480) if cam else {}
+        if not cam or not pv:
+            self._json({"clip": row["id"], "camera": cam and CAM.short_label(cam), "available": False})
+            return
+        d = st.work / "frames" / "looks"
+        d.mkdir(parents=True, exist_ok=True)
+        key = hashlib.sha1(json.dumps([row["id"], round(t, 3), pv.get("match")], sort_keys=True, default=str).encode()).hexdigest()[:12]
+        urls = {}
+        for k in ("before", "after"):
+            fp = d / f"cam_{row['id']}_{key}_{k}.jpg"
+            if not fp.exists():
+                Image.fromarray(pv[k]).save(fp, quality=88)
+            urls[k] = f"/media/look/{quote(fp.name)}"
+        m = pv.get("match") or {}
+        self._json({"clip": row["id"], "available": True, "camera": CAM.short_label(cam), "cam_key": cam["cam_key"],
+                    "profile": cam["log_profile"], "profile_src": cam["profile_src"], "confidence": cam["confidence"],
+                    "before_url": urls["before"], "after_url": urls["after"], "where": where,
+                    "match": {k: m.get(k) for k in ("gains", "sat", "exposure_stops", "de_before", "de_after", "n_pairs",
+                                                    "day", "disabled", "why", "method")} if m else None})
 
     def api_multicam(self):
         """Synced multicam groups (cutroom sync): members, angles, offsets, drift; and the devices."""
@@ -4221,6 +4283,9 @@ ROUTES = [
     _r("POST", r"/api/export", Handler.api_export),
     _r("POST", r"/api/export_nle", Handler.api_export_nle),
     _r("GET", r"/api/multicam", Handler.api_multicam),
+    _r("GET", r"/api/cameras", Handler.api_cameras),
+    _r("GET", r"/api/cameras/match", Handler.api_camera_match),
+    _r("POST", rf"/api/clip/{ID}/camera", Handler.api_clip_camera),
     _r("GET", r"/api/jobs", Handler.api_jobs),
     _r("GET", rf"/api/jobs/{ID}", Handler.api_job),
     _r("POST", rf"/api/jobs/{ID}/stop", Handler.api_job_stop),

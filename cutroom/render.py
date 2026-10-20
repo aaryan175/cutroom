@@ -59,9 +59,10 @@ from . import looks as LK
 from . import media
 from . import overlays as OV
 from . import plan as P
+from . import cameras as CAM
 
 SR = 48000
-_SRC_FILES = ("render.py", "captions.py", "overlays.py", "media.py", "cards.py", "film.py")
+_SRC_FILES = ("render.py", "captions.py", "overlays.py", "media.py", "cards.py", "film.py", "colorsci.py", "cameras.py")
 CODE_VERSION = hashlib.sha1(b"".join(Path(__file__).with_name(f).read_bytes() for f in _SRC_FILES
                                      if Path(__file__).with_name(f).exists())).hexdigest()[:12]
 
@@ -139,6 +140,9 @@ class Ctx:
         self.lut = self._resolve_lut(self.style["grade"].get("lut") or cfg.lut)
         self.film = FM.normalize(self.style.get("film"))
         self.co_boost = 0.0
+        self._cam = {}
+        self._cam_con = None
+        self._decode = {}
 
     def warn(self, msg, once_key=None):
         with self.lock:
@@ -173,10 +177,53 @@ class Ctx:
         return dict(r)
 
     def source(self, row):
-        """Input file for a clip: original master for finals, proxy for previews."""
+        """Input file for a clip: original master for finals (a RAW master's decodable stand-in), proxy for previews."""
         if self.preview and row.get("proxy") and os.path.exists(row["proxy"]):
             return row["proxy"]
-        return row["path"]
+        dec = getattr(self, "_decode", None)
+        if dec is None or not row.get("id"):
+            return row["path"]
+        with self.lock:
+            if row["id"] not in dec:
+                if self._cam_con is None:
+                    self._cam_con = _thread_con(self.cfg)
+                dec[row["id"]] = CAM.decode_path(self._cam_con, row)
+            return dec[row["id"]]
+
+    def camera_grade(self, row, src):
+        """The clip's combined camera transform (cameras.py): {"lut", "log", "tag"}, {"skip": True} for a preview
+        proxy that already carries everything, or None (legacy grade: config/plan LUT for log footage)."""
+        if not row or not row.get("id") or not hasattr(self, "_cam"):
+            return None
+        k = (row["id"], src)
+        with self.lock:
+            if k in self._cam:
+                return self._cam[k]
+            if self._cam_con is None:
+                self._cam_con = _thread_con(self.cfg)
+            try:
+                path, desc = CAM.lut_for_clip(self.cfg, self._cam_con, row, self.style)
+            except FileNotFoundError as e:
+                raise P.PlanError(str(e)) from None
+            except Exception as e:  # noqa: BLE001 - a broken camera LUT must not stop a render
+                path, desc = None, {}
+                self._warned.add("cam")
+                self.warnings.append(f"camera transform for {row.get('rel')}: {e}")
+        res = None
+        if path:
+            graded_proxy = bool(row.get("proxy")) and src == row.get("proxy") and self.pregraded(row, src)
+            if graded_proxy:                                # the proxy has the transform baked in: add only the match
+                M = desc.get("match")
+                res = {"lut": CAM.match_only_lut(self.cfg, M), "log": False, "tag": "camera-match"} if M else {"skip": True}
+            else:
+                res = {"lut": path, "log": bool(desc.get("log")), "tag": f"camera:{desc.get('cam_key')}",
+                       "show": ((desc.get("show") or {}).get("src"))}
+                if (desc.get("show") or {}).get("kind") == "math":
+                    self.warn("show transform: ARRI colorimetric formula (no ARRI LogC3->Rec709 LUT in luts/): "
+                              "not ARRI's look", once_key="showmath")
+        with self.lock:
+            self._cam[k] = res
+        return res
 
     def info(self, path):
         with self.lock:
@@ -231,6 +278,13 @@ class Ctx:
 
 
 # ============================================================================== picture chains
+def _thread_con(cfg):
+    import sqlite3
+    con = sqlite3.connect(str(cfg.db_path), timeout=60, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+
 def _range_of(info):
     return "full" if info.get("range") in ("pc", "jpeg") else "tv"
 
@@ -289,15 +343,30 @@ def grade_chain(ctx, row, src, W, H, stops=0.0, pre_fx=(), probe=False):
     rng = _range_of(info)
     sat = float(ctx.style["grade"].get("saturation", 1.0) or 1.0)
     is_log = bool(row.get("is_log")) if row else False
-    pre = ctx.pregraded(row, src) if row else False
-    log_domain = is_log and not pre
+    cam = ctx.camera_grade(row, src) if hasattr(ctx, "camera_grade") else None
+    pre = (ctx.pregraded(row, src) if row else False) if not cam else bool(cam.get("skip") or cam.get("tag") == "camera-match")
+    log_domain = (bool(cam.get("log")) and not pre) if cam else (is_log and not pre)
     expo = log_exposure if log_domain else display_exposure
     ops = []
     if not probe:
         if abs(float(stops)) > 0.01:
             ops.append(expo(stops))
         ops += [expo(st, f"eq(n,{int(fr)})") for fr, st in (pre_fx or ())]
-    if log_domain and not ctx.lut:
+    if cam and cam.get("lut"):
+        # colour-managed camera: ONE combined LUT (camera input transform -> show transform -> per-camera match)
+        f = [f"scale={W}:{H}:flags=lanczos:in_range={rng}:out_range=full:in_color_matrix=bt709", "format=gbrp16le"] + ops
+        f += ["format=gbrpf32le", f"lut3d=file='{cam['lut']}':interp=tetrahedral"]
+        tag = cam["tag"]
+        if not probe:
+            f += finish_chain(ctx)
+        f += ["format=gbrp16le", HOUSE_TAIL]
+    elif cam and cam.get("skip"):
+        f = [f"scale={W}:{H}:flags=lanczos:in_range={rng}:out_range=full:in_color_matrix=bt709", "format=gbrp16le"] + ops
+        tag = "pregraded"
+        if not probe:
+            f += finish_chain(ctx)
+        f += ["format=gbrp16le", HOUSE_TAIL]
+    elif log_domain and not ctx.lut:
         ctx.warn("log footage without a LUT: using a generic log->709 curve (set config lut or style.grade.lut)",
                  once_key="nolut")
         f = [f"scale={W}:{H}:flags=lanczos:in_range={rng}:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709",
@@ -1354,8 +1423,17 @@ def _conform(ctx, row, src, seg, sync):
     f = q[0] / q[1]
     if abs(f - ctx.fps) < 1e-3:
         return "none", 1.0
+    ratio = f / ctx.fps
+    integer_multiple = ratio >= 1.9 and abs(ratio - round(ratio)) < 0.02          # 50p in 25p, 100p in 25p
     if mode == "auto":
-        mode = ("blend" if sync else "speed") if abs(f - ctx.fps) / ctx.fps < 0.05 else "dup"
+        if integer_multiple and not sync and (seg or {}).get("ramp"):
+            mode = "slowmo"                     # PAL: a 50p b-roll shot with a ramp plays as 2x slow motion into the ramp
+        else:
+            mode = ("blend" if sync else "speed") if abs(f - ctx.fps) / ctx.fps < 0.05 else "dup"
+    if mode == "slowmo":
+        if not integer_multiple or sync:                # sync sound is never slowed; non-2x rates can't be
+            return "dup", 1.0
+        return "slowmo", ctx.fps * q[1] / q[0]
     if mode == "speed":
         return "speed", ctx.fps * q[1] / q[0]
     return mode, 1.0
@@ -2391,8 +2469,29 @@ def build_audio_cmd(ctx, at):
     chain += [f"apad=whole_len={S_tot}", f"atrim=end_sample={S_tot}", "asetpts=N/SR/TB"]
     a0 = au["a"] - pre * asp
     args = ["-ss", f"{max(0.0, a0):.3f}", "-t", f"{tot * asp + 0.5:.3f}", "-i", au["path"], "-vn",
-            "-af", ",".join(chain), "-c:a", "pcm_s16le", "-ar", str(SR), "-ac", "2"]
+            "-af", ",".join(chain), "-c:a", "pcm_f32le" if _float_audio(ctx, au["path"]) else "pcm_s16le",
+            "-ar", str(SR), "-ac", "2"]
     return args, [au["path"]]
+
+
+_FLOAT_AUDIO = {}
+
+
+def _float_audio(ctx, path):
+    """True for 32/64-bit float recordings (Rode Wireless PRO, Sound Devices 32-bit): their pieces stay float until
+    the mix, so peaks above 0 dBFS survive the per-piece gain instead of clipping at the 16-bit stage. Integer
+    sources keep the 16-bit pieces the mix was tuned on (room-tone gating measures their digital silence)."""
+    if path in _FLOAT_AUDIO:
+        return _FLOAT_AUDIO[path]
+    try:
+        info = media.probe(ctx.cfg, path)
+        a = next((x for x in info.get("streams", []) if x.get("codec_type") == "audio"), {})
+        res = str(a.get("codec_name") or "").startswith(("pcm_f32", "pcm_f64")) or str(a.get("sample_fmt") or "") in ("flt", "dbl")
+        res = res and str(a.get("codec_name") or "").startswith("pcm")
+    except Exception:  # noqa: BLE001
+        res = False
+    _FLOAT_AUDIO[path] = res
+    return res
 
 
 def _encoder(ctx):

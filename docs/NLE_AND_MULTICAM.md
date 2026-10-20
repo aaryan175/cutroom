@@ -204,7 +204,173 @@ up to half a frame off picture there (≤ 20 ms at 25p); FCPXML keeps it sample-
   `multicam_angle`, so it is one undo step.
 - **API:** `GET /api/multicam` returns the groups and devices.
 
-## 3. What I need from the creator's camera list
+## 3. Your kit: ARRI AMIRA hero, Pocket 6K Pro, X-T5, Sony S-Log3, Rode Wireless PRO, PAL
+
+The creator shoots events on mixed cameras, matches everything to the ARRI, records sound on Rode Wireless PRO units
+(internal recording), cuts in Premiere and delivers 25 fps (50 fps for slow motion). Cards are dumped together per shoot
+day, so folders say nothing about the camera. This section says what cutroom does for that kit, what is automatic,
+what is assumed, and what the creator has to provide.
+
+```bash
+cutroom index                      # identifies every clip's camera + log profile while probing
+cutroom cameras                    # cameras found, clips per day, profiles (metadata / assumed), transform used
+cutroom cameras clips              # every clip in (clock-corrected) shooting order with its camera and profile
+cutroom cameras set DSCF0042 --profile fuji_flog2 --all     # correct a clip, or (--all) every clip of its camera
+cutroom sync                       # groups, claps, split recorder takes, per-camera clock offsets
+cutroom sync clocks                # how far each camera's clock is off the ARRI, per day
+cutroom sync recordings            # split recorder takes joined into one recording
+cutroom cameras match              # fit each camera's per-day correction toward the ARRI (ΔE before -> after)
+cutroom cameras luts               # the per-camera .cube files for Premiere's Lumetri Input LUT
+cutroom braw                       # Blackmagic RAW / ARRIRAW clips and how each one is decoded
+```
+
+### Camera identity (automatic, per clip, from metadata)
+
+| Camera | How it is recognised | Log profile |
+|---|---|---|
+| ARRI AMIRA | QuickTime make/model or brand words in the file's own header/trailer atoms; ARRI file naming (`A001C003_YYMMDD_R1AB`, weak alone) | LogC3: read from tags when present, otherwise **estimated** from the picture (`assumed`) |
+| Blackmagic Pocket 6K Pro | `manufacturer` / `camera_type` / `camera_id` tags (the names Blackmagic writes, checked on Blackmagic's own sample .braw), `.braw` container, `.sidecar` files, BMD naming (`A001_MMDDhhmm_C001`), 6K frame sizes | `viewing_gamma` "Blackmagic Design Film" = Film Gen 5 (metadata); "Video" = Rec.709 |
+| Fujifilm X-T5 | make `FUJIFILM` / model `X-T5` tags or the same words in the file atoms, `DSCF####` naming, X-T5 frame sizes | F-Log2 is not tagged by the camera: **estimated** from the picture (`assumed`) |
+| Sony (S-Log3) | the `XAVC` brand, the XML sidecar (`C0001M01.XML`: manufacturer, model, serial) | `CaptureGammaEquation` / `CaptureColorPrimaries` from the sidecar (metadata). S-Gamut3 (not .Cine) is LUT-only |
+| anything else | HLG from the `arib-std-b67` transfer tag; other log from file names or the histogram | `log_unknown` keeps the old single-LUT path |
+
+Each clip stores `camera_make`, `camera_model`, `camera_serial`, `log_profile`, how it was found (`metadata`, `filename`,
+`assumed`, `user`) and a confidence. The Studio library shows a camera badge on every clip (amber with `?` = assumed),
+a **Camera** filter chip, and clicking the badge corrects the camera or profile for that clip or every clip of the camera.
+Brand words are only searched in printable text runs, so random bytes in compressed picture data can't name a camera.
+
+**What is assumed here:** the exact metadata an AMIRA and an X-T5 write was not available (no real files from either).
+The recognisers use the generic QuickTime keys, brand strings and naming; the first real card dump is the test.
+
+### Colour: everything matched to the ARRI
+
+One combined LUT per clip, applied where the house LUT was (`render.grade_chain`), so the doctrine holds: one
+transform, plus at most one look.
+
+1. **Camera input transform** to the ARRI's space (LogC3 EI 800 / ARRI Wide Gamut 3):
+   - **maths, from published specs** (cited constant by constant in `cutroom/colorsci.py`, unit-tested against the
+     documents' own reference values): ARRI LogC3 EI 800 + AWG3 (ARRI "ALEXA Log C Curve – Usage in VFX"), Sony S-Log3
+     + S-Gamut3.Cine (Sony "Technical Summary for S-Gamut3.Cine/S-Log3"), Fujifilm F-Log2 + F-Gamut = BT.2020
+     (Fujifilm "F-Log2 Data Sheet"). The curves apply to the signal after the usual legal-range expansion; checked on
+     this machine against Fujifilm's own F-Log2 LUT (black lands at 95/1023) and Resolve's ARRI LogC 1D LUT
+     (identical to 7 decimals).
+   - **LUT only (no formula implemented)**: Blackmagic Film Gen 5. Its constants circulate, but no copy on a
+     Blackmagic domain could be checked here, so cutroom does not use them. It needs Blackmagic's "Gen 5 Film to
+     Video" LUT: `luts/bmd.cube` (or `luts/<camera key>.cube`); when DaVinci Resolve is installed, cutroom finds
+     Blackmagic's own copy in Resolve's LUT folder. Same for LogC4, F-Log (v1) and S-Gamut3 (non-Cine).
+2. **Show transform** (the ARRI look): `luts/arri_logc3.cube` (or `arri.cube`, `show.cube`, or
+   `style.grade.camera_transforms.show_lut`). Without one, cutroom uses the ARRI LogC-to-Rec709 LUT it finds in
+   Resolve's LUT folder, and failing that the colorimetric conversion from ARRI's white paper (flagged: correct
+   colours, not ARRI's look; the render warns).
+3. **Match to the hero**: per camera and per shoot day, frames of that camera and of the ARRI at the same moments
+   (sync groups first, else capture time corrected by the measured clock offsets, within 15 min) give a correction
+   in display-linear light: white balance + exposure gains and a saturation factor (optionally a Monge-Kantorovich
+   3×3, kept only when it is better). A correction that would make it worse is stored but left off. Stored in
+   `camera_match`; the Looks panel shows the frame under the playhead with the camera transform only and with the
+   match, plus ΔE before → after. QA `camera_match` measures CIEDE2000 between every pair of angles in each multicam
+   group the render uses (warn above 5).
+
+**Measured on the synthetic kit** (`camera-samples/synthetic-kit`: one scene "shot" by all four cameras through the
+published curves, Blackmagic through the inverse of Blackmagic's Gen 5 LUT, each non-ARRI camera given a known white
+balance / exposure / saturation error; identical framing, so every pixel is a ground-truth pair). Per-pixel CIEDE2000
+against the ARRI, median / 95th percentile:
+
+| Camera | one LUT on everything | camera transform | + match |
+|---|---|---|---|
+| Sony S-Log3 | 10.28 / 10.60 | 6.14 / 6.44 | 0.85 / 3.11 |
+| Fujifilm F-Log2 | 5.40 / 9.10 | 4.88 / 5.18 | 0.85 / 2.34 |
+| Blackmagic Film Gen 5 | 2.69 / 4.77 | 4.20 / 4.41 | 0.88 / 1.94 |
+
+"Camera transform" still contains the deliberate camera error; the transform alone is exact for the maths cameras
+(unit test: 95th percentile ΔE < 0.5 against the ARRI rendering of the same scene). QA `camera_match` on the rendered
+multicam group: median ΔE 8.05 before, 0.32 after. These are synthetic numbers: real cameras differ in spectral
+response, which a 3×3 can only approximate. The first real shoot day will give the real numbers.
+
+### Premiere hand-off
+
+`cutroom export-nle` writes `luts/` beside the XML: one `.cube` per camera (and shoot day when the match differs by day)
+holding the whole transform (camera → ARRI show LUT → match), `<camera>_to_LogC3.cube` for the maths cameras (curve
+and gamut only), `luts/clips.csv` (each clip file → its LUT), and a sequence marker on every clip naming its LUT.
+README_PREMIERE.txt: select a camera's clips → Lumetri Color → Basic Correction → **Input LUT** → that camera's file.
+Do not also put the ARRI LUT on an adjustment layer for those clips; adjustment layers are for the creative grade.
+Option B in the README keeps the ARRI LUT on an adjustment layer and uses the `_to_LogC3` files instead (no match).
+`cutroom cameras luts` writes the same files without a timeline.
+
+### Blackmagic RAW (.braw) and ARRIRAW
+
+- ffmpeg reads the .braw container (timing, sound, Blackmagic's metadata) but cannot decode the picture. `cutroom index`
+  registers .braw clips with status `raw` and says so; `cutroom doctor` and `cutroom braw` list them.
+- **Decode status on this machine:** the Blackmagic RAW runtime (`BlackmagicRawAPI.framework`) is present inside
+  Blackmagic RAW Player / Speed Test and DaVinci Resolve, but the SDK headers are not. The framework exposes one C
+  entry point (`CreateBlackmagicRawFactoryInstance`) and COM-style interfaces whose layout is only in the SDK headers,
+  so no decoder helper was built: guessing that layout would crash or decode wrongly. With the Blackmagic RAW SDK
+  installed (a free download behind a registration form), a small helper can be built; until then:
+- **Stand-ins (works now):** a ProRes / H.264 rendition with the same file name in `<work>/raw_proxies/` or in a
+  `Proxy/` folder beside the clip is used to decode the picture (index, proxies, previews, renders); the NLE export
+  still links the .braw master (Premiere needs Blackmagic's BRAW plug-in for that). Ways to make them:
+  - `tools/resolve_braw_proxies.py --work <project>` drives DaVinci Resolve's render queue through Resolve's
+    documented scripting API (ProRes, one file per clip, one Resolve project per frame rate). Blackmagic documents
+    external scripting for Resolve Studio; this machine has the free version, so the script is **untested here** and
+    may be refused. The free version can do it by hand: Deliver page, "Individual clips", ProRes 422 Proxy, file
+    name = source name, into `<work>/raw_proxies/`.
+  - Blackmagic Proxy Generator (installed here): it writes a `Proxy` folder beside the clips, which cutroom finds.
+  - Recording ProRes, or proxies, on the Pocket 6K Pro.
+  Decode the stand-in with the clip's as-shot settings (Film for a log workflow) so it matches the Blackmagic transform.
+- **ARRIRAW** (`.ari` / `.arx` frame sequences, ARRIRAW `.mxf`): reported as unsupported (scan lists the folders,
+  never registers one clip per frame). The AMIRA records ProRes, which works directly.
+- Tested: Blackmagic's own sample .braw (shipped with Blackmagic RAW Speed Test) is identified (camera, serial,
+  Film gamma), reported as missing a stand-in, then indexed through a synthetic stand-in. Real BRAW decoding: not done.
+
+### Rode Wireless PRO audio
+
+- The recorder's files are registered as sound (status `audio`), never as picture. `bwf.py` reads the headers:
+  32-bit float (`fmt` tag 3 or extensible float), `bext` (originator, origination date/time, time reference =
+  samples since midnight), `iXML` (timecode rate, timestamp, file-set family for split takes) and RF64 for > 4 GB.
+- 32-bit float stays float: decoding is `f32le`, and the rendered pieces cut from a float recording stay `pcm_f32le`
+  until the final mix, so a recording peaking above 0 dBFS is not clipped before loudness normalisation brings it
+  down. Integer sources keep 16-bit pieces (the room-tone gating was tuned on their digital silence; switching all
+  pieces to float measurably changed it).
+- **Split takes**: files of one device in an iXML file set, or whose time reference continues sample-exactly where the
+  previous file ended, are joined into one logical recording (exact sync pairs, method `chunk`; `cutroom sync
+  recordings`). A multicam segment takes its sound from whichever file of the take covers it.
+- **Sync**: the audio cross-correlation decides, as before. New: **clap / slate anchors**: a sharp, broadband, short
+  transient found in both recordings at the aligned moment confirms the offset (method `audio+clap`, the number of
+  agreeing claps in the pair's note). When the envelopes alone can't decide, matching claps whose local correlation is
+  clearly the best can rescue a pair (method `clap`). **Timecode**: when both clips carry timecode, its agreement is
+  checked (method `+tc`); a device whose timecode agreed on two or more pairs and never disagreed is trusted for silent
+  clips automatically (`tc_sync`).
+- The recorder is the dialogue source (external recorder > lav > camera); camera sound is scratch. A Rode plugged into
+  a camera is camera sound to cutroom: mark that camera `--kind lav` if it should outrank the others.
+- **Assumed:** the exact Rode Wireless PRO file names, whether it writes iXML, and how it splits long takes were not
+  available; the reader follows the BWF/iXML standards and the joiner uses the time reference, so it works for any
+  recorder that writes them.
+
+### Mixed card dumps and clock offsets
+
+Cameras are told apart by their own identity (make, model, serial), not by folders. After sync, `estimate_clocks`
+measures each device's clock against the ARRI's per day (the audio says when a clip really started; the file says what
+the clock claimed), robust per device pair, solved over the pair graph. The corrected times put clips that did not sync
+into the right moment (`cutroom cameras clips` sorts by them; matching uses them), and a third sync pass tries the
+pairs the corrected clocks bring together. A camera that matched nothing yet is tried within 30 min
+(`sync_lonely_window_s`, default 1800 s); the audio still decides. Synthetic test: an X-T5
+whose clock was 7.5 min fast joined the group, measured +454.4 s off (truth +454.4 s).
+
+### PAL
+
+The project default is 25 fps. A 50p clip is a slow-motion candidate (`cutroom cameras` counts them). In a 25p edit
+it plays in real time (every other frame dropped) unless the plan asks for slow motion: a b-roll shot with a `ramp`
+plays as 2× slow motion into the ramp; `"conform": "slowmo"` asks for it without a ramp. Sync talk is never slowed.
+
+### Things to send me
+
+1. One shoot day's sample, straight off the cards: 2–3 clips from each camera (AMIRA, Pocket 6K Pro as .braw and any
+   ProRes, X-T5, each Sony body), plus the Rode files from the same moments, ideally including one clap.
+2. Your LUTs: the ARRI LogC3 → Rec.709 LUT you grade with (→ `luts/arri_logc3.cube`), Blackmagic's Gen 5 Film to
+   Video LUT you use (→ `luts/bmd.cube`), and any Sony / Fujifilm LUTs you use in Premiere.
+3. How you decode BRAW today (Premiere plug-in, Resolve, proxies) and whether you can record ProRes proxies on the 6K Pro.
+4. One finished edit (and its Premiere project if you can) as the reference for look and cutting.
+
+## 4. What I need from the creator's camera list
 
 There is no real multicam footage in the test library. The pipeline is generic, but these answers decide the defaults:
 the device hint, the time-zone slop, whether timecode can be trusted, and which sound is "best".

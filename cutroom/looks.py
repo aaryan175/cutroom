@@ -96,8 +96,10 @@ def lut_files(cfg):
     d = luts_dir(cfg)
     if not d.is_dir():
         return []
-    return sorted((p for p in d.iterdir() if p.is_file() and p.suffix.lower() == ".cube" and not p.name.startswith(".")),
-                  key=lambda p: p.name.lower())
+    from .cameras import reserved_lut_names
+    hide = reserved_lut_names()                 # camera input / show transforms are not creative looks
+    return sorted((p for p in d.iterdir() if p.is_file() and p.suffix.lower() == ".cube" and not p.name.startswith(".")
+                   and p.name.lower() not in hide), key=lambda p: p.name.lower())
 
 
 def normalize_look(v):
@@ -312,9 +314,11 @@ def _base_chain(cfg, con, row, plan_style, W, H):
         pass
     plan = P.normalize({"sections": [], "style": plan_style or {}}, cfg)
     ctx = _Pv(cfg, con, plan, False)
+    ctx._cam, ctx._cam_con = {}, None                 # camera transforms (cameras.py) apply to look previews too
     lut = ctx.style["grade"].get("lut") or cfg.lut
     ctx.lut = R.Ctx._resolve_lut(ctx, lut) if lut else ""
-    f, tag = R.grade_chain(ctx, row, row["path"], W, H)
+    from . import cameras as CAM
+    f, tag = R.grade_chain(ctx, row, CAM.decode_path(con, row), W, H)
     return f, tag
 
 
@@ -337,14 +341,16 @@ def previews(cfg, con, clip, t, looks, plan_style=None, width=480, run=None):
     t = max(0.0, min(float(t), max(0.0, dur - 0.05)))
     W, H = frame_size(row, width)
     base, tag = _base_chain(cfg, con, row, plan_style, W, H)
-    st = os.stat(row["path"])
+    from . import cameras as CAM
+    src = CAM.decode_path(con, row)
+    st = os.stat(src)
     out_dir = Path(cfg.p("frames", "looks"))
     out_dir.mkdir(parents=True, exist_ok=True)
     items = []
     for lk in looks:
         lk = normalize_look(lk) or {"name": "natural", "intensity": 1.0}
         ch = chain(cfg, lk)
-        key = _sha([row["path"], st.st_size, int(st.st_mtime), round(t, 3), base, ch, W])
+        key = _sha([src, st.st_size, int(st.st_mtime), round(t, 3), base, ch, W])
         items.append((lk, ch, out_dir / f"{row['id']}_{int(round(t * 1000)):08d}_{key}.jpg"))
     todo = [(lk, ch, p) for lk, ch, p in items if not (p.exists() and p.stat().st_size > 0)]
     if todo:
@@ -353,7 +359,7 @@ def previews(cfg, con, clip, t, looks, plan_style=None, width=480, run=None):
         fc = [f"[0:v]{','.join(base)}" + (f",split={n}" + "".join(f"[s{i}]" for i in range(n)) if n > 1 else "[s0]")]
         for i, (lk, ch, _) in enumerate(todo):
             fc.append(f"[s{i}]{','.join(ch) if ch else 'null'},format=yuvj420p[o{i}]")
-        args = ["-ss", f"{t:.3f}", "-i", row["path"], "-filter_complex", ";".join(fc)]
+        args = ["-ss", f"{t:.3f}", "-i", src, "-filter_complex", ";".join(fc)]
         for i, tmp in enumerate(tmps):
             args += ["-map", f"[o{i}]", "-frames:v", "1", "-q:v", "3", "-update", "1", "-f", "image2", str(tmp)]
         try:

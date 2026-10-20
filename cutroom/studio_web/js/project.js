@@ -8,7 +8,8 @@ const PAGE = 200;
 let body;
 
 // ================================================================ clips
-const F = Object.assign({ q: '', setting: '', time: '', people: '', max_shake: '', min_quality: '', speech: false, creator: false }, LS.get('clipFilters', {}));
+const F = Object.assign({ q: '', setting: '', time: '', people: '', max_shake: '', min_quality: '', speech: false, creator: false, cam: '' }, LS.get('clipFilters', {}));
+const CAMS = { list: [], profiles: {}, families: {} };   // /api/cameras (cameras.py)
 let viewMode = LS.get('clipView', 'grid');
 const lib = { total: null, pages: new Map(), inflight: new Map(), gen: 0 };
 let scroller, space, countEl, chipsEl, io, cells = new Map();
@@ -16,7 +17,7 @@ let geom = { cols: 1, cw: 150, ch: 110 };
 
 function params(offset) {
   return { q: F.q, setting: F.setting, time: F.time, people: F.people, max_shake: F.max_shake, min_quality: F.min_quality,
-    speech: F.speech ? 1 : '', creator: F.creator ? 1 : '', offset, limit: PAGE };
+    speech: F.speech ? 1 : '', creator: F.creator ? 1 : '', cam: F.cam, offset, limit: PAGE };
 }
 function resetLib() {
   lib.gen++; lib.total = null; lib.pages.clear();
@@ -85,12 +86,12 @@ function render() {
 let emptyEl;
 function showEmpty() {
   if (emptyEl) return;
-  const filtered = F.q || F.setting || F.time || F.people || F.max_shake || F.min_quality || F.speech || F.creator;
+  const filtered = F.q || F.setting || F.time || F.people || F.max_shake || F.min_quality || F.speech || F.creator || F.cam;
   emptyEl = h('div.empty', { style: { position: 'absolute', inset: 0 } },
     h('span', { html: icon('search') }),
     h('h4', filtered ? 'No clips match' : 'Library is empty'),
     h('p', filtered ? 'Loosen a filter or search transcripts with different words.' : 'Index the footage folder (cutroom index) or start the overnight pass.'),
-    filtered ? h('div.acts', h('button.btn', { on: { click: () => { Object.assign(F, { q: '', setting: '', time: '', people: '', max_shake: '', min_quality: '', speech: false, creator: false }); syncChips(); resetLib(); } } }, 'Clear filters')) : null);
+    filtered ? h('div.acts', h('button.btn', { on: { click: () => { Object.assign(F, { q: '', setting: '', time: '', people: '', max_shake: '', min_quality: '', speech: false, creator: false, cam: '' }); syncChips(); resetLib(); } } }, 'Clear filters')) : null);
   scroller.appendChild(emptyEl);
 }
 function hideEmpty() { if (emptyEl) { emptyEl.remove(); emptyEl = null; } }
@@ -116,7 +117,8 @@ function makeCell(row) {
   const flags = h('div.flags',
     row.has_transcript ? h('span', { title: 'Has speech (transcribed)', html: icon('speech', 11) }) : null,
     t.creator_visible ? h('span', { title: 'Creator in frame', html: icon('person', 11) }) : null,
-    row.mc ? h('span.mc', { title: `Multicam: ${row.mc.name || 'group ' + row.mc.group} · angle ${row.mc.angle}` }, `MC ${row.mc.angle}`) : null);
+    row.mc ? h('span.mc', { title: `Multicam: ${row.mc.name || 'group ' + row.mc.group} · angle ${row.mc.angle}` }, `MC ${row.mc.angle}`) : null,
+    camBadge(row));
   const th = h('div.th', img, scrub, flags, h('span.dur', dur(row.duration)));
   const el = h('div.cell', { draggable: true, title: `${row.rel}\n${t.summary || ''}${row.shake !== undefined ? `\nshake ${(+row.shake).toFixed(1)}` : ''}` },
     th, h('div.meta', h('span.name', name(row)), qdots(row.quality ?? t.quality)));
@@ -155,8 +157,50 @@ function wireClip(el, row) {
   });
 }
 
+// ---------------------------------------------------------------- camera badge + correction
+function camBadge(row) {
+  const c = row.cam;
+  if (!c || !c.label) return null;
+  const el = h('span.cam' + (c.assumed ? '.assumed' : '') + (c.raw ? '.raw' : ''), {
+    title: `Camera: ${c.key}\nProfile: ${c.profile || 'unknown'}${c.assumed ? ' (assumed from the picture: click to correct)' : ''}${c.raw ? `\n${c.raw.toUpperCase()}: decoded through a stand-in` : ''}\nClick to correct`,
+  }, c.label + (c.assumed ? '?' : ''));
+  el.addEventListener('click', (e) => { e.stopPropagation(); camPop(el, row); });
+  el.addEventListener('dblclick', (e) => e.stopPropagation());
+  return el;
+}
+function camPop(anchor, row) {
+  closePop();
+  const c = row.cam || {};
+  const prof = h('select.inp', ...Object.entries(CAMS.profiles).map(([k, l]) => h('option', { value: k, selected: k === c.profile }, l)));
+  const fam = h('select.inp', ...Object.entries(CAMS.families).map(([k, l]) => h('option', { value: k, selected: k === c.family }, l)));
+  const scope = h('select.inp', h('option', { value: 'clip' }, 'This clip only'), h('option', { value: 'camera' }, `Every clip from ${c.key}`));
+  const save = h('button.btn.primary', 'Save');
+  save.addEventListener('click', async () => {
+    try {
+      const r = await api.setCamera(row.id, { profile: prof.value, family: fam.value, scope: scope.value });
+      toast(`Camera corrected on ${r.clips.length} clip(s)`);
+      closePop(); resetLib();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+  const pop = h('div.chip-pop.cam-pop', { on: { click: (e) => e.stopPropagation() } },
+    h('label', 'Camera'), fam, h('label', 'Log profile'), prof, h('label', 'Apply to'), scope, h('div.opts', save));
+  openPop = pop; openPop._k = 'cam-edit';
+  anchor.closest('.cell, .row') ? anchor.closest('.cell, .row').appendChild(pop) : document.body.appendChild(pop);
+}
+async function loadCameras() {
+  try {
+    const r = await api.cameras();
+    CAMS.list = r.cameras || []; CAMS.profiles = r.profiles || {}; CAMS.families = r.families || {};
+    const d = CHIP_DEFS.find((x) => x.k === 'cam');
+    d.opts = CAMS.list.map((c) => c.key);
+    d.labels = Object.fromEntries(CAMS.list.map((c) => [c.key, `${c.label} (${c.clips})`]));
+    if (chipsEl) syncChips();
+  } catch (e) { /* library without cameras yet */ }
+}
+
 // ---------------------------------------------------------------- filter chips
 const CHIP_DEFS = [
+  { k: 'cam', label: 'Camera', opts: [], fmt: (v) => v },
   { k: 'setting', label: 'Setting', opts: ['kitchen', 'street', 'beach', 'office', 'car', 'gym', 'restaurant', 'park', 'cafe', 'hotel', 'balcony', 'airport'], free: true },
   { k: 'time', label: 'Time of day', opts: ['day', 'golden', 'night', 'indoor'] },
   { k: 'people', label: 'People', opts: ['creator', 'creator + friend', 'strangers', 'none'] },
@@ -202,7 +246,8 @@ function buildPop(d) {
     return pop;
   }
   const opts = h('div.opts');
-  for (const o of d.opts) opts.appendChild(h('button.chip', { class: String(F[d.k]) === o ? 'chip on' : 'chip', on: { click: () => set(o) } }, d.fmt ? d.fmt(o) : o));
+  for (const o of d.opts) opts.appendChild(h('button.chip', { class: String(F[d.k]) === o ? 'chip on' : 'chip', on: { click: () => set(o) } }, d.labels ? (d.labels[o] || o) : d.fmt ? d.fmt(o) : o));
+  if (!d.opts.length) opts.appendChild(h('span', { style: { color: 'var(--text-3)', fontSize: '11px' } }, d.k === 'cam' ? 'No cameras identified yet (cutroom index)' : ''));
   pop.append(opts);
   if (d.free) {
     const inp = h('input.inp', { placeholder: 'Other setting…', value: d.opts.includes(F[d.k]) ? '' : F[d.k] });
@@ -230,6 +275,7 @@ function buildClips(pane) {
   };
   gridBtn.onclick = () => setView('grid'); listBtn.onclick = () => setView('list'); daysBtn.onclick = () => setView('days');
   chipsEl = h('div.chips');
+  loadCameras();
   countEl = h('div.pj-count', h('span', ''), h('span', 'Double-click to open · drag to timeline'));
   scroller = h('div.vscroll'); space = h('div.vspace'); scroller.appendChild(space);
   daysWrap = h('div.days', { hidden: true });

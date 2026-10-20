@@ -62,7 +62,7 @@ LOCAL_SEARCH_S = 3.0          # +-3 s around the global lag (1 h at 800 ppm)
 MAX_FINE_WINDOWS = 12
 RIVAL_EXCLUDE_S = 0.5
 KIND_RANK = {"recorder": 0, "lav": 1, "camera": 2}
-ALGO_VERSION = 3              # bump -> cached pairs are re-measured
+ALGO_VERSION = 4              # bump -> cached pairs are re-measured (4: clap anchors)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS sync_members (
   PRIMARY KEY (group_id, clip_id)
 );
 CREATE INDEX IF NOT EXISTS sync_members_clip ON sync_members(clip_id);
+CREATE TABLE IF NOT EXISTS device_clock (
+  device_id INTEGER, day TEXT, offset_s REAL, n INTEGER, spread_s REAL, ref_device INTEGER, updated REAL,
+  PRIMARY KEY (device_id, day)   -- the device's clock minus the reference device's clock (seconds)
+);
 """
 
 
@@ -188,15 +192,38 @@ def media_meta(cfg, path, info=None) -> dict:
     if od and ot:
         created, src = f"{od.replace(':', '-')}T{ot.replace('-', ':')}", "bwf"
     tref = tags.get("time_reference")
+    if str(path).lower().endswith((".wav", ".bwf", ".w64")):
+        from . import bwf
+        bm = bwf.read(path)
+        if bm.get("ok"):
+            out["bwf"] = {"format": bm.get("format"), "bits": bm.get("bits"), "time_reference": bm.get("time_reference"),
+                          "time_reference_src": bm.get("time_reference_src"), "frames": bm.get("frames"),
+                          "family_uid": (bm.get("ixml") or {}).get("family_uid")}
+            if bm.get("time_reference") is not None:
+                tref = str(bm["time_reference"])
+                ixr = (bm.get("ixml") or {}).get("timecode_rate")
+                if ixr:
+                    try:                                       # iXML TIMECODE_RATE: "25/1", "30000/1001"
+                        from fractions import Fraction
+                        out["tc_rate"] = float(Fraction(str(ixr).strip()))
+                    except (ValueError, ZeroDivisionError):
+                        pass
+            mk = bwf.maker(bm)
+            if mk and not out.get("make"):
+                out["make"] = mk.split()[0]
+                out["model"] = out.get("model") or mk
+            be = bm.get("bext") or {}
+            if be.get("origination_date") and be.get("origination_time") and not (od and ot):
+                od, ot = be["origination_date"], be["origination_time"]
+                created, src = f"{od.replace(':', '-')}T{ot.replace('-', ':')}", "bwf"
     if tref and out["sample_rate"]:
         try:
             secs = int(tref) / out["sample_rate"]
             out["tc_seconds"] = secs
             if not out["timecode"]:
-                h, r_ = divmod(secs, 3600)
-                m_, s_ = divmod(r_, 60)
-                out["timecode"] = f"{int(h):02d}:{int(m_):02d}:{int(s_):02d}:00"
-                out["tc_rate"] = 25.0
+                from .bwf import tc_string
+                out["tc_rate"] = out["tc_rate"] if out.get("bwf") and out["tc_rate"] else 25.0
+                out["timecode"] = tc_string(int(tref), out["sample_rate"], out["tc_rate"])
         except ValueError:
             pass
     for sc in _sidecars(str(path)):
@@ -334,6 +361,16 @@ def probe_media(cfg, con, ids=None, force=False, echo=print) -> int:
         except Exception as e:  # noqa: BLE001
             _log(echo, f"  ! sync probe {r['rel']}: {e}")
             continue
+        if not m.get("audio_only"):
+            try:
+                from . import cameras as CAM
+                cam = CAM.get(con, r["id"])
+            except Exception:  # noqa: BLE001
+                cam = None
+            if cam and cam.get("family") not in (None, "other") and float(cam.get("confidence") or 0) >= 0.6:
+                m["make"] = m.get("make") or cam.get("make")
+                m["model"] = m.get("model") or cam.get("model")
+                m["serial"] = m.get("serial") or cam.get("serial")
         did = _device_id(cfg, con, m, r["rel"])
         db.upsert(con, "clip_media", {"clip_id": r["id"], "device_id": did, "make": m.get("make"), "model": m.get("model"),
                                       "serial": m.get("serial"), "timecode": m.get("timecode"), "tc_rate": m.get("tc_rate"),
@@ -501,6 +538,61 @@ def _robust_line(ts, ys, w=None):
     return float(a), float(b), rms, int(keep.sum())
 
 
+# ============================================================================================ claps
+CLAP_RISE_DB = 18.0           # a clap/slate: energy jumps this much over the preceding 100 ms ...
+CLAP_DECAY_DB = 10.0          # ... and falls this much again within 150 ms (a hit, not a word or music onset)
+CLAP_HF_SHARE = 0.25          # ... with broadband energy (share above 1 kHz)
+CLAP_AGREE_S = 0.025          # two recordings' claps agree with an alignment within this
+
+
+def detect_claps(x, sr=SR, max_n=40) -> list:
+    """Sharp, broadband, short transients (hand clap, slate, clapper): [(t_onset_s, strength_db)], strongest first.
+    The onset is the first sample whose |x| reaches half the hit's peak (sample-precise at `sr`)."""
+    x = np.asarray(x, np.float32)
+    hop = max(1, int(sr * 0.002))                                  # 2 ms energy frames
+    n = len(x) // hop
+    pre_w, post_w, tail0 = int(0.1 / 0.002), int(0.15 / 0.002), int(0.12 / 0.002)
+    if n < pre_w + post_w + 10:
+        return []
+    fr = x[: n * hop].reshape(n, hop).astype(np.float64)
+    e = (fr ** 2).mean(1) + 1e-12
+    d = np.diff(x, prepend=x[:1])[: n * hop].reshape(n, hop).astype(np.float64)
+    hf = (d ** 2).mean(1) + 1e-12                                  # first difference ~ high-pass (white noise: 2x energy)
+    edb = 10 * np.log10(e)
+    cs = np.concatenate([[0.0], np.cumsum(e)])
+    idx = np.arange(pre_w, n - post_w)
+    pre = 10 * np.log10((cs[idx - 2] - cs[idx - pre_w]) / (pre_w - 2) + 1e-12)
+    ct = np.concatenate([[0.0], np.cumsum(edb)])
+    tail = (ct[idx + post_w] - ct[idx + tail0]) / (post_w - tail0)
+    peak = (edb[idx] >= edb[idx - 1]) & (edb[idx] >= edb[idx + 1]) & (edb[idx] >= edb.max() - 60.0)
+    ok = peak & (edb[idx] - pre >= CLAP_RISE_DB) & (edb[idx] - tail >= CLAP_DECAY_DB) & (hf[idx] / e[idx] >= 2.0 * CLAP_HF_SHARE)
+    cand = sorted(zip(idx[ok], (edb[idx] - pre)[ok]), key=lambda c: -c[1])
+    out = []
+    for i, rise in cand:
+        if any(abs(i * hop / sr - t) < 0.3 for t, _ in out):
+            continue
+        a0 = max(0, (int(i) - 3) * hop)
+        seg = np.abs(x[a0:(int(i) + 2) * hop])
+        if not len(seg) or seg.max() <= 0:
+            continue
+        k = int(np.argmax(seg >= 0.5 * seg.max()))
+        out.append((float((a0 + k) / sr), round(float(rise), 1)))
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def clap_anchor(ca, cb, lag_fn, tol=CLAP_AGREE_S) -> list:
+    """Clap pairs that agree with an alignment: [(t_a, t_b, error_s)] where lag_fn(t_a) is the expected a-b lag."""
+    out = []
+    for ta, _ in ca:
+        exp = lag_fn(ta)
+        best = min(((abs(ta - tb - exp), tb) for tb, _ in cb), default=None)
+        if best and best[0] <= tol:
+            out.append((ta, best[1], ta - best[1] - exp))
+    return out
+
+
 # ============================================================================================ audio cache
 class AudioCache:
     """Decoded 8 kHz mono audio, a few clips at a time (pairs are processed clip by clip)."""
@@ -560,8 +652,14 @@ def align_pair(cfg, ra, rb, audio_cache=None, min_conf=None, min_ratio=None) -> 
     base.update(lag=co["lag"], corr=round(co["corr"], 4), ratio=round(min(co["ratio"], 99.0), 3),
                 overlap=round(co["overlap"], 2))
     need = max(min_conf, 6.0 / math.sqrt(max(1.0, co["overlap"] * ENV_RATE)))     # above the noise floor of a
+    claps_a = claps_b = None
     if co["corr"] < need or co["ratio"] < min_ratio:                                # max over ~all lags
-        return {**base, "why": f"low confidence (corr {co['corr']:.2f}, ratio {co['ratio']:.2f})"}
+        claps_a, claps_b = detect_claps(ac.get(ra)), detect_claps(ac.get(rb))
+        rescue = _clap_rescue(ea, eb, claps_a, claps_b)
+        if not rescue:
+            return {**base, "why": f"low confidence (corr {co['corr']:.2f}, ratio {co['ratio']:.2f})"}
+        co = {**co, "lag": rescue["lag"], "corr": rescue["corr"], "ratio": max(co["ratio"], min_ratio)}
+        base.update(lag=co["lag"], corr=round(co["corr"], 4), method="clap")
     # local envelope offsets -> drift, then sample-level refinement on the waveform
     loc = [(t, l_) for t, l_, r in local_lags(ea, eb, co["lag"]) if r >= max(0.2, 0.5 * co["corr"])]
     if len(loc) >= 3:
@@ -603,9 +701,60 @@ def align_pair(cfg, ra, rb, audio_cache=None, min_conf=None, min_ratio=None) -> 
     drift = b if abs(b) * 1e6 > 2.0 else 0.0
     if drift == 0.0 and lags:
         a = float(np.median(np.asarray(lags) - 0.0))
+    method = ("clap" if base.get("method") == "clap" else "audio") if k else \
+        ("clap" if base.get("method") == "clap" else "audio-envelope")
+    # clap / slate anchor: a sharp transient in both recordings at the aligned moment confirms the offset; when the
+    # waveform refinement had nothing to work on, the clap pins it to the sample
+    if claps_a is None:
+        claps_a, claps_b = detect_claps(xa), detect_claps(xb)
+    anch = clap_anchor(claps_a, claps_b, lambda t: a + drift * t)
+    clap_info = ""
+    if anch:
+        errs = [e for _, _, e in anch]
+        if not k:
+            a = float(a + np.median(errs))
+        if method == "audio":
+            method = "audio+clap"
+        clap_info = f"{len(anch)} clap(s) agree within {max(abs(e) for e in errs) * 1000:.1f} ms"
     return {**base, "ok": 1, "lag": round(float(a), 6), "drift_ppm": round(float(drift) * 1e6, 3),
             "fine_windows": int(k), "rms_ms": round(rms * 1000, 3) if rms is not None else None,
-            "method": "audio" if k else "audio-envelope", "why": ""}
+            "method": method, "why": clap_info, "claps": len(anch)}
+
+
+def _clap_rescue(ea, eb, ca, cb, min_r=0.3, win_s=10.0):
+    """When the envelopes alone can't decide: test every clap pair's lag; accept the one whose local envelope
+    correlation (+-win_s around the clap) is >= min_r and clearly the best within +-0.5 s, preferring lags that
+    several clap pairs agree on. {lag, corr} or None."""
+    if not ca or not cb:
+        return None
+    pairs = [(ta, tb) for ta, _ in ca[:12] for tb, _ in cb[:12]]
+    lags = [ta - tb for ta, tb in pairs]
+    W = int(win_s * ENV_RATE)
+    best = None
+    for ta, tb in pairs:
+        lag = ta - tb
+        n_agree = sum(1 for l2 in lags if abs(l2 - lag) <= CLAP_AGREE_S)
+        L0 = int(round(lag * ENV_RATE))
+        c = int(ta * ENV_RATE)
+        r_at = {}
+        for d in range(L0 - 50, L0 + 51):
+            i0, i1 = max(0, c - W, d), min(len(ea), c + W, len(eb) + d)
+            if i1 - i0 < 200:
+                continue
+            xw, yw = ea[i0:i1].astype(np.float64), eb[i0 - d:i1 - d].astype(np.float64)
+            xw, yw = xw - xw.mean(), yw - yw.mean()
+            den = math.sqrt(float((xw * xw).sum() * (yw * yw).sum()))
+            r_at[d] = float((xw * yw).sum() / den) if den > 1e-12 else -1.0
+        if L0 not in r_at:
+            continue
+        r0 = max(r_at.get(L0 + q, -1.0) for q in (-1, 0, 1))
+        rival = max((v for d, v in r_at.items() if abs(d - L0) > 10), default=-1.0)
+        if r0 < min_r or r0 < 1.2 * rival:
+            continue
+        score = (n_agree, r0)
+        if best is None or score > best[0]:
+            best = (score, {"lag": float(lag), "corr": r0})
+    return best[1] if best else None
 
 
 # ============================================================================================ candidates
@@ -621,11 +770,16 @@ def _same_body(a, b):
     return a["device_id"] == b["device_id"] and a.get("dserial")
 
 
-def candidates(cfg, con, window_s=None, hour_shift=0, devices=None) -> list:
+def candidates(cfg, con, window_s=None, hour_shift=0, devices=None, corrected=False) -> list:
     """Pairs (id_a, id_b) whose capture spans overlap within window_s (with b's clock moved by hour_shift
-    hours when given; `devices` limits shifted passes to those device pairs)."""
+    hours when given; `devices` limits shifted passes to those device pairs). corrected=True uses capture starts
+    corrected by the measured per-device clock offsets (estimate_clocks)."""
     W = float(window_s if window_s is not None else getattr(cfg, "sync_window_s", 300.0))
     sp = [s for s in _spans(con) if s["start_epoch"] is not None]
+    if corrected:
+        offs = _clock_table(con)
+        for s_ in sp:
+            s_["start_epoch"] = s_["start_epoch"] - _offset_for(offs, s_["device_id"], s_["start_epoch"])
     ev = sorted(sp, key=lambda s: s["start_epoch"])
     out = set()
     for i, a in enumerate(ev):
@@ -682,6 +836,189 @@ def _timecode_fallback(con, a, b, res):
             "why": f"timecode (audio: {res.get('why') or 'no match'})"}
 
 
+def _timecode_check(con, a, b, res):
+    """Audio matched: when both clips carry timecode, note whether it agrees (within one frame). Consistent
+    timecode across a day lets silent angles sync on timecode alone (auto_tc_sync)."""
+    q = "SELECT tc_seconds, tc_rate FROM clip_media WHERE clip_id=?"
+    ra, rb = con.execute(q, (a,)).fetchone(), con.execute(q, (b,)).fetchone()
+    if not (ra and rb and ra["tc_seconds"] is not None and rb["tc_seconds"] is not None):
+        return res
+    tc_lag = float(rb["tc_seconds"]) - float(ra["tc_seconds"])
+    frame = 1.0 / float(ra["tc_rate"] or 25.0)
+    if abs(tc_lag - float(res["lag"])) <= frame:
+        return {**res, "method": (res.get("method") or "audio") + "+tc",
+                "why": ((res.get("why") or "") + " · timecode agrees").strip(" ·")}
+    return {**res, "why": ((res.get("why") or "") + f" · timecode off by {tc_lag - float(res['lag']):+.2f}s").strip(" ·")}
+
+
+def auto_tc_sync(con, echo=None, min_pairs=2) -> list:
+    """Devices whose timecode agreed with the audio on at least `min_pairs` matched pairs (and never disagreed) are
+    marked tc_sync, so their silent clips can sync on timecode. Returns the device ids newly marked."""
+    ok, bad = {}, {}
+    for r in con.execute("""SELECT p.method, p.why, ma.device_id AS da, mb.device_id AS db FROM sync_pairs p
+                            JOIN clip_media ma ON ma.clip_id=p.a JOIN clip_media mb ON mb.clip_id=p.b WHERE p.ok=1"""):
+        for d in (r["da"], r["db"]):
+            if "+tc" in (r["method"] or ""):
+                ok[d] = ok.get(d, 0) + 1
+            elif "timecode off" in (r["why"] or ""):
+                bad[d] = bad.get(d, 0) + 1
+    marked = []
+    for d, n in ok.items():
+        if n >= min_pairs and not bad.get(d):
+            cur = con.execute("SELECT tc_sync, name FROM devices WHERE id=?", (d,)).fetchone()
+            if cur and not cur["tc_sync"]:
+                con.execute("UPDATE devices SET tc_sync=1, updated=? WHERE id=?", (time.time(), d))
+                marked.append(d)
+                _log(echo, f"sync: {cur['name']}: timecode agreed with the audio on {n} pairs -> trusted for silent clips")
+    con.commit()
+    return marked
+
+
+def join_chunks(cfg, con, echo=None) -> list:
+    """Split recordings (one long take written as several files: iXML file sets, or sample-contiguous BWF time
+    references on the same device) become exact sync pairs (method 'chunk'): lag = the earlier file's length."""
+    from . import bwf
+    rows = con.execute("""SELECT c.id, c.path, c.duration, m.device_id FROM clips c JOIN clip_media m ON m.clip_id=c.id
+                          WHERE m.audio_only=1""").fetchall()
+    items = []
+    for r in rows:
+        if not str(r["path"]).lower().endswith((".wav", ".bwf", ".w64")):
+            continue
+        meta = bwf.read(r["path"])
+        if meta.get("ok"):
+            items.append({"id": r["id"], "path": r["path"], "device": r["device_id"], "duration": r["duration"], "meta": meta})
+    by_id = {it["id"]: it for it in items}
+    chains = bwf.chunk_chains(items)
+    for ch in chains:
+        for x, y in zip(ch, ch[1:]):
+            mx = by_id[x]["meta"]
+            lag = (mx.get("frames") or 0) / float(mx["sample_rate"]) if mx.get("frames") else float(by_id[x]["duration"] or 0)
+            a, b = sorted((x, y))
+            res = {"ok": 1, "lag": round(lag if a == x else -lag, 6), "drift_ppm": 0.0, "corr": 1.0, "ratio": 99.0,
+                   "overlap": 0.0, "fine_windows": 0, "rms_ms": 0.0, "method": "chunk",
+                   "why": "split recording (continues sample-exactly)"}
+            _store_pair(con, a, b, res)
+        _log(echo, f"sync: joined a split recording of {len(ch)} files")
+    con.commit()
+    return chains
+
+
+def logical_recordings(con) -> list:
+    """Chains of split files as [[clip ids in order]] (from the stored 'chunk' pairs)."""
+    nxt, has_prev = {}, set()
+    for r in con.execute("SELECT a, b, lag FROM sync_pairs WHERE ok=1 AND method='chunk'"):
+        first, second = (r["a"], r["b"]) if float(r["lag"]) >= 0 else (r["b"], r["a"])
+        nxt[first] = second
+        has_prev.add(second)
+    out = []
+    for start in [k for k in nxt if k not in has_prev]:
+        ch = [start]
+        while ch[-1] in nxt and len(ch) < 1000:
+            ch.append(nxt[ch[-1]])
+        out.append(ch)
+    return out
+
+
+def _clock_table(con):
+    ensure_schema(con)
+    return [dict(r) for r in con.execute("SELECT * FROM device_clock")]
+
+
+def _day_of(ep):
+    return dt.datetime.fromtimestamp(ep).strftime("%Y-%m-%d") if ep is not None else "unknown"
+
+
+def _offset_for(table, device_id, ep):
+    rows = [r for r in table if r["device_id"] == device_id]
+    if not rows:
+        return 0.0
+    day = _day_of(ep)
+    same = [r for r in rows if r["day"] == day]
+    return float((same or rows)[0]["offset_s"] or 0.0)
+
+
+def corrected_start(con, cid):
+    """A clip's capture start (epoch s) corrected by its device's measured clock offset for that day."""
+    r = con.execute("SELECT start_epoch, device_id FROM clip_media WHERE clip_id=?", (cid,)).fetchone()
+    if not r or r["start_epoch"] is None:
+        return None
+    return float(r["start_epoch"]) - _offset_for(_clock_table(con), r["device_id"], r["start_epoch"])
+
+
+def estimate_clocks(cfg, con, echo=None, ref_device=None) -> list:
+    """Per device and shoot day: its clock minus the reference device's clock, from every matched pair (the audio says
+    when b really started relative to a; the files' capture times say what each clock claimed). Robust: the median
+    per device pair, then a least-squares solve over the pair graph. The reference is the hero camera's device
+    (ARRI) when there is one, else the device with the most matches. Writes device_clock; returns its rows."""
+    ensure_schema(con)
+    rows = con.execute("""SELECT p.a, p.b, p.lag, p.method, ma.device_id AS da, mb.device_id AS db, ma.start_epoch AS sa,
+                                 mb.start_epoch AS sb, ma.start_src AS srca, mb.start_src AS srcb
+                          FROM sync_pairs p JOIN clip_media ma ON ma.clip_id=p.a JOIN clip_media mb ON mb.clip_id=p.b
+                          WHERE p.ok=1 AND p.method != 'chunk' AND ma.start_epoch IS NOT NULL AND mb.start_epoch IS NOT NULL
+                                AND ma.device_id != mb.device_id""").fetchall()
+    per = {}
+    for r in rows:
+        if "mtime" in (r["srca"] or "") or "mtime" in (r["srcb"] or ""):
+            continue                                            # a file date is not a camera clock
+        err = (float(r["sb"]) - float(r["sa"])) - float(r["lag"])   # b's clock minus a's clock
+        day = _day_of(r["sa"])
+        per.setdefault(day, {}).setdefault((r["da"], r["db"]), []).append(err)
+    hero = None
+    try:
+        from . import cameras as CAM
+        CAM.ensure_schema(con)
+        h = con.execute("""SELECT m.device_id, COUNT(*) n FROM clip_media m JOIN clip_camera k ON k.clip_id=m.clip_id
+                           WHERE k.family=? GROUP BY m.device_id ORDER BY n DESC LIMIT 1""", (CAM.HERO_DEFAULT,)).fetchone()
+        hero = h["device_id"] if h else None
+    except Exception:  # noqa: BLE001
+        hero = None
+    con.execute("DELETE FROM device_clock")
+    out = []
+    for day, edges in per.items():
+        devs = sorted({d for e in edges for d in e})
+        cnt = {d: sum(len(v) for e, v in edges.items() if d in e) for d in devs}
+        ref = ref_device if ref_device in devs else (hero if hero in devs else max(devs, key=lambda d: (cnt[d], -d)))
+        # connected to the reference only
+        idx = {d: i for i, d in enumerate(devs)}
+        A, y, w = [], [], []
+        for (da, db_), v in edges.items():
+            row = np.zeros(len(devs))
+            row[idx[db_]] += 1.0
+            row[idx[da]] -= 1.0
+            A.append(row)
+            y.append(float(np.median(v)))
+            w.append(math.sqrt(len(v)))
+        row = np.zeros(len(devs))
+        row[idx[ref]] = 1.0
+        A.append(row)
+        y.append(0.0)
+        w.append(100.0)
+        A, y, w = np.asarray(A), np.asarray(y), np.asarray(w)
+        sol, *_ = np.linalg.lstsq(A * w[:, None], y * w, rcond=None)
+        reach = {ref}
+        changed = True
+        while changed:
+            changed = False
+            for (da, db_) in edges:
+                if (da in reach) != (db_ in reach):
+                    reach |= {da, db_}
+                    changed = True
+        for d in devs:
+            if d not in reach or d == ref:
+                continue
+            spread = [abs((v_ - (sol[idx[b_]] - sol[idx[a_]]))) for (a_, b_), vs in edges.items() if d in (a_, b_) for v_ in vs]
+            rec = {"device_id": d, "day": day, "offset_s": round(float(sol[idx[d]]), 3), "n": cnt[d],
+                   "spread_s": round(float(np.median(spread)) if spread else 0.0, 3), "ref_device": ref, "updated": time.time()}
+            db.upsert(con, "device_clock", rec, key=("device_id", "day"))
+            out.append(rec)
+            if echo and abs(rec["offset_s"]) >= 1.0:
+                nm = con.execute("SELECT name FROM devices WHERE id=?", (d,)).fetchone()
+                _log(echo, f"sync: {nm['name'] if nm else d} clock is {rec['offset_s']:+.1f}s off on {day} "
+                           f"({rec['n']} pair(s))")
+    con.commit()
+    return out
+
+
 def detect(cfg, con, clips=None, force=False, echo=print) -> dict:
     """Register recorder audio, probe metadata, align candidate pairs, rebuild groups. `clips` (refs) = align
     exactly these against each other (no timestamps needed)."""
@@ -701,13 +1038,19 @@ def detect(cfg, con, clips=None, force=False, echo=print) -> dict:
     ac = AudioCache(cfg)
     gov = governor.for_cfg(cfg)
     stats = {"pairs": 0, "measured": 0, "accepted": 0, "rejected": 0}
+    chains = join_chunks(cfg, con, echo=echo)
+    stats["chunk_chains"] = len(chains)
 
     def run(plist):
         for a, b in sorted(plist):
             if a not in rows or b not in rows:
                 continue
             stats["pairs"] += 1
-            if not force and _pair_cached(con, a, b):
+            cached = _pair_cached(con, a, b)
+            if cached and cached.get("method") == "chunk":          # a split recording: exact, never re-measured
+                stats["accepted"] += 1
+                continue
+            if not force and cached:
                 if _pair_cached(con, a, b)["ok"]:
                     stats["accepted"] += 1
                 continue
@@ -718,6 +1061,8 @@ def detect(cfg, con, clips=None, force=False, echo=print) -> dict:
                     res = {"ok": 0, "why": f"{type(e).__name__}: {e}"}
             if not res["ok"]:
                 res = _timecode_fallback(con, a, b, res)
+            else:
+                res = _timecode_check(con, a, b, res)
             _store_pair(con, a, b, res)
             con.commit()
             stats["measured"] += 1
@@ -737,6 +1082,23 @@ def detect(cfg, con, clips=None, force=False, echo=print) -> dict:
         devs = {s["device_id"] for s in sp.values()}
         lonely = {(x, y) for x in devs for y in devs if x != y and frozenset((x, y)) not in matched}
         if lonely:
+            # a camera whose clock is minutes off (never set, drifted, a battery swap reset it): a wider window,
+            # for device pairs that matched nothing yet; the audio still has to agree
+            wide = float(getattr(cfg, "sync_lonely_window_s", 1800.0) or 0)
+            if wide > float(getattr(cfg, "sync_window_s", 300.0)):
+                near = {pr for pr in candidates(cfg, con, window_s=wide)
+                        if pr[0] in sp and pr[1] in sp and (sp[pr[0]]["device_id"], sp[pr[1]]["device_id"]) in lonely}
+                near -= set(pairs)
+                if near:
+                    _log(echo, f"sync: trying {len(near)} pair(s) of unmatched cameras within {wide / 60:.0f} min")
+                    run(near)
+                    matched = set()
+                    for r in con.execute("SELECT a, b FROM sync_pairs WHERE ok=1"):
+                        if r[0] in sp and r[1] in sp:
+                            matched.add(frozenset((sp[r[0]]["device_id"], sp[r[1]]["device_id"])))
+                    lonely = {(x, y) for x, y in lonely if frozenset((x, y)) not in matched}
+                    pairs = sorted(set(pairs) | near)
+        if lonely:
             extra = set()
             for q in range(-56, 57):                          # every quarter hour from -14 h to +14 h (all time zones)
                 if q:
@@ -747,6 +1109,20 @@ def detect(cfg, con, clips=None, force=False, echo=print) -> dict:
                 _log(echo, f"sync: trying {len(extra)} pair(s) with whole-hour clock offsets")
                 run(extra)
     groups = rebuild_groups(cfg, con, echo=echo)
+    # pass 3: per-camera clock offsets measured from the matched pairs, then the pairs that the corrected clocks
+    # now put side by side (a camera whose clock is minutes off still lands next to the right moment)
+    if not ids:
+        clocks = estimate_clocks(cfg, con, echo=echo)
+        stats["clock_offsets"] = len(clocks)
+        if clocks:
+            tried = {(r[0], r[1]) for r in con.execute("SELECT a, b FROM sync_pairs")}
+            extra = set(candidates(cfg, con, corrected=True)) - tried - set(pairs)
+            if extra:
+                _log(echo, f"sync: trying {len(extra)} pair(s) after clock correction")
+                run(extra)
+                groups = rebuild_groups(cfg, con, echo=echo)
+                estimate_clocks(cfg, con, echo=None)
+        auto_tc_sync(con, echo=echo)
     stats.update(groups=len(groups), seconds=round(time.time() - t0, 1))
     _log(echo, f"sync: {stats['pairs']} pair(s) ({stats['measured']} measured) · {stats['accepted']} matched · "
                f"{len(groups)} group(s) · {stats['seconds']}s")
@@ -941,15 +1317,22 @@ def from_group(m, g):
     return (float(g) - float(m["offset"])) / (1.0 + float(m["drift_ppm"] or 0) * 1e-6)
 
 
-def best_audio(g, prefer=None, angle_member=None):
+def best_audio(g, prefer=None, angle_member=None, span=None):
     """The member whose sound a multicam segment uses. prefer: 'auto' (external recorder > lav > camera; among
-    cameras the angle's own sound wins), 'camera' (the angle's own sound), or an angle / device name."""
+    cameras the angle's own sound wins), 'camera' (the angle's own sound), or an angle / device name.
+    span = (g0, g1) group seconds the segment needs: with 'auto', a source that covers it beats one that doesn't
+    (a recorder take split into several files: the file that holds the moment)."""
     if prefer and str(prefer).lower() not in ("auto", "best"):
         if str(prefer).lower() == "camera" and angle_member is not None:
             return angle_member
         return member(g, prefer)
     cands = [m for m in g["members"]]
-    return min(cands, key=lambda m: (m["audio_rank"], 0 if angle_member is not None and m["clip_id"] == angle_member["clip_id"]
+
+    def covers(m):
+        if not span:
+            return 0
+        return 0 if (float(m["offset"]) - 0.05 <= span[0] and span[1] <= float(m["end"]) + 0.05) else 1
+    return min(cands, key=lambda m: (covers(m), m["audio_rank"], 0 if angle_member is not None and m["clip_id"] == angle_member["clip_id"]
                                      else 1, -(m["confidence"] or 0), m["angle"]))
 
 
@@ -976,7 +1359,10 @@ def concrete(con, seg) -> dict:
             if seg.get(k) is not None:
                 out[k] = round(from_group(ang, float(seg[k])), 4)
     out["clip"] = ang["clip_id"]
-    au = best_audio(g, mc.get("audio"), ang)
+    span = None
+    if out.get("in") is not None and out.get("out") is not None:
+        span = tuple(sorted((to_group(ang, float(out["in"])), to_group(ang, float(out["out"])))))
+    au = best_audio(g, mc.get("audio"), ang, span=span)
     if au["clip_id"] != ang["clip_id"]:
         s_p = 1.0 + float(ang["drift_ppm"] or 0) * 1e-6
         s_a = 1.0 + float(au["drift_ppm"] or 0) * 1e-6

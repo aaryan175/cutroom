@@ -69,7 +69,11 @@ Craft fields (docs/PLAN_FORMAT.md "Craft"; defaults measured from a reference vl
   style.grade.finish     {"enabled": true, "black": 0.028, "shoulder": 0.96, "vibrance": 0.18}  one curve, every shot
   style.audio            {"join_xfade_s": 0.02, "room_tone": true, "room_tone_under_voice_db": -32,
                           "bed_fade_s": 0.3, "jl_duck_db": -12, "auto_lead_in": 0.3, "auto_tail": 0.0}
-  style.conform          "auto" | "speed" | "blend" | "dup"     frame-rate conform of 23.976/29.97/50/60 sources
+  style.conform          "auto" | "speed" | "blend" | "dup" | "slowmo"   frame-rate conform of 23.976/29.97/50/60
+                          sources; auto plays a 50p b-roll shot that carries a ramp as 2x slow motion (PAL)
+  style.grade.camera_transforms  "auto" (default) | "off" | {"show_lut": "arri_logc3.cube", "hero": "arri",
+                          "match": true, "matrix": false, "cameras": {"<camera key>": {"lut": "x.cube", "profile": "..."}}}
+                          per-camera input transform -> show LUT -> per-camera match, as ONE LUT (cameras.py)
   style.auto_push        null | {"min_hold": 4.0, "to": 1.04}   slow push-in on long held talk shots
   section.music          + "start"/"end": "cut" | {"fade": s}, "montage_gain_db": 7, "natural_duck_db": 0,
                           "mode": "under" (+ "under_db": -5, never ducked), "breaks": [{"at": seg-rel s | "before": "cut:<seg>", "dur": 0.3}]
@@ -108,7 +112,7 @@ POSITIONS = {"top-left", "top-right", "bottom-left", "bottom-right", "center", "
 
 TRANSITION_KINDS = {"flash", "dip", "dip_black", "dip_white", "whip", "burn", "cut"}
 BURN_PALETTES = {"warm", "red", "gold"}
-CONFORM_MODES = {"auto", "speed", "blend", "dup"}
+CONFORM_MODES = {"auto", "speed", "blend", "dup", "slowmo"}
 CAPTION_SIZE_1080 = 43           # font px at 1080; the reference vlog's text measures ~3 % of frame height; scaled with output height
 
 DEFAULT_STYLE = {
@@ -116,7 +120,7 @@ DEFAULT_STYLE = {
                  "max_chars": 30, "case": "sentence", "fixes": []},
     # house grade = the LUT and nothing else (the creator's approved look). Exposure normalisation, the
     # finishing curve and looks stay available, opt-in per plan (docs/PLAN_FORMAT.md "Grade").
-    "grade": {"lut": "", "normalize_exposure": False, "saturation": 1.0, "look": None,
+    "grade": {"lut": "", "normalize_exposure": False, "saturation": 1.0, "look": None, "camera_transforms": "auto",
               "exposure": {"strength": 0.5, "max_stops": 1.0, "deadband_stops": 0.33, "target_luma": 118.0,
                            "night_luma": 60.0, "night_target": 70.0},
               "finish": {"enabled": False, "black": 0.028, "shoulder": 0.96, "vibrance": 0.0}},
@@ -223,6 +227,8 @@ def validate(plan: dict, con=None) -> list:
     grade = (plan.get("style") or {}).get("grade") or {}
     if isinstance(grade, dict) and grade.get("look") is not None:
         errs += validate_look(grade["look"], "style.grade.look")
+    from .cameras import validate as _validate_ct
+    errs += _validate_ct(plan.get("style") or {})
 
     def chk_clip(where, ref, *times):
         if con is None or ref is None:

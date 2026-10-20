@@ -129,6 +129,20 @@ part stays available as an opt-in:
 The exposure correction runs in the LOG domain *before* the LUT: half of the measured error, at most ±1
 stop. Nothing is ever brightened after the LUT, because that turns blacks milky.
 
+**Camera transforms (mixed cameras, matched to the hero camera).** `style.grade.camera_transforms` is `"auto"`
+by default. Every clip whose camera was identified (`cutroom cameras`) gets ONE combined LUT instead of the
+plan's LUT: its camera input transform (published log curve + gamut maths, or the manufacturer's LUT), then the
+show transform (the hero ARRI's LogC3 → Rec.709 LUT), then the per-camera, per-day match to the hero. It is
+still the house grade: one transform, plus at most one look. Clips with no identified camera keep the old path
+(`style.grade.lut` / config `lut` on log footage).
+```json
+"grade": {"camera_transforms": {"show_lut": "arri_logc3.cube", "hero": "arri", "match": true, "matrix": false,
+                                "cameras": {"bmd-pocket-cinema-camera-6k-pro": {"lut": "bmd.cube"},
+                                            "fuji-x-t5": {"profile": "fuji_flog2"}}}}
+```
+`"off"` switches it off for one plan. `matrix: true` also fits a full 3×3 (used only when it beats the
+white-balance / exposure / saturation fit). See docs/NLE_AND_MULTICAM.md "Your kit".
+
 **Film / lens** (`style.film`, cutroom/film.py), all off by default: `grain` (std, 0–12), `grain_size`
 (1–3 px), `soften` (gaussian sigma px at 1080), `vignette` (corner fall-off 0–0.6), `halation` / `bloom`
 (0–1), `ca` (lateral fringe px at the corners), `rolloff` (`{"knee": 0.86, "ceiling": 0.96}`), `black`
@@ -204,7 +218,11 @@ first segment):
 - A 23.976 or 24 fps b-roll source is sped up to 25 (+4.3 %, pitch-kept atempo on its ambience), so
   there are no duplicate frames.
 - Sync talk and match cuts are frame-blended (`framerate`), so lip-sync holds.
-- Sources far from the output rate (50, 60) go through `fps` (frames dropped, never duplicated).
+- Sources far from the output rate (50, 60) go through `fps` (frames dropped, never duplicated), so they
+  play in real time.
+- PAL slow motion: a 50p (or 100p) b-roll shot in a 25p edit that carries a `ramp` plays as 2× (4×) slow motion,
+  every source frame shown once, then ramps into the cut. `"conform": "slowmo"` asks for that without a ramp.
+  Sync talk is never slowed.
 - `"dup"` forces the old fps behaviour.
 
 **Push-in.** `"push": {"to": 1.06, "ease": "inout"}` on talk, broll or a montage shot (or the montage)

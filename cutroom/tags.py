@@ -427,7 +427,7 @@ _STATS_CHECKED = {}
 def query(cfg, con, text="", setting=None, time=None, people=None, shot=None, camera=None, max_shake=None,
           min_quality=None, speech=None, creator=False, min_dur=None, offset=0, limit=200,
           include_unusable=False, day=None, highlights=False, dedupe=False, session=None, near=None,
-          event_kind=None) -> dict:
+          event_kind=None, body=None) -> dict:
     """Filtered, scored, paged clip search in SQL. Same filters and ranking as `search`
     (tags x3, speech x2, path x1 per word; then quality, then duration). speech: True = with
     speech, False = without, None = either. Returns {total, offset, limit, rows}."""
@@ -448,6 +448,11 @@ def query(cfg, con, text="", setting=None, time=None, people=None, shot=None, ca
         analyze.ensure_event_schema(con)
         where.append("c.id IN (SELECT clip_id FROM event_windows WHERE kind = ?)")
         args.append(str(event_kind))
+    if body:                                                      # camera body (cameras.py): key or family
+        from . import cameras as _cam
+        _cam.ensure_schema(con)
+        where.append("c.id IN (SELECT clip_id FROM clip_camera WHERE cam_key = ? OR family = ?)")
+        args += [str(body), str(body)]
     if highlights:
         where.append("COALESCE(hp.score, 0) >= ?")
         args.append(HL_MIN)

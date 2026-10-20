@@ -20,7 +20,8 @@ MIN_SIZE = 100 * 1024          # smaller files are thumbnails / junk
 BATCH = 2000                   # rows per commit during scan
 TILE_W = 320                   # contact-sheet tile width
 SHEET_COLS = 6
-SIDECAR_EXTS = (".xml", ".json")
+SIDECAR_EXTS = (".xml", ".json", ".sidecar")
+RAW_SEQ_EXTS = {".ari", ".arx"}        # ARRIRAW frame sequences: reported, never registered (one file per frame)
 
 
 # -- helpers ---------------------------------------------------------------------------------
@@ -97,13 +98,18 @@ def scan(cfg, con) -> dict:
     n_files = n_new = n_changed = 0
     pending = 0
     now = time.time()
+    raw_seq = set()
     for root in cfg.library_roots:
         root_real = os.path.realpath(root)
         if not os.path.isdir(root_real):
             _log(f"  ! library root missing: {root}")
             continue
         for path, size, mtime in _iter_files(root_real):
-            if os.path.splitext(path)[1].lower() not in VIDEO_EXTS or size < MIN_SIZE:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in RAW_SEQ_EXTS:
+                raw_seq.add(os.path.dirname(path))
+                continue
+            if ext not in VIDEO_EXTS or size < MIN_SIZE:
                 continue
             n_files += 1
             cid = db.clip_id(path)
@@ -128,10 +134,15 @@ def scan(cfg, con) -> dict:
                 pending = 0
     con.commit()
     missing = len(set(known) - seen_paths)
+    if raw_seq:
+        _log(f"  ! {len(raw_seq)} ARRIRAW frame-sequence folder(s) (.ari/.arx) skipped: ffmpeg can't decode ARRIRAW. "
+             f"Record ProRes on the camera or make ProRes proxies (ARRI Reference Tool / Resolve): "
+             f"{', '.join(sorted(raw_seq)[:3])}{' ...' if len(raw_seq) > 3 else ''}")
     dt = time.time() - t
     _log(f"scan: {n_files} video files in {dt:.1f}s · {n_new} new · {n_changed} changed · "
          f"{missing} missing on disk · {con.execute('SELECT COUNT(*) FROM clips').fetchone()[0]} in library")
-    return {"files": n_files, "new": n_new, "changed": n_changed, "missing": missing, "seconds": dt}
+    return {"files": n_files, "new": n_new, "changed": n_changed, "missing": missing, "seconds": dt,
+            "arriraw_sequences": sorted(raw_seq)}
 
 
 def register_files(cfg, con, paths) -> list:
@@ -209,7 +220,7 @@ def detect_log(cfg, path: str, info: dict, summary: dict) -> bool:
 
 def probe_all(cfg, con, limit=None, ids=None):
     """ffprobe clips with status 'new'. `limit` bounds how many are probed this run; `ids` = only these clips."""
-    rows = con.execute("SELECT id, path FROM clips WHERE status='new' ORDER BY rel").fetchall()
+    rows = con.execute("SELECT id, path, rel FROM clips WHERE status='new' ORDER BY rel").fetchall()
     if ids is not None:
         rows = [r for r in rows if r["id"] in ids]
     if limit:
@@ -220,22 +231,38 @@ def probe_all(cfg, con, limit=None, ids=None):
     t = time.time()
     ok = err = 0
 
+    from . import cameras as CAM
+
     def work(r):
         info = media.probe(cfg, r["path"])
         s = media.summarize_probe(info)
+        raw = CAM.raw_kind(r["path"], info)
+        sd = CAM.standin(cfg, r["path"]) if raw else None
+        if sd:                                        # RAW master: picture facts come from its decodable stand-in
+            sinfo = media.probe(cfg, sd)
+            ss = media.summarize_probe(sinfo)
+            s.update({k: ss[k] for k in ("codec", "pix_fmt", "color_transfer") if ss.get(k)})
+            s["width"], s["height"] = s.get("width") or ss.get("width"), s.get("height") or ss.get("height")
         if not s.get("width"):
             raise media.FFError("no video stream")
         s["is_log"] = int(detect_log(cfg, r["path"], info, s))
-        return s
+        ident = CAM.analyze(cfg, {"path": r["path"], "rel": r["rel"], "duration": s.get("duration"),
+                                  "pix_fmt": s.get("pix_fmt")}, info=info)
+        return s, ident, raw, sd
 
     with ThreadPoolExecutor(_workers(cfg)) as ex:
         futs = {ex.submit(work, r): r for r in rows}
         for i, f in enumerate(as_completed(futs), 1):
             r = futs[f]
             try:
-                s = f.result()
-                s.update(status="probed", error=None, updated=time.time())
+                s, ident, raw, sd = f.result()
+                if raw and not sd:
+                    s.update(status="raw", error=f"{'Blackmagic RAW' if raw == 'braw' else 'ARRIRAW'}: ffmpeg can't decode "
+                             "it; add a ProRes stand-in (cutroom braw)", updated=time.time())
+                else:
+                    s.update(status="probed", error=None, updated=time.time())
                 _update(con, r["id"], s)
+                CAM.store(con, r["id"], ident)
                 ok += 1
             except Exception as e:  # noqa: BLE001 - any probe failure marks the clip
                 _update(con, r["id"], {"status": "error", "error": f"probe: {str(e)[-300:]}", "updated": time.time()})
@@ -257,8 +284,25 @@ PROXY_709_TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_t
 
 
 def proxy_lut(cfg, row):
-    """The LUT a proxy of this clip gets baked in, or None."""
+    """The LUT a proxy of this clip gets baked in, or None: the clip's camera transform (cameras.py, without the
+    per-day match, which previews add on top) when it has one, else cfg.lut for log clips."""
+    if isinstance(row, dict) and "_cam_lut" in row:
+        if row["_cam_lut"]:
+            return row["_cam_lut"]
     return cfg.lut if cfg.lut and row["is_log"] and os.path.exists(cfg.lut) else None
+
+
+def with_camera_lut(cfg, con, row) -> dict:
+    """row as a dict carrying its camera transform LUT (`_cam_lut`) and decode source (`_src`) for the proxy."""
+    from . import cameras as CAM
+    d = dict(row)
+    try:
+        d["_cam_lut"], _ = CAM.lut_for_clip(cfg, con, d, {}, match=False)
+    except Exception as e:  # noqa: BLE001 - a missing camera LUT falls back to the legacy proxy grade
+        _log(f"  ! camera transform for {d.get('rel')}: {e}")
+        d["_cam_lut"] = None
+    d["_src"] = CAM.decode_path(con, d)
+    return d
 
 
 def lut_sha(path) -> str:
@@ -332,7 +376,7 @@ def _encode_proxy(cfg, row, enc, out) -> str:
     timeout = max(600, (row["duration"] or 0) * 10)
     log = cfg.p("proxies", "ffmpeg.log")
     try:
-        media.ffmpeg(cfg, _proxy_args(cfg, row, row["path"], tmp, enc), log=log, timeout=timeout)
+        media.ffmpeg(cfg, _proxy_args(cfg, row, (row.get("_src") if isinstance(row, dict) else None) or row["path"], tmp, enc), log=log, timeout=timeout)
     except media.GovernorKilled:
         tmp.unlink(missing_ok=True)
         raise
@@ -340,7 +384,7 @@ def _encode_proxy(cfg, row, enc, out) -> str:
         if "libx264" in enc:
             raise
         # hardware encoders can refuse odd sizes or run out of sessions: fall back to x264
-        media.ffmpeg(cfg, _proxy_args(cfg, row, row["path"], tmp,
+        media.ffmpeg(cfg, _proxy_args(cfg, row, (row.get("_src") if isinstance(row, dict) else None) or row["path"], tmp,
                                       ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(cfg.proxy_crf)]),
                      log=log, timeout=timeout)
     os.replace(tmp, out)
@@ -359,6 +403,7 @@ def make_proxies(cfg, con, limit=None, max_jobs=None, ids=None):
     if not rows:
         _log("proxies: nothing to do")
         return
+    rows = [with_camera_lut(cfg, con, r) for r in rows]
     enc = media.hw_encoder(cfg)
     t = time.time()
     total_s = sum(r["duration"] or 0 for r in rows)

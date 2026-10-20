@@ -1122,6 +1122,7 @@ def run(cfg, video, plan_path=None, out_dir=None, sidecar_path=None) -> dict:
                   frozen, cfg)
     _reference_checks(rep, vs, fps, n, raw_side, framed)
     swing_check(cfg, rep, au.momentary if (au and au.error is None) else None, raw_side)
+    camera_match_check(cfg, rep, raw_side)
 
     # ---------------------------------------------------------------- contact sheets
     issue_frames = {}
@@ -1534,6 +1535,44 @@ def _reference_checks(rep, vs, fps, n, raw, framed):
             value={"shots": rows[:60], "tolerance": {"luma": GRADE_LUMA_TOL, "p1_drop": GRADE_P1_DROP,
                                                      "sat_gain": GRADE_SAT_GAIN}},
             status=None if rows else "info")
+
+
+CAMERA_DE_WARN = 5.0            # camera_match: CIEDE2000 between angles of one multicam group (mean colour)
+
+
+def camera_match_check(cfg, rep, raw):
+    """Angles of the same multicam group should look like one camera: CIEDE2000 between the mean colour of each
+    pair of angles at a shared moment, through the camera transforms + match (cameras.group_delta_e)."""
+    try:
+        from . import cameras as CAM
+        from . import db as DB
+        from . import sync as SY
+        con = DB.connect(cfg.db_path)
+        SY.ensure_schema(con)
+        CAM.ensure_schema(con)
+        used = {x.get("clip") for x in (raw.get("segments") or []) if x.get("clip")}
+        gids = sorted({r[0] for r in con.execute("SELECT group_id, clip_id FROM sync_members") if r[1] in used})
+        style = {}
+        try:
+            style = json.loads(Path(raw["plan"]).read_text()).get("style") or {} if raw.get("plan") else {}
+        except (OSError, ValueError):
+            style = {}
+        res, iss = [], []
+        for g in gids:
+            r = CAM.group_delta_e(cfg, con, g, style=style)
+            if not r["pairs"]:
+                continue
+            res.append(r)
+            for pr in r["pairs"]:
+                if pr["de_after"] > CAMERA_DE_WARN:
+                    iss.append(rep.issue("warn", f"group {g}: {pr['a']} ({pr['cam_a']}) vs {pr['b']} ({pr['cam_b']}) differ "
+                                                 f"by ΔE00 {pr['de_after']:.1f} after matching (before {pr['de_before']:.1f}); "
+                                                 f"run `cutroom cameras match` or check the camera profile"))
+        rep.add("camera_match", "picture", "Cameras match the hero camera within a multicam group (ΔE00)", iss,
+                value={"groups": res, "warn_above": CAMERA_DE_WARN}, status=None if res else "info")
+    except Exception as e:  # noqa: BLE001 - the check never breaks QA
+        rep.add("camera_match", "picture", "Cameras match the hero camera within a multicam group (ΔE00)", [],
+                value={"error": f"{type(e).__name__}: {e}"}, status="info")
 
 
 SWING_TOL_LU = 2.0

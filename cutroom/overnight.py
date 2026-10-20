@@ -743,10 +743,12 @@ class Pipeline:
         for stale in self.cfg.p("proxies").glob("*.tmp.mp4"):
             stale.unlink(missing_ok=True)
         enc = media.hw_encoder(self.cfg)
+        rows = [ingest.with_camera_lut(self.cfg, self.con, r) for r in rows]   # camera transform + RAW stand-in
 
         def ok(r, p):
             self.con.execute("UPDATE clips SET proxy=?, status='proxied', error=NULL, updated=? WHERE id=?",
                              (p, time.time(), r["id"]))
+            ingest.record_proxy(self.cfg, self.con, r, p)
             self.con.commit()
         self.run_items("proxies", rows, lambda r: ingest._make_proxy(self.cfg, r, enc), ok, self._err("proxies"),
                        workers=self.gov.heavy_slots)
@@ -880,7 +882,15 @@ class Pipeline:
         from . import sync
         self.stage_begin("sync", total=1)
         res = sync.detect(self.cfg, self.con, echo=self.log)
-        self.stage_end("sync", done=1, groups=res["groups"], pairs=res["pairs"], matched=res["accepted"])
+        matched = []
+        try:                                             # camera matching to the hero camera uses the new groups
+            from . import cameras as CAM
+            CAM.identify_all(self.cfg, self.con, echo=None)
+            matched = [r for r in CAM.match_all(self.cfg, self.con, echo=self.log) if r.get("ok")]
+        except Exception as e:  # noqa: BLE001 - matching is an extra, never fails the night
+            self.log(f"camera match: {type(e).__name__}: {e}")
+        self.stage_end("sync", done=1, groups=res["groups"], pairs=res["pairs"], matched=res["accepted"],
+                       cameras_matched=len(matched))
 
     def st_sessions(self):
         from . import analyze

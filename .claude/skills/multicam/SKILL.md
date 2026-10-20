@@ -20,6 +20,20 @@ cutroom sync devices            # which camera is camA / camB, which recorder is
 - Name the devices the way the creator talks about them: `cutroom sync name camA "Cam A wide"`. Mark a lav with
   `--kind lav`. Mark jam-synced timecode with `--tc-sync on`.
 
+## 1b. Mixed cameras: identity, colour match, RAW (docs/NLE_AND_MULTICAM.md "Your kit")
+```bash
+cutroom cameras                 # cameras found per clip from metadata, log profile (metadata / assumed), transform
+cutroom cameras match           # per-camera, per-day correction toward the hero camera (ARRI); prints ΔE before -> after
+cutroom sync clocks             # how far each camera's clock is off; unsynced clips sort by the corrected time
+cutroom braw                    # .braw clips: which have a ProRes stand-in, how to make the rest
+```
+- A profile marked `assumed` came from the picture histogram. Check a frame; if wrong, `cutroom cameras set <clip>
+  --profile <p> --all` (or the badge in the Studio library) fixes every clip of that camera.
+- Never stack a LUT or a look to "fix" a camera that doesn't match: re-run `cutroom cameras match`, check QA
+  `camera_match`, and say which camera is off and by how much (ΔE).
+- Blackmagic Film Gen 5 has no formula here: without `luts/bmd.cube` (or Resolve's copy) those clips keep the old
+  single-LUT path. Say so instead of guessing.
+
 ## 2. Look before you cut
 `cutroom frames <clip> <t>` on each angle at the same moment (`cutroom sync map G T --from camA --to camB` gives
 the times). Know which angle is the wide, which is the close-up and which is the roamer. Note who is in frame and

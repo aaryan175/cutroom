@@ -1207,6 +1207,24 @@ def readme(model, out_files, fmts) -> str:
         lines += [f"   {lut}",
                   "   The graphics and rendered segments above it are finished already, so the layer must sit below them.",
                   "   On another machine copy that .cube file along and browse to the copy."]
+    cl = model.get("camera_luts") or []
+    if cl:
+        lines += ["", "CAMERAS AND COLOUR (one input LUT per camera, made by cutroom)",
+                  "Every camera is matched to the hero camera (ARRI). Each .cube in luts/ is that camera's whole transform:",
+                  "its log curve -> the ARRI LogC3 show LUT -> the per-camera match (white balance, exposure, saturation).",
+                  "A. Simplest: select all clips of one camera in the sequence (the markers say which), Lumetri Color > Basic",
+                  "   Correction > Input LUT > Browse... the camera's file below. Do NOT also put the ARRI LUT on an adjustment",
+                  "   layer for these clips (it is already inside). Use adjustment layers only for your own creative grade.",
+                  "B. Or keep the ARRI LUT on an adjustment layer: give each non-ARRI clip the <camera>_to_LogC3.cube Input LUT",
+                  "   (the curve and gamut only; the match is then not included, so re-balance by eye)."]
+        for x in cl:
+            how = {"identity": "hero camera", "math": "published log curve + gamut maths", "lut": "manufacturer LUT",
+                   "display": "Rec.709 camera (match only)"}.get(x.get("input"), x.get("input"))
+            lines.append(f"  luts/{Path(x['file']).name:<40} {len(x['clips'])} clip(s) · {x.get('profile')} "
+                         f"({x.get('profile_src') or '?'}) · {how}" + (" · matched" if x.get("match") else ""))
+            if x.get("logc3_file"):
+                lines.append(f"  luts/{Path(x['logc3_file']).name:<40} option B for the same clips")
+        lines.append("  Profiles marked (assumed) were estimated from the picture: check them (cutroom cameras).")
     lines += ["", "TRACKS",
               "V1  main picture, every cut at the exact cutroom frame (talk tightening = many short clips on purpose)",
               "V2  cutaways / b-roll covering the talk",
@@ -1238,6 +1256,52 @@ def readme(model, out_files, fmts) -> str:
     if model.get("warnings"):
         lines += ["", "WARNINGS"] + [f"- {w}" for w in model["warnings"]]
     return "\n".join(lines) + "\n"
+
+
+# ============================================================================================ camera LUTs
+def camera_luts(cfg, con, model, plan_path, dest, echo=print) -> list:
+    """Per-camera Lumetri Input LUTs for every clip on the picture tracks (cameras.export_luts), a CSV mapping each clip
+    to its LUT, and a sequence marker on each clip naming the LUT to load."""
+    from . import cameras as CAM
+    try:
+        plan = json.loads(Path(plan_path).read_text())
+    except (OSError, ValueError):
+        plan = {}
+    ids = sorted({it["clip"] for it in model["items"] if it.get("clip") and it["track"] in ("V1", "V2")})
+    if not ids:
+        return []
+    try:
+        out = CAM.export_luts(cfg, con, dest / "luts", clip_ids=ids, style=plan.get("style") or {})
+    except Exception as e:  # noqa: BLE001 - the timeline is still useful without them
+        model["warnings"].append(f"camera LUTs not written ({type(e).__name__}: {e})")
+        return []
+    by_clip = {c: x for x in out for c in x["clips"]}
+    rows = ["clip_file,camera,profile,profile_source,input_lut"]
+    for cid in ids:
+        x = by_clip.get(cid)
+        fi = model["files"].get(cid) or {}
+        cam = CAM.get(con, cid) or {}
+        rows.append(",".join(str(v).replace(",", " ") for v in (Path(fi.get("path", cid)).name, cam.get("cam_key", ""),
+                                                                cam.get("log_profile", ""), cam.get("profile_src", ""),
+                                                                f"luts/{Path(x['file']).name}" if x else "")))
+    (dest / "luts").mkdir(parents=True, exist_ok=True)
+    (dest / "luts" / "clips.csv").write_text("\n".join(rows) + "\n")
+    seen = set()
+    for it in model["items"]:
+        x = by_clip.get(it.get("clip"))
+        if x and it["track"] in ("V1", "V2") and (it["clip"], it["track"]) not in seen:
+            seen.add((it["clip"], it["track"]))
+            model["markers"].append({"frame": it["start"], "name": f"Input LUT {x['cam_key']}",
+                                     "comment": f"Lumetri > Basic Correction > Input LUT: luts/{Path(x['file']).name}"})
+    if out:
+        for m in model["markers"]:
+            if m["name"] == "GRADE":
+                m["comment"] = ("Colour-managed: each clip gets its camera's Input LUT from luts/ (markers below, README "
+                                "'CAMERAS AND COLOUR'); adjustment layers for the creative grade only")
+    model["markers"].sort(key=lambda m: m["frame"])
+    if out:
+        echo(f"export-nle: {len(out)} camera input LUT(s) in {dest / 'luts'}")
+    return out
 
 
 # ============================================================================================ export
@@ -1291,6 +1355,7 @@ def export(cfg, con, plan_path, fmts=("premiere",), out=None, render=None, clean
                 model["markers"].append({"frame": s["start"], "end": s["end"], "name": "RENDER IN CUTROOM",
                                          "comment": f"{', '.join(s['why'])}: not rebuilt here"})
         model["markers"].sort(key=lambda m: m["frame"])
+    model["camera_luts"] = camera_luts(cfg, con, model, plan_path, dest, echo=echo)
     written = []
     if "premiere" in fmts:
         written.append(write_xmeml(model, dest / f"{model['name']}.xml"))
@@ -1309,7 +1374,8 @@ def export(cfg, con, plan_path, fmts=("premiere",), out=None, render=None, clean
                 written.append(p)
     if model["captions"]:
         written.append(EX.write_srt(model["captions"], dest / "captions.srt"))
-    files = written + [Path(m["path"]) for m in model["graphics_media"] + model["fx_media"]]
+    files = written + [Path(m["path"]) for m in model["graphics_media"] + model["fx_media"]] + \
+        [Path(x["file"]) for x in model["camera_luts"]] + [Path(x["logc3_file"]) for x in model["camera_luts"] if x.get("logc3_file")]
     rd = dest / "README_PREMIERE.txt"
     rd.write_text(readme(model, files, fmts))
     written.append(rd)

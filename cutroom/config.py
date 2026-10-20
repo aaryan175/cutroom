@@ -23,7 +23,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 CONFIG_NAME = "cutroom.json"
-VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".mxf", ".avi", ".mts", ".m2ts", ".insv", ".lrv", ".webm"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".mxf", ".avi", ".mts", ".m2ts", ".insv", ".lrv", ".webm",
+              ".braw"}                      # .braw: registered, decoded through a stand-in (cameras.py)
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg"}
 
 SUBDIRS = ["proxies", "sheets", "frames", "transcripts", "voice", "cache", "plans", "renders", "notes", "music", "luts", "fonts"]
@@ -100,6 +101,8 @@ class Config:
     # -- multicam / dual-system audio sync (sync.py, docs/NLE_AND_MULTICAM.md)
     sync_window_s: float = 300.0                           # clips whose capture times overlap within this slack are
                                                            # tried against each other (camera clocks drift)
+    sync_lonely_window_s: float = 1800.0                   # a camera that matched nothing is tried against clips within
+                                                           # this much clock slack (a clock minutes off); audio decides
     sync_tz_slop: bool = True                              # also try whole-hour clock offsets (a device left on UTC
                                                            # or home time); the audio still has to agree
     sync_min_conf: float = 0.25                            # audio match acceptance: normalised correlation peak

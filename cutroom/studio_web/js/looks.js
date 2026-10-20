@@ -122,6 +122,7 @@ let loading = false;
 let pick = null;            // {name, intensity} selected in the gallery
 let split = LS.get('lk.split', 0.5);
 let match = null;           // result of /api/looks/match
+let camMatch = null;        // result of /api/cameras/match (camera transform + match to the hero camera)
 let refs = null;
 let reqSeq = 0;
 
@@ -139,6 +140,8 @@ async function loadFrame(force = false) {
     const r = await jget(`/api/looks/sheet?plan=${enc(S.plan.slug)}&t=${t.toFixed(3)}`);
     if (my !== reqSeq) return;
     frame = { ...r, plan: S.plan.slug, t };
+    camMatch = null;
+    jget(`/api/cameras/match?plan=${enc(S.plan.slug)}&t=${t.toFixed(3)}`).then((m) => { if (my === reqSeq) { camMatch = m; draw(); } }).catch(() => {});
   } catch (e) {
     if (my !== reqSeq) return;
     frameErr = e.message;
@@ -194,6 +197,20 @@ function gallery() {
   return g;
 }
 
+function camBlock() {
+  const m = camMatch;
+  if (!m || !m.available) return null;
+  const mm = m.match;
+  const line = mm ? (mm.disabled ? `Match left off: ${mm.why || ''}` :
+    `Matched to the ARRI${mm.day ? ` (${mm.day})` : ''}: ΔE ${mm.de_before} → ${mm.de_after} · exposure ${mm.exposure_stops >= 0 ? '+' : ''}${mm.exposure_stops} st · sat ×${mm.sat}`)
+    : 'No match fitted for this camera yet (cutroom cameras match)';
+  return h('div.lk-cam',
+    h('div', h('b', m.camera), ` · ${m.profile || 'unknown profile'}${m.profile_src === 'assumed' ? ' (assumed)' : ''}`),
+    h('div.s', line),
+    h('div.lk-cam-pair', h('div', h('img', { src: m.before_url, alt: '' }), h('div.s', 'Camera transform')),
+      h('div', h('img', { src: m.after_url, alt: '' }), h('div.s', '+ match to ARRI'))));
+}
+
 function side() {
   const lk = pick || planLook() || { name: 'natural', intensity: 1 };
   const c = CAT.find((x) => x.name === lk.name) || {};
@@ -216,7 +233,7 @@ function side() {
       h('div', h('span', 'Whole edit'), h('b', lookText(whole))),
       h('div', h('span', 'This segment'), h('b', segLk ? lookText(segLk) : sg ? 'Same as whole edit' : '–'),
         segLk ? h('button.cm-x.lk-clear', { title: 'Follow the whole edit again', html: ico('x', 10), on: { click: () => applySeg(sg.key, null) } }) : null)),
-    matchBox());
+    matchBox(), camBlock());
   return s;
 }
 

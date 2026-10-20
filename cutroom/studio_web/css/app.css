@@ -719,3 +719,14 @@ input, textarea, select, [contenteditable="true"], pre, code, .fx-log, .fx-ledge
 .mc-angles { display: flex; flex-wrap: wrap; gap: 4px; }
 .mc-angles button { font-size: 11px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line, #333); background: transparent; color: var(--text-2); cursor: pointer; }
 .mc-angles button.on { background: rgba(70, 120, 255, .85); border-color: transparent; color: #fff; }
+
+/* camera badge (cameras.py): ARRI LogC3 / Fuji F-Log2 ...; "?" = profile assumed from the picture */
+.cell .flags span.cam { background: rgba(20, 150, 110, .85); color: #fff; font-size: 9.5px; font-weight: 600; cursor: pointer; }
+.cell .flags span.cam.assumed { background: rgba(190, 130, 20, .88); }
+.cell .flags span.cam.raw { box-shadow: 0 0 0 1px rgba(255, 90, 90, .9); }
+.cam-pop { position: absolute; left: 4px; bottom: 26px; z-index: 30; display: grid; gap: 4px; min-width: 210px; }
+.cam-pop label { font-size: 11px; color: var(--text-3); }
+.lk-cam { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line, #333); font-size: 12px; }
+.lk-cam .lk-cam-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 6px; }
+.lk-cam img { width: 100%; border-radius: 4px; display: block; }
+.lk-cam .s { color: var(--text-3); font-size: 11px; }

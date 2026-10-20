@@ -218,6 +218,30 @@ def test_thumbnails_end_to_end(tmp_path, fast_gov, monkeypatch):
     assert all(Path(o["file"]).stat().st_size > 1000 for o in out)
 
 
+def test_reframe_faces_use_yunet_with_haar_fallback(monkeypatch):
+    """The 9:16 reframe's face track runs on vision.py's YuNet detector (grey frames are fed as BGR); the
+    multi-cascade Haar detector runs only when YuNet is unavailable or fails."""
+    from cutroom import vision
+    gray = np.zeros((90, 160), np.uint8)
+    seen = {}
+
+    class Det:
+        backend = "yunet"
+
+    def fake_detect(bgr, backend="auto"):
+        seen["shape"] = bgr.shape
+        return [{"box": [0.4, 0.2, 0.1, 0.2], "score": 0.9, "kp": None}]
+    monkeypatch.setattr(vision, "face_detector", lambda backend="auto": Det())
+    monkeypatch.setattr(vision, "detect_faces", fake_detect)
+    monkeypatch.setattr(export, "detect_faces_haar", lambda g: [("haar",)])
+    assert export.detect_faces(gray) == [(0.4, 0.2, 0.1, 0.2)] and seen["shape"] == (90, 160, 3)
+    Det.backend = "haar"                                       # no model (offline, CUTROOM_FACES=haar)
+    assert export.detect_faces(gray) == [("haar",)]
+    Det.backend = "yunet"
+    monkeypatch.setattr(vision, "detect_faces", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bad model")))
+    assert export.detect_faces(gray) == [("haar",)]
+
+
 # ================================================================================================ cutdowns
 
 LINES = [(0.2, 1.8, "we drove three hundred miles today."), (2.2, 3.6, "the view was insane."),
@@ -287,6 +311,58 @@ def test_cutdown_plan_is_valid_and_fits(copied_project):
         # story order: picked lines appear in source order
         keyed = [(0 if s["clip"] == ids["steady"] else 1, s["in"]) for s in talks]
         assert keyed == sorted(keyed)
+
+
+def test_cutdown_keeps_a_cold_open_that_points_at_sections(copied_project):
+    """Regression: a plan whose cold_open lines are {"from": "<section>/<seg>"} used to fail every cutdown
+    ("cold_open line 0: from 'day/0' names no section"): the cutdown rebuilds the sections (hook + "story")
+    but copied cold_open verbatim. The teaser lines are now resolved against the full plan into the same
+    concrete clip/in/out, the auto shot pool is frozen to the full edit's b-roll, the duration accounting
+    includes the teaser, and a teaser that would eat over half the cut is dropped."""
+    from cutroom import plan as P, render
+    cfg, con, ids = copied_project
+    _write_transcript(cfg, con, ids["steady"], LINES)
+    _write_transcript(cfg, con, ids["vertical"], [(0.2, 1.6, "first time here."), (2.0, 3.6, "and that is the end.")])
+
+    def plan_with(co_dur):
+        return {"title": "Road trip", "version": 3, "style": {"captions": {"enabled": True}},
+                "cold_open": {"style": "teaser", "dur": co_dur, "lines": [{"from": "day/0"}, "end/0"], "shots": "auto"},
+                "sections": [
+                    {"name": "intro", "segments": [
+                        {"type": "montage", "beat_sync": False, "max_shot": 1.0, "shots": [
+                            {"clip": ids["scenes"], "in": 0.5}, {"clip": ids["shaky"], "in": 1.0},
+                            {"clip": ids["dark"], "in": 1.0}, {"clip": ids["scenes"], "in": 4.0}]},
+                        {"type": "title", "text": "Road trip", "dur": 2.0}]},
+                    {"name": "day", "segments": [{"type": "talk", "clip": ids["steady"], "in": 0.0, "out": 8.0}]},
+                    {"name": "end", "segments": [{"type": "talk", "clip": ids["vertical"], "in": 0.0, "out": 4.0},
+                                                 {"type": "black", "dur": 1.0}]}]}
+    plan = plan_with(4)
+    pp = cfg.p("plans", "roadtrip_v3.json")
+    pp.write_text(json.dumps(plan))
+    full = render.resolve_timeline(cfg, con, plan)
+    assert not [w for w in full["warnings"] if "cold_open" in w], full["warnings"]
+    full_lines = [(p["clip"], p["in"], p["out"]) for p in full["pieces"]
+                  if p["sec"] == -1 and p["type"] == "talk" and p.get("track", "V1") == "V1"]
+    assert full_lines
+
+    out = export.build_cutdown(cfg, con, pp, 15, echo=None)
+    cut = json.loads(out.read_text())
+    assert P.validate(P.normalize(cut, cfg), con) == []
+    co = cut["cold_open"]
+    assert len(co["lines"]) == 2 and all("from" not in ln and ln["clip"] and ln["out"] > ln["in"] for ln in co["lines"])
+    assert isinstance(co["shots"], list) and co["shots"]                      # frozen to the full edit's pool
+    tl = render.resolve_timeline(cfg, con, cut)
+    assert not [w for w in tl["warnings"] if "cold_open" in w], tl["warnings"]
+    teaser = [(p["clip"], p["in"], p["out"]) for p in tl["pieces"]
+              if p["sec"] == -1 and p["type"] == "talk" and p.get("track", "V1") == "V1"]
+    assert teaser == full_lines                                               # the same teaser lines as the full edit
+    assert abs(tl["duration"] - 15) <= 0.1 * 15, tl["duration"]               # counted in the length
+
+    # a teaser that would take over half of a short cut is dropped, not left dangling
+    pp2 = cfg.p("plans", "roadtrip_v4.json")
+    pp2.write_text(json.dumps(plan_with(8)))
+    cut2 = json.loads(export.build_cutdown(cfg, con, pp2, 10, echo=None).read_text())
+    assert "cold_open" not in cut2 and P.validate(P.normalize(cut2, cfg), con) == []
 
 
 # ================================================================================================ dedupe

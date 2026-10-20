@@ -370,9 +370,58 @@ def test_tagging_skipped_when_codex_not_logged_in(tmp_path, monkeypatch):
     assert pipe.agent_missing() == "codex not logged in"
 
 
+def _waiting_labels(gov, kind="heavy"):
+    out = set()
+    for f in gov._p("waiting", "x").parent.glob(f"{kind}.*.json"):
+        try:
+            out.add(json.loads(f.read_text()).get("label"))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def _until(cond, timeout=10.0, what="condition"):
+    """Wait for a condition (a synchronisation point, not a guess at timing); fail loudly on timeout."""
+    end = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < end, f"timed out waiting for {what}"
+        time.sleep(0.005)
+
+
+def test_slot_is_fifo_between_threads_of_one_process(tmp_path, monkeypatch):
+    """A thread that has been waiting for a slot is never overtaken by one that started waiting later
+    (in-process waiters used to race for a freed slot, so queued work could start out of order)."""
+    monkeypatch.setenv("CUTROOM_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setenv("CUTROOM_MIN_FREE_RAM_GB", "0.01")
+    cfg = init_project(tmp_path / "work", [])
+    cfg.heavy_slots, cfg.max_load, cfg.min_free_disk_gb = 1, 1000.0, 0.0
+    cfg.save()
+    gov = governor.Governor(cfg)
+    gov.poll_s = 0.01
+    order, lock = [], threading.Lock()
+
+    def take(label):
+        with gov.slot("heavy", label=label):
+            with lock:
+                order.append(label)
+
+    labels = [f"w{i}" for i in range(4)]
+    threads = []
+    with gov.slot("heavy", label="holder"):
+        for lab in labels:                          # each one provably queued before the next arrives
+            t = threading.Thread(target=take, args=(lab,))
+            t.start()
+            threads.append(t)
+            _until(lambda: lab in _waiting_labels(gov), what=f"{lab} to queue")
+    for t in threads:
+        t.join(10)
+    assert order == labels, order
+
+
 def test_stop_takes_effect_between_items_even_for_queued_work(tmp_path, monkeypatch):
     """`overnight --stop` (the STOP file): items queued for a governor slot must not start afterwards;
-    only the one already running finishes."""
+    only the one already running finishes. Synchronised on events and the governor's own waiter files:
+    c0 holds the only heavy slot, the other in-flight items are provably queued for it, then STOP lands."""
     import threading
     monkeypatch.setenv("CUTROOM_LOCK_DIR", str(tmp_path / "locks"))
     monkeypatch.setenv("CUTROOM_MIN_FREE_RAM_GB", "0.01")
@@ -380,22 +429,29 @@ def test_stop_takes_effect_between_items_even_for_queued_work(tmp_path, monkeypa
     cfg.heavy_slots, cfg.max_load, cfg.min_free_disk_gb = 1, 1000.0, 0.0
     cfg.save()
     pipe = overnight.Pipeline(cfg, {"run_id": "t"}, echo=False)
-    pipe.gov.poll_s = 0.05
+    pipe.gov.poll_s = 0.01
     pipe.gov.abort_check = pipe.stop_reason
     started, lock = [], threading.Lock()
+    c0_in = threading.Event()
+    workers = 3
 
     def fn(r):
+        if r["id"] != "c0":
+            assert c0_in.wait(10), "c0 never took the slot"
         with pipe.gov.slot("heavy", label=r["id"]):
             with lock:
                 started.append(r["id"])
             if r["id"] == "c0":
-                (pipe.dir / "STOP").touch()          # the user stops the night while c0 encodes
-                time.sleep(0.6)
+                c0_in.set()
+                # the user stops the night while c0 encodes, once the other in-flight items wait for the slot
+                _until(lambda: _waiting_labels(pipe.gov) >= {f"c{i}" for i in range(1, workers)},
+                       what="the queued items to wait for the slot")
+                (pipe.dir / "STOP").touch()
         return r["id"]
     rows = [{"id": f"c{i}", "duration": 1.0, "rel": f"c{i}"} for i in range(5)]
     pipe.stage_begin("proxies", total=len(rows))
     with pytest.raises(overnight.Stopped):
-        pipe.run_items("proxies", rows, fn, lambda r, res: None, lambda r, e: None, workers=3)
+        pipe.run_items("proxies", rows, fn, lambda r, res: None, lambda r, e: None, workers=workers)
     pipe.gov.abort_check = None
     assert started == ["c0"], started
     assert pipe.stage_mem["proxies"]["done"] == 1 and not pipe.stage_mem["proxies"].get("errors")

@@ -279,7 +279,9 @@ def probe_all(cfg, con, limit=None, ids=None):
 # Same colour pipe as render.grade_chain: decode with an explicit BT.709 matrix into float RGB, apply the
 # LUT there, then convert back to BT.709 limited-range 4:2:0. Without in_color_matrix swscale assumes
 # BT.601 for the YUV->RGB step the LUT needs, which shifts hues (greens/skin) in every graded proxy.
-PROXY_LUT_TAIL = "colorspace=ispace=gbr:iprimaries=bt709:itrc=bt709:irange=pc:all=bt709:range=tv:format=yuv420p:dither=fsb"
+# threads=1: the colorspace filter's Floyd-Steinberg dither is not deterministic with slice threads (render.HOUSE_TAIL)
+PROXY_LUT_TAIL = ("colorspace=ispace=gbr:iprimaries=bt709:itrc=bt709:irange=pc:all=bt709:range=tv:format=yuv420p"
+                  ":dither=fsb:threads=1")
 PROXY_709_TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
 
 

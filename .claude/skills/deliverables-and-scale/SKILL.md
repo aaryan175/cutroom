@@ -37,7 +37,9 @@ description: Use when an approved edit has to go out to platforms (YouTube, Reel
 - `cutroom cutdown plans/<slug>_vN.json --len 30` writes `plans/<slug>_cut30.json`. It keeps the hook
   (the cold open), takes the strongest lines (numbers, superlatives and stakes words, highlight score, a
   clean 1–8 s length) in story order, and ends on the last line (the payoff). The length lands within
-  10 % of the target.
+  10 % of the target. A plan-level `cold_open` comes along with its teaser lines pinned to the same
+  clip/in/out as the full edit (`from: "<section>/<seg>"` references are resolved, since the cut renames the
+  sections) and its auto shots frozen; it is dropped when it would take over half the cut.
 - **It is a draft.** Read it like any plan:
   - Does the story still make sense without the cut lines?
   - Is there a line that needs its set-up?

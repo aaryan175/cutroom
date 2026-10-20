@@ -7,10 +7,11 @@
 What it makes, in renders/exports/<render stem>/:
   <stem>_<preset>.mp4      platform presets: resolution, frame rate, bitrate/CRF, max duration, loudness
                            target (two-pass loudnorm, verified with ebur128) and caption safe areas
-  9:16 / 4:5 / 1:1         auto-reframed from the 16:9 render: faces are detected on every sampled frame,
-                           each shot (from the render sidecar) gets its own smoothed crop path, a static
-                           crop when the subject barely moves, and the crop is clamped so a detected head
-                           is never cut. Shots with no face follow the picture's saliency, else the centre.
+  9:16 / 4:5 / 1:1         auto-reframed from the 16:9 render: faces are detected (YuNet; Haar cascades when
+                           YuNet is unavailable) on every sampled frame, each shot (from the render sidecar)
+                           gets its own smoothed crop path, a static crop when the subject barely moves, and
+                           the crop is clamped so a detected head is never cut. Shots with no face follow
+                           the picture's saliency, else the centre.
                            Title cards and shots carrying an overlay are letterboxed over a blurred copy.
                            Burned-in captions would be cut by the crop, so a caption-free "clean feed" of
                            the plan is rendered once (cached pieces make this cheap) and the captions are
@@ -24,7 +25,9 @@ What it makes, in renders/exports/<render stem>/:
 Cutdowns (`--cutdown 30`): a new plan `<slug>_cut30.json` keeps the hook (the opening of the first
 section), picks the strongest lines (transcript stakes words + highlight score + length) in story order and
 ends on the payoff (the last line), fitted to the length within 10 % using the renderer's own timeline
-resolution; then it is rendered and exported like any other edit.
+resolution; then it is rendered and exported like any other edit. A plan-level cold_open is kept with its
+teaser lines resolved to the full edit's clip/in/out (the cut renames the sections its `from` refs name) and
+its auto shot pool frozen; it is dropped when it would take over half the cut.
 """
 import hashlib
 import json
@@ -254,9 +257,27 @@ def _cascade(name):
     return _CASCADES[name]
 
 
-def detect_faces(gray) -> list:
-    """Faces as (x, y, w, h) fractions of the frame: frontal + profile (both directions) Haar cascades on an
-    equalised greyscale frame, overlapping boxes merged. Tests replace this with a synthetic detector."""
+def detect_faces(img) -> list:
+    """Faces as (x, y, w, h) fractions of the frame (greyscale or BGR): the YuNet DNN detector in vision.py
+    (side-on, small and partly covered faces, few false positives in caption bands). When YuNet is not
+    available (offline with no cached model, CUTROOM_FACES=haar, or a failing model) the Haar cascades below
+    run instead. Tests replace this with a synthetic detector."""
+    import cv2
+    try:
+        from . import vision
+        det = vision.face_detector()
+        if det.backend == "yunet":
+            bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img
+            return [tuple(f["box"]) for f in vision.detect_faces(bgr)]
+    except Exception:  # noqa: BLE001 - never fail an export on the face model: use the cascades
+        pass
+    gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return detect_faces_haar(gray)
+
+
+def detect_faces_haar(gray) -> list:
+    """Frontal + profile (both directions) Haar cascades on an equalised greyscale frame, overlapping boxes
+    merged: the fallback when YuNet is unavailable."""
     import cv2
     h, w = gray.shape[:2]
     eqd = cv2.equalizeHist(gray)
@@ -1118,9 +1139,69 @@ def _has_table(con, name):
     return bool(con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
 
 
-def _plan_duration(cfg, con, plan) -> float:
+def _resolve(cfg, con, plan) -> dict:
     from . import render
-    return float(render.resolve_timeline(cfg, con, plan, preview=True)["duration"])
+    return render.resolve_timeline(cfg, con, plan, preview=True)
+
+
+def _plan_duration(cfg, con, plan) -> float:
+    return float(_resolve(cfg, con, plan)["duration"])
+
+
+def _cutdown_cold_open(cfg, con, plan, echo=None) -> dict | None:
+    """The plan's cold_open made independent of the full edit's sections, for a cutdown whose sections are
+    rebuilt (the hook + "story"): every `{"from": "<section>/<seg>"}` line is resolved against the FULL plan
+    into the same concrete {clip, in, out, text} the full edit uses, and `shots: "auto"` is frozen to the full
+    edit's b-roll pool. A line that cannot be resolved (or is not a 0.3-6 s line) is dropped; with no line left
+    the cold open is dropped. Returns the rewritten cold_open, or None."""
+    from . import plan as P, render
+    co = json.loads(json.dumps(plan.get("cold_open") or {}))
+    if not co:
+        return None
+    try:
+        full = P.normalize(plan, cfg)
+        ctx = render._ResolveCtx(cfg, con, full, True)
+    except Exception as e:  # noqa: BLE001
+        _log(echo, f"cutdown: dropping the cold open (the full plan does not resolve: {e})")
+        return None
+    raw = co.get("lines") or []
+    lines, resolved = [], []
+    for k, ln in enumerate(raw if isinstance(raw, list) else []):
+        if isinstance(ln, str):
+            ln = {"from": ln}
+        if not isinstance(ln, dict):
+            continue
+        try:
+            row, a, b, text = render._resolve_line(ctx, full, ln)
+        except Exception as e:  # noqa: BLE001
+            _log(echo, f"cutdown: cold open line {k} dropped ({e})")
+            continue
+        if ln.get("from") is None:
+            lines.append(ln)
+        elif 0.3 <= b - a <= 6:
+            lines.append({"clip": row["id"], "in": round(a, 3), "out": round(b, 3),
+                          "text": text or ln.get("text", "")})
+        else:
+            _log(echo, f"cutdown: cold open line {k} dropped ({ln['from']!r} resolves to {b - a:.1f}s, "
+                       "not a teaser line)")
+            continue
+        resolved.append((row, a, b, text))
+    if raw and not lines:
+        _log(echo, "cutdown: dropping the cold open (none of its lines survive the cut)")
+        return None
+    co["lines"] = lines
+    if not (co.get("music") or {}).get("song"):      # the teaser's music falls back to the FULL edit's first song
+        src = next((s.get("music") for s in full.get("sections", []) if (s.get("music") or {}).get("song")), None)
+        if src:
+            co["music"] = {**(co.get("music") or {}), "song": src["song"], "offset": float(src.get("offset", 0.0))}
+    if co.get("shots", "auto") == "auto":
+        try:
+            pco = {**co, "end_shot": {"auto": True}} if co.get("end_shot") == "auto" else co
+            pool = render._ShotPool(ctx, full, pco, resolved)
+            co["shots"] = [{"clip": p["row"]["id"], "in": round(float(p["next"]), 3)} for p in pool.pool]
+        except Exception as e:  # noqa: BLE001 - keep "auto": it may still find b-roll in the cut's own sections
+            _log(echo, f"cutdown: cold open shots stay auto ({e})")
+    return co
 
 
 def _trim_seg(seg, budget):
@@ -1155,11 +1236,24 @@ def build_cutdown(cfg, con, plan_path, length, echo=print) -> Path:
     first = secs[0]
     meta = {k: v for k, v in first.items() if k != "segments"}
     hook_budget = max(3.0, min(0.3 * L, 12.0))
+    co = _cutdown_cold_open(cfg, con, plan, echo) if plan.get("cold_open") else None
 
-    def make(sections, note):
-        p = {k: v for k, v in plan.items() if k not in ("sections", "cutdown", "note")}
+    def make(sections, note, cold_open=True):
+        p = {k: v for k, v in plan.items() if k not in ("sections", "cutdown", "note", "cold_open")}
+        if co and cold_open:
+            p["cold_open"] = co
         p.update(title=f"{plan.get('title', 'untitled')} ({int(L)} s cut)", version=1, sections=sections, note=note)
         return p
+
+    if co:                                          # the teaser must build on its own and leave room for the cut
+        probe = [{**meta, "segments": [{"type": "black", "dur": 0.5}]}]
+        tl = _resolve(cfg, con, make(probe, ""))
+        bad = [w for w in tl["warnings"] if str(w).startswith("cold_open")]
+        co_s = float(tl["duration"]) - _plan_duration(cfg, con, make(probe, "", cold_open=False))
+        if bad or co_s > 0.5 * L:
+            why = bad[0] if bad else f"{co_s:.1f}s is over half of {L:.0f}s"
+            _log(echo, f"cutdown: dropping the cold open ({why})")
+            co = None
 
     # the hook: the opening of the first section up to its first talk segment (the cold open)
     hook_segs = []

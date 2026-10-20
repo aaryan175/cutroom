@@ -66,7 +66,11 @@ _SRC_FILES = ("render.py", "captions.py", "overlays.py", "media.py", "cards.py",
 CODE_VERSION = hashlib.sha1(b"".join(Path(__file__).with_name(f).read_bytes() for f in _SRC_FILES
                                      if Path(__file__).with_name(f).exists())).hexdigest()[:12]
 
-HOUSE_TAIL = "colorspace=ispace=gbr:iprimaries=bt709:itrc=bt709:irange=pc:all=bt709:range=tv:format=yuv420p:dither=fsb"
+# The Floyd-Steinberg dither of ffmpeg's colorspace filter is NOT deterministic with slice threads (the error
+# diffusion races across slice boundaries: the same command gave a different picture each run, up to ~8 code
+# values near some rows). One thread for this one filter keeps every render frame-identical and cacheable.
+HOUSE_TAIL = ("colorspace=ispace=gbr:iprimaries=bt709:itrc=bt709:irange=pc:all=bt709:range=tv:format=yuv420p:dither=fsb"
+              ":threads=1")
 GENERIC_LOG = "format=gbrp,curves=all='0.09/0 0.25/0.13 0.41/0.4 0.6/0.68 0.8/0.9 1/1',format=yuv420p,eq=saturation=1.35"
 LUMA_TARGET, LUMA_DEADBAND, EQ_BOUND = 118.0, 10.0, 0.08
 SLOG_STOP = 0.075                        # S-Log3 code-value offset per stop of exposure (log domain, pre-LUT)

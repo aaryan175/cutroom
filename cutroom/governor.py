@@ -293,6 +293,13 @@ class RunResult(subprocess.CompletedProcess):
     peak_gb = 0.0
 
 
+
+def _write_atomic(path: Path, text: str):
+    """Write a small state file so readers never see it half written (temp file + rename)."""
+    tmp = path.with_name(f".{path.name}.{threading.get_ident()}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
 class Governor:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -446,8 +453,13 @@ class Governor:
     def _waiter_file(self, kind) -> Path:
         return self._p("waiting", f"{kind}.{os.getpid()}.{threading.get_ident()}.json")
 
-    def _first_in_line(self, kind, me: Path, since: float) -> bool:
-        """FIFO between processes: a waiter that started earlier (and is alive) goes first."""
+    def _first_in_line(self, kind, me: Path, since: float, seq: int | None = None) -> bool:
+        """FIFO: a waiter that started earlier (and is alive) goes first. Between processes by `since`;
+        between threads of this process by arrival order (`seq`), so a thread that has been waiting is never
+        overtaken by work queued after it (a thread polls every poll_s; without this a newly arrived
+        thread could take a freed slot first, again and again)."""
+        mine = os.getpid()
+        live = None
         for f in me.parent.glob(f"{kind}.*.json"):
             if f == me:
                 continue
@@ -458,8 +470,18 @@ class Governor:
             if not pid_alive(d.get("pid")):
                 f.unlink(missing_ok=True)
                 continue
-            if d.get("pid") != os.getpid() and d.get("since", 1e18) < since:
-                return False
+            if d.get("pid") != mine:
+                if d.get("since", 1e18) < since:
+                    return False
+                continue
+            if seq is None or d.get("seq") is None or d["seq"] >= seq:
+                continue
+            if live is None:
+                live = {t.ident for t in threading.enumerate()}
+            if d.get("tid") not in live:                 # a stale file of a thread that is gone
+                f.unlink(missing_ok=True)
+                continue
+            return False
         return True
 
     def _try_acquire(self, kind) -> int | None:
@@ -529,9 +551,14 @@ class Governor:
             finally:
                 held[kind] = 0
             return
-        since = time.time()
         me = self._waiter_file(kind)
-        me.write_text(json.dumps({"pid": os.getpid(), "kind": kind, "label": label, "since": since}))
+        with self._mx:                               # arrival order = the order the waiter files appear
+            since = time.time()
+            self._arrivals = getattr(self, "_arrivals", 0) + 1
+            seq = self._arrivals
+            info = {"pid": os.getpid(), "tid": threading.get_ident(), "seq": seq, "kind": kind, "label": label,
+                    "since": since}
+            _write_atomic(me, json.dumps(info))
         said, reason, got = 0.0, "", None
         try:
             while True:
@@ -539,7 +566,7 @@ class Governor:
                 if why:
                     raise SlotAborted(f"{kind} slot for {label or 'work'} not taken: {why}")
                 blocks = self.blockers(kind) if self.enabled else []
-                if not blocks and self._first_in_line(kind, me, since):
+                if not blocks and self._first_in_line(kind, me, since, seq):
                     if kind == "light":
                         got = (None, None)
                         break
@@ -558,8 +585,7 @@ class Governor:
                     if time.time() - since > 1:
                         _log(f"waiting for a {kind} slot{' for ' + label if label else ''}: {reason}")
                     said = time.time()
-                me.write_text(json.dumps({"pid": os.getpid(), "kind": kind, "label": label, "since": since,
-                                          "reason": reason}))
+                _write_atomic(me, json.dumps({**info, "reason": reason}))
                 time.sleep(self.poll_s)
         finally:
             me.unlink(missing_ok=True)

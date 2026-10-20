@@ -249,7 +249,10 @@ def test_grade_default_is_lut_only(tmp_path):
     assert tag == "lut" and "lut3d" in s
     assert not any(k in s for k in ("curves=master", "vibrance", "eq=saturation", "colorbalance", "vignette"))
     src = tmp_path / "ramp.mp4"
-    _ff("-f", "lavfi", "-i", "gradients=s=320x180:c0=black:c1=white:x0=0:y0=0:x1=320:y1=0:d=1:r=25", *X264, src)
+    # a fixed left-to-right black->white ramp. Not lavfi `gradients`: an out-of-range point (x1=320 on a
+    # 320-wide frame) is silently replaced by a RANDOM one per run, which made this test flaky.
+    _ff("-f", "lavfi", "-i", "color=c=black:s=320x180:r=25:d=1,format=yuv444p,geq=lum='255*X/(W-1)':cb=128:cr=128",
+        *X264, src)
     p1 = {}
     for k, style in (("lut_only", st), ("finish", P.normalize({"sections": [], "style": {"grade": {
             "finish": {"enabled": True, "vibrance": 0.18}, "saturation": 1.05}}})["style"])):

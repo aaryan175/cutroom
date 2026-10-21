@@ -61,9 +61,19 @@ BUILTIN = [
      "p": {"curves": {"all": [[0, .1], [.5, .55], [1, .97]]},
            "cb": {"rh": .02, "bh": .03, "gm": -.01}, "eq": {"saturation": .85}},
      "css": {"contrast": .84, "saturate": .85, "brightness": 1.07}},
+    # mono = Rec.709 luma written to R = G = B (an RGB channel mix). Not eq=saturation=0: ffmpeg's eq writes
+    # U = V = 127 for that, a measurable green cast (Lab a -3.2, b +2.7 on a neutral chart).
     {"name": "bw", "label": "Black & White", "desc": "Monochrome with a little extra contrast.",
-     "p": {"eq": {"saturation": 0.0, "contrast": 1.1}},
+     "p": {"mono": 1.0, "eq": {"contrast": 1.1}},
      "css": {"saturate": 0.0, "contrast": 1.1}},
+    # generated looks: a 3D LUT built from a measured recipe (GEN_RECIPES below), not shipped data
+    {"name": "bw_contrast", "label": "B&W Contrast", "gen": "bw_contrast", "reference_look": True,
+     "desc": "Neutral low-key black and white: crushed toe, silver highlights that stop at 85 % (no paper white).",
+     "css": {"saturate": 0.0, "contrast": 1.25, "brightness": 0.82}},
+    {"name": "teal_night", "label": "Teal Night", "gen": "teal_night", "reference_look": True, "neutralize": True,
+     "desc": "One cyan tint over every level, a 4/255 cyan black floor, skin pulled toward grey-cyan. "
+             "White balance is neutralised first.",
+     "css": {"saturate": 0.55, "contrast": 1.15, "brightness": 0.8, "hue": 170, "sepia": 0.2}},
     {"name": "vintage_fade", "label": "Vintage Fade", "desc": "Faded, warm, old-print colour.",
      "p": {"curves": {"r": [[0, .08], [.5, .53], [1, .96]], "g": [[0, .06], [.5, .5], [1, .93]],
                       "b": [[0, .12], [.5, .46], [1, .84]]},
@@ -76,6 +86,109 @@ BUILTIN = [
      "css": {"brightness": .82, "contrast": 1.12, "saturate": .8, "hue": 14}},
 ]
 BUILTIN_BY_NAME = {b["name"]: b for b in BUILTIN}
+
+# ------------------------------------------------------------------------------------------------- generated looks
+# Recipes measured on a stylised brand-film reference (cutroom-refs forensic "picture" report): display-referred
+# Rec.709 in -> out. Only the numbers are kept here; the .cube is generated from them on first use and cached by
+# content (cache/luts/gen_<sha>.cube), so nothing third-party is bundled.
+GEN_RECIPES = {
+    # neutral mono (Rec.709 luma -> R=G=B) through a low-key curve: crushed toe, darker mids, white ceiling 0.85
+    "bw_contrast": {"kind": "mono",
+                    "curve": [[0, 0], [0.04, 0.004], [0.10, 0.022], [0.20, 0.068], [0.35, 0.17], [0.50, 0.30],
+                              [0.65, 0.45], [0.80, 0.62], [0.90, 0.73], [1.0, 0.85]]},
+    # one cyan hue at every level: luma curve with a 4/255 floor and a 0.94 ceiling, Lab chroma x0.70 (x0.35 near
+    # the skin/orange axis, Lab hue 60 +- 30 deg), plus a cyan (a, b) tint by OUTPUT L
+    "teal_night": {"kind": "tint",
+                   "curve": [[0, 0.016], [0.05, 0.022], [0.15, 0.045], [0.30, 0.12], [0.50, 0.29], [0.70, 0.52],
+                             [0.85, 0.72], [1.0, 0.94]],
+                   "chroma": 0.70, "skin_chroma": 0.35, "skin_hue": 60.0, "skin_width": 30.0,
+                   "tint": [[0, 0, 0], [10, -3.0, -2.2], [22, -6.8, -3.7], [45, -12.4, -6.5], [70, -16.1, -9.8],
+                            [90, -11.2, -7.6], [100, -4.0, -3.0]]},
+}
+_Y709 = np.array([0.2126, 0.7152, 0.0722])
+_M709 = np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]])
+_WP = _M709 @ np.ones(3)
+
+
+def _lin(c):
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def _enc(c):
+    c = np.clip(c, 0, 1)
+    return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(c, 1 / 2.4) - 0.055)
+
+
+def _lab_f(t):
+    return np.where(t > 0.008856, np.cbrt(t), 7.787 * t + 16 / 116)
+
+
+def _lab_finv(t):
+    return np.where(t > 0.206893, t ** 3, (t - 16 / 116) / 7.787)
+
+
+def rgb_to_lab(rgb):
+    """Display RGB (0-1, sRGB/709 primaries, D65) -> CIE Lab, rows of 3."""
+    xyz = _lin(np.asarray(rgb, np.float64)) @ _M709.T / _WP
+    fx, fy, fz = _lab_f(xyz[:, 0]), _lab_f(xyz[:, 1]), _lab_f(xyz[:, 2])
+    return np.stack([116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)], 1)
+
+
+def lab_to_rgb(lab):
+    fy = (lab[:, 0] + 16) / 116
+    fx, fz = fy + lab[:, 1] / 500, fy - lab[:, 2] / 200
+    xyz = np.stack([_lab_finv(fx), _lab_finv(fy), _lab_finv(fz)], 1) * _WP
+    return _enc(xyz @ np.linalg.inv(_M709).T)
+
+
+def gen_transform(name):
+    """The colour transform of a generated look: f(rgb rows 0-1) -> rgb rows 0-1."""
+    fn = _gen_transform(name)
+
+    def safe(p):
+        with np.errstate(all="ignore"):          # Accelerate's matmul raises spurious FP flags on finite inputs
+            return np.nan_to_num(fn(np.asarray(p, np.float64)), nan=0.0)
+    return safe
+
+
+def _gen_transform(name):
+    r = GEN_RECIPES[name]
+    xs, ys = zip(*r["curve"])
+
+    def curve(x):
+        return np.interp(x, xs, ys)
+    if r["kind"] == "mono":
+        def fn(p):
+            return np.repeat(curve(p @ _Y709)[:, None], 3, 1)
+        return fn
+    Ls = [t[0] for t in r["tint"]]
+
+    def fn(p):
+        lab = rgb_to_lab(p)
+        yo = curve(p @ _Y709)
+        Lo = rgb_to_lab(np.repeat(yo[:, None], 3, 1))[:, 0]
+        ta = np.interp(Lo, Ls, [t[1] for t in r["tint"]])
+        tb = np.interp(Lo, Ls, [t[2] for t in r["tint"]])
+        hue = np.degrees(np.arctan2(lab[:, 2], lab[:, 1]))
+        d = (hue - r["skin_hue"] + 180) % 360 - 180
+        k = r["chroma"] - (r["chroma"] - r["skin_chroma"]) * np.exp(-(d / r["skin_width"]) ** 2)
+        return lab_to_rgb(np.stack([Lo, lab[:, 1] * k + ta, lab[:, 2] * k + tb], 1))
+    return fn
+
+
+def gen_cube_path(cfg, name, size=33):
+    """Content-named generated .cube for a GEN look (cache/luts/gen_<name>_<sha>.cube)."""
+    from .colorsci import Cube
+    import inspect
+    key = _sha([name, GEN_RECIPES[name], size, inspect.getsource(_gen_transform)], 12)    # content: recipe + maths
+    d = Path(cfg.p("cache", "luts"))
+    out = d / f"gen_{name}_{key}.cube"
+    if out.exists() and out.stat().st_size > 0:
+        return out
+    with _LOCK:
+        if not out.exists():
+            Cube.from_function(gen_transform(name), size, f"cutroom {name} (generated from a measured recipe)").write(out)
+    return out
 CB_KEYS = ("rs", "gs", "bs", "rm", "gm", "bm", "rh", "gh", "bh")
 _LOCK = threading.Lock()
 
@@ -122,7 +235,22 @@ def normalize_look(v):
         raise LookError(f"unknown look {name!r} (built-ins: {', '.join(BUILTIN_BY_NAME)}; or lut:<file in luts/>)")
     if name.startswith("lut:") and (not name[4:] or "/" in name[4:] or name[4:].startswith(".")):
         raise LookError("lut looks are lut:<file name in the project's luts/ folder>")
-    return {"name": name, "intensity": round(k, 3)}
+    out = {"name": name, "intensity": round(k, 3)}
+    nz = v.get("neutralize")
+    if nz is not None:
+        if not isinstance(nz, bool):
+            raise LookError("look neutralize must be true or false (white balance to neutral before the look)")
+        out["neutralize"] = nz
+    return out
+
+
+def wants_neutral(lk):
+    """True when a look neutralises white balance before it runs: its own `neutralize`, else the built-in's default."""
+    if not lk:
+        return False
+    if lk.get("neutralize") is not None:
+        return bool(lk["neutralize"])
+    return bool((BUILTIN_BY_NAME.get(lk["name"]) or {}).get("neutralize"))
 
 
 def validate_look(v, where="look"):
@@ -253,6 +381,27 @@ def _lut_for(cfg, name, k):
     return out
 
 
+def _blend_cube(cfg, src, k):
+    """A cube blended with identity at intensity k (content-named, cached)."""
+    h = hashlib.sha1(Path(src).read_bytes()).hexdigest()[:16]
+    kk = round(float(k), 3)
+    out = Path(cfg.p("cache", "luts")) / f"{h}_k{int(round(kk * 1000)):04d}.cube"
+    if out.exists():
+        return out
+    with _LOCK:
+        if not out.exists():
+            size, dmin, dmax, rows = _read_cube(src)
+            ident = _identity(size, dmin, dmax)
+            mix = ident + (rows - ident) * kk
+            lines = [f"LUT_3D_SIZE {size}", "DOMAIN_MIN " + " ".join(f"{v:g}" for v in dmin),
+                     "DOMAIN_MAX " + " ".join(f"{v:g}" for v in dmax)]
+            lines += [f"{a:.6f} {b:.6f} {c:.6f}" for a, b, c in mix]
+            tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
+            tmp.write_text("\n".join(lines) + "\n")
+            os.replace(tmp, out)
+    return out
+
+
 # ------------------------------------------------------------------------------------------------- chains
 _TO_RGB = "scale=in_range=tv:in_color_matrix=bt709:out_range=full,format=gbrp"
 _TO_YUV = "scale=in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p"
@@ -262,22 +411,59 @@ def _pts(points, k):
     return " ".join(f"{x:g}/{x + (y - x) * k:.4f}" for x, y in points)
 
 
-def chain(cfg, look):
-    """ffmpeg filters (list) that apply a look to a yuv420p rec709 picture and return yuv420p. [] = none."""
+def wb_filter(gains):
+    """RGB gains (white balance to neutral) as an RGB-domain channel mixer; '' when ~unity."""
+    if not gains or all(abs(float(g) - 1.0) < 0.004 for g in gains):
+        return ""
+    r, g, b = (float(x) for x in gains)
+    return f"colorchannelmixer=rr={r:.4f}:gg={g:.4f}:bb={b:.4f}"
+
+
+def wb_gains(rgb_mean, limit=(0.7, 1.45)):
+    """Grey-world gains from the mean (R, G, B) of a picture's mid-tones: green kept, red/blue scaled to it,
+    clamped so a scene that IS one colour is not forced grey."""
+    r, g, b = (max(1e-3, float(x)) for x in rgb_mean)
+    lo, hi = limit
+    return [round(min(hi, max(lo, g / r)), 4), 1.0, round(min(hi, max(lo, g / b)), 4)]
+
+
+def _mono_mixer(k):
+    """Rec.709 luma to R = G = B at strength k (0 = untouched, 1 = mono), as a colorchannelmixer."""
+    wr, wg, wb_ = (float(x) for x in _Y709)
+    vals = {}
+    for o, own in (("r", "r"), ("g", "g"), ("b", "b")):
+        for i, w in (("r", wr), ("g", wg), ("b", wb_)):
+            vals[f"{o}{i}"] = (1 - k) * (1.0 if i == own else 0.0) + k * w
+    return "colorchannelmixer=" + ":".join(f"{kk}={v:.5f}" for kk, v in vals.items())
+
+
+def chain(cfg, look, wb=None):
+    """ffmpeg filters (list) that apply a look to a yuv420p rec709 picture and return yuv420p. [] = none.
+    `wb` = RGB gains (wb_gains) applied before the look when the look neutralises white balance
+    (render.prepare measures them per shot)."""
     lk = normalize_look(look)
     if not lk or lk["name"] == "natural" or lk["intensity"] <= 0.001:
         return []
     k = float(lk["intensity"])
     name = lk["name"]
+    pre = wb_filter(wb) if (wb and wants_neutral(lk)) else ""
     if name.startswith("lut:"):
         lut = _lut_for(cfg, name, k)
         return ["scale=in_range=tv:in_color_matrix=bt709:out_range=full,format=gbrpf32le",
-                f"lut3d=file='{lut}':interp=tetrahedral", "format=gbrp16le", _TO_YUV]
+                *([pre] if pre else []), f"lut3d=file='{lut}':interp=tetrahedral", "format=gbrp16le", _TO_YUV]
     b = BUILTIN_BY_NAME.get(name)
     if b is None:
         raise LookError(f"unknown look {name!r}")
+    if b.get("gen"):
+        lut = gen_cube_path(cfg, b["gen"])
+        if k < 0.999:
+            lut = _blend_cube(cfg, lut, k)
+        return ["scale=in_range=tv:in_color_matrix=bt709:out_range=full,format=gbrpf32le",
+                *([pre] if pre else []), f"lut3d=file='{lut}':interp=tetrahedral", "format=gbrp16le", _TO_YUV]
     p = b["p"]
-    f, rgb = [], []
+    f, rgb = [], [pre] if pre else []
+    if p.get("mono"):
+        rgb.append(_mono_mixer(float(p["mono"]) * k))
     if p.get("curves"):
         names = {"all": "master", "r": "red", "g": "green", "b": "blue"}
         rgb.append("curves=" + ":".join(f"{names[ch]}='{_pts(pts, k)}'" for ch, pts in p["curves"].items()))
@@ -322,6 +508,36 @@ def _base_chain(cfg, con, row, plan_style, W, H):
     return f, tag
 
 
+def _frame_wb(cfg, src, t, base, out_dir, st):
+    """Grey-world white-balance gains of one base-graded frame (mid-tones), cached by content."""
+    from . import media
+    key = _sha(["wb1", src, st.st_size, int(st.st_mtime), round(t, 3), base])
+    jp = Path(out_dir) / f"wb_{key}.json"
+    if jp.exists():
+        return json.loads(jp.read_text())
+    raw = Path(out_dir) / f".wb_{key}.{os.getpid()}.raw"
+    try:
+        media.ffmpeg(cfg, ["-ss", f"{t:.3f}", "-i", src, "-frames:v", "1", "-vf",
+                           ",".join(base) + ",scale=160:90,scale=in_range=tv:in_color_matrix=bt709:out_range=full,format=rgb24",
+                           "-f", "rawvideo", "-pix_fmt", "rgb24", str(raw)], timeout=120)
+        a = np.frombuffer(raw.read_bytes(), np.uint8).reshape(-1, 3).astype(np.float64)
+    finally:
+        raw.unlink(missing_ok=True)
+    g = wb_gains(midtone_mean(a))
+    jp.write_text(json.dumps(g))
+    return g
+
+
+def midtone_mean(rgb):
+    """Mean (R, G, B) of the mid-tone pixels (luma 20-90 % of range) of rows of 0-255 RGB; all pixels if too few."""
+    a = np.asarray(rgb, np.float64).reshape(-1, 3)
+    y = a[:, 0] * _Y709[0] + a[:, 1] * _Y709[1] + a[:, 2] * _Y709[2]
+    m = (y > 0.2 * 255) & (y < 0.9 * 255)
+    if m.sum() < 0.05 * len(a):
+        m = np.ones(len(a), bool)
+    return a[m].mean(axis=0).tolist()
+
+
 def frame_size(row, width=480):
     w, h = int(row.get("width") or 16), int(row.get("height") or 9)
     if abs(int(row.get("rotation") or 0)) % 180 == 90:
@@ -347,9 +563,12 @@ def previews(cfg, con, clip, t, looks, plan_style=None, width=480, run=None):
     out_dir = Path(cfg.p("frames", "looks"))
     out_dir.mkdir(parents=True, exist_ok=True)
     items = []
+    wb = None
+    if any(wants_neutral(normalize_look(lk)) for lk in looks if lk):
+        wb = _frame_wb(cfg, src, t, base, out_dir, st)
     for lk in looks:
         lk = normalize_look(lk) or {"name": "natural", "intensity": 1.0}
-        ch = chain(cfg, lk)
+        ch = chain(cfg, lk, wb=wb)
         key = _sha([src, st.st_size, int(st.st_mtime), round(t, 3), base, ch, W])
         items.append((lk, ch, out_dir / f"{row['id']}_{int(round(t * 1000)):08d}_{key}.jpg"))
     todo = [(lk, ch, p) for lk, ch, p in items if not (p.exists() and p.stat().st_size > 0)]
@@ -413,7 +632,7 @@ def is_night_look(name):
     return bool((BUILTIN_BY_NAME.get(name) or {}).get("night"))
 
 
-def match(base_stats, look_stats, target, scene_luma=None):
+def match(base_stats, look_stats, target, scene_luma=None, reference=False):
     """Pick the look and intensity whose result is closest to `target` colour stats.
     look_stats: {name: stats at intensity 1}. Stats move ~linearly with intensity, so each look is a
     line from base (k=0) to its full stats; the best k on that line is found by a fine scan.
@@ -421,21 +640,25 @@ def match(base_stats, look_stats, target, scene_luma=None):
     for daylight footage (`scene_luma`, default the base's own luma, >= NIGHT_SCENE_LUMA), and the
     intensity is capped so the black point stays >= MATCH_MIN_P1 and saturation within +15 % of the
     LUT-only base.
-    Returns {name, intensity, distance, base_distance, ranked: [{name, intensity, distance}]}."""
+    reference=True ("reference look" mode): the reference is itself a deliberate stylised grade (crushed blacks,
+    a night tint on every shot), so the night-on-daylight exclusion and the black-point / saturation caps are
+    off. It is used automatically when the reference's own black point is below MATCH_MIN_P1
+    (`reference_mode(target)`).
+    Returns {name, intensity, distance, base_distance, ranked: [{name, intensity, distance}], mode}."""
     ranked = []
     day = float(scene_luma if scene_luma is not None else base_stats.get("luma", 0)) >= NIGHT_SCENE_LUMA
     for name, st in look_stats.items():
         best = (distance(base_stats, target), 0.0)
-        if day and is_night_look(name):
+        if day and is_night_look(name) and not reference:
             ranked.append({"name": name, "intensity": 0.0, "distance": round(best[0], 3), "excluded": "night look on daylight"})
             continue
         for k in np.linspace(0.2, 1.0, 17):
             s = {key: base_stats[key] + (st[key] - base_stats[key]) * k for key in _W}
-            if "p1" in base_stats and "p1" in st:
+            if "p1" in base_stats and "p1" in st and not reference:
                 p1k = base_stats["p1"] + (st["p1"] - base_stats["p1"]) * k
                 if p1k < min(MATCH_MIN_P1, base_stats["p1"]) - 1e-6:
                     break
-            if s["sat"] > base_stats["sat"] * MATCH_MAX_SAT + 1e-6:
+            if s["sat"] > base_stats["sat"] * MATCH_MAX_SAT + 1e-6 and not reference:
                 break
             d = distance(s, target)
             if d < best[0] - 1e-9:
@@ -446,5 +669,66 @@ def match(base_stats, look_stats, target, scene_luma=None):
     base_d = distance(base_stats, target)
     if top is None or top["distance"] >= base_d - 0.05:
         top = {"name": "natural", "intensity": 1.0, "distance": round(base_d, 3)}
-    return {**top, "base_distance": round(base_d, 3), "ranked": ranked}
+    return {**top, "base_distance": round(base_d, 3), "ranked": ranked, "mode": "reference" if reference else "guarded"}
+
+
+def reference_mode(target, ref_p1=None):
+    """True when the reference's own picture breaks the match guards on purpose: its black point (p1, 0-255) is
+    under MATCH_MIN_P1, i.e. crushed blacks are the look, not a mistake to protect against."""
+    p1 = ref_p1 if ref_p1 is not None else (target or {}).get("p1")
+    return p1 is not None and float(p1) < MATCH_MIN_P1
+
+
+# ------------------------------------------------------------------------------------------------- per-shot reference looks
+MONO_SAT = 10.0          # a reference shot with mean HSV saturation (0-255) under this reads as black and white
+COOL_WARMTH = -1.5       # mean R - B at or under this (0-255) on a coloured shot = a cool / cyan tint
+
+
+def classify_shot(shot):
+    """Look family of one measured reference shot (reference.py shot row: luma, sat, warmth):
+    'black' (nothing to grade), 'mono' (black and white), 'cool' (cyan / teal tint), 'warm' or 'natural'."""
+    luma, sat, warm = (shot.get(k) for k in ("luma", "sat", "warmth"))
+    if luma is not None and float(luma) < 3.0:
+        return "black"
+    if sat is not None and float(sat) < MONO_SAT:
+        return "mono"
+    if warm is not None and float(warm) <= COOL_WARMTH:
+        return "cool"
+    if warm is not None and float(warm) >= 12.0:
+        return "warm"
+    return "natural"
+
+
+FAMILY_LOOK = {"mono": "bw_contrast", "cool": "teal_night", "warm": "teal_night", "natural": None, "black": None}
+
+
+def reference_looks(an):
+    """Per-shot look plan for a measured reference (reference.load_analysis): which built-in look each of its
+    shots maps to, and the share of runtime per family. A stylised reference switches looks BY SHOT, so the
+    rebuild gives each of its segments the look of the reference shot it stands in for.
+    'warm' maps to teal_night too: in a teal-graded film the warm shots are the same grade on tungsten /
+    practical light (amber mids, cyan highlights), not a third grade."""
+    shots = an.get("shots") or []
+    dur = float(shots[-1]["end"] if shots else 0) or 1.0
+    rows, fam_s = [], {}
+    for sh in shots:
+        fam = classify_shot(sh)
+        d = float(sh.get("dur") or (sh["end"] - sh["start"]))
+        fam_s[fam] = fam_s.get(fam, 0.0) + d
+        rows.append({"i": sh.get("i"), "start": sh.get("start"), "end": sh.get("end"), "family": fam,
+                     "sat": sh.get("sat"), "warmth": sh.get("warmth"), "luma": sh.get("luma")})
+    colour = sum(fam_s.get(k, 0.0) for k in ("cool", "warm", "natural"))
+    teal_film = colour > 0 and fam_s.get("cool", 0.0) >= 0.5 * colour     # most coloured time is cyan-tinted
+    for r in rows:
+        r["look"] = ("teal_night" if (teal_film and r["family"] in ("cool", "warm", "natural"))
+                     else FAMILY_LOOK.get(r["family"]) if r["family"] != "natural" else None)
+    shares = {k: round(v / dur, 3) for k, v in sorted(fam_s.items(), key=lambda kv: -kv[1])}
+    ov = (an.get("colour") or {}).get("overall") or {}
+    styl = (fam_s.get("mono", 0.0) + (fam_s.get("cool", 0.0) if teal_film else 0.0)) / dur
+    if ov.get("p1") is not None:
+        rm = reference_mode(ov)
+    else:                       # no black point measured: a dark, mostly stylised (mono / tinted) film counts
+        rm = bool(ov.get("luma") is not None and float(ov["luma"]) < 60 and styl >= 0.5)
+    return {"shots": rows, "shares": shares, "teal_film": teal_film, "stylised_share": round(styl, 3),
+            "reference_mode": rm}
 

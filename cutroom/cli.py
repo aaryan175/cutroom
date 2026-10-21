@@ -19,6 +19,8 @@
   cutroom estimate [--tb 4 | --hours 100] [--bench] [--json]         time + disk for indexing, before you start
   cutroom clip REF [--frames 6]                                      everything known about one clip (+ frame grabs)
   cutroom say REF [--from S --to S]                                  transcript with timestamps
+  cutroom breaks REF [--from S --to S] [--kind sentence]             where a voice-over may be cut (word gaps)
+  cutroom looks list | looks ref ID                                  looks; a reference's look per shot
   cutroom frames REF T [T ...]                                       pull full-res frames to look at
   cutroom songs index | cutroom songs list | cutroom beats SONG
   cutroom matchcuts [--limit N] [--min-score 0.75]                   mine match-cut candidates
@@ -327,6 +329,8 @@ def cmd_index(a):
         ingest.scan(cfg, con)
         from . import cameras as CAM
         CAM.raw_report(cfg, con)                         # RAW clips whose ProRes stand-in appeared get indexed now
+        from . import sync as SY                         # audio-only files (voice memos, recorders) -> clips, status 'audio'
+        SY.register_audio(cfg, con)
     print("index-step probe", flush=True)
     ingest.probe_all(cfg, con, ids=ids)
     if not a.skip_proxies:
@@ -493,7 +497,50 @@ def cmd_plan(a):
         print("  ✗", e)
     print(f"{'INVALID' if errs else 'ok'} · {sum(len(s['segments']) for s in p['sections'])} segments · "
           f"~{P.estimate_duration(p):.0f}s before tightening")
+    if not errs:
+        from . import story
+        try:
+            hs = story.hints(p, con, cfg)
+        except Exception as e:  # noqa: BLE001 - hints never block a check
+            hs = [f"(story hints unavailable: {e})"]
+        for h in hs:
+            print("  · hint:", h)
     sys.exit(1 if errs else 0)
+
+
+def cmd_breaks(a):
+    """Sentence / clause / pause breaks in a clip's words: where a voice-over may be cut."""
+    from . import asr, db, story
+    cfg, con = _cfg_con()
+    cid = db.get_clip(con, a.ref)["id"]
+    ws = asr.words(cfg, cid)
+    if not ws:
+        sys.exit(f"{a.ref}: no transcript words (cutroom transcribe)")
+    for b in story.breaks(ws, a.start, a.end):
+        if a.kind and b["kind"] != a.kind:
+            continue
+        print(f"{b['t']:8.2f}s  {b['kind']:8s}  gap {b['gap']:.2f}s  after '{b['after']}'")
+
+
+def cmd_looks(a):
+    """Built-in looks, and the per-shot look map of a measured reference (which look each reference shot uses)."""
+    from . import looks as LK
+    cfg, con = _cfg_con()
+    if a.action == "list":
+        for c in LK.catalogue(cfg):
+            print(f"{c['name']:16s} {c['kind']:8s} {c['desc']}")
+        return
+    from . import reference as R
+    rid = R.resolve_id(cfg, a.ref)
+    an = R.load_analysis(cfg, rid)
+    res = LK.reference_looks(an)
+    if a.json:
+        print(json.dumps(res, indent=1))
+        return
+    print(f"reference {rid}: " + " · ".join(f"{k} {v * 100:.0f}%" for k, v in res["shares"].items())
+          + f" · reference look mode {'ON (its blacks are crushed on purpose: match guards off)' if res['reference_mode'] else 'off'}")
+    for r in res["shots"]:
+        print(f"  shot {r['i']:>3}  {r['start']:7.2f}-{r['end']:7.2f}s  {r['family']:7s} -> {r['look'] or '(none)'}")
 
 
 def cmd_render(a):
@@ -1043,7 +1090,11 @@ def _ref_show(cfg, rid, as_json=False):
     if not an:
         print(f"  not analyzed yet: cutroom ref analyze {rid}")
         return
-    for ln in an.get("summary") or R.summary_lines(an):
+    try:
+        lines = R.summary_lines(an)                 # fresh: older analyses get the newer lines too
+    except (KeyError, TypeError):
+        lines = an.get("summary") or []
+    for ln in lines:
         print("  " + ln)
     for sh in an.get("sheets") or []:
         print(f"  sheet: {d / sh}")
@@ -1145,6 +1196,12 @@ def main(argv=None):
     p = sp.add_parser("clip"); p.add_argument("ref"); p.add_argument("--frames", type=int, default=0); p.set_defaults(fn=cmd_clip)
     p = sp.add_parser("say"); p.add_argument("ref"); p.add_argument("--from", dest="start", type=float)
     p.add_argument("--to", dest="end", type=float); p.set_defaults(fn=cmd_say)
+    p = sp.add_parser("breaks", help="sentence / clause / pause breaks in a clip's words (where a voice-over cuts)")
+    p.add_argument("ref"); p.add_argument("--from", dest="start", type=float); p.add_argument("--to", dest="end", type=float)
+    p.add_argument("--kind", choices=["sentence", "clause", "pause"]); p.set_defaults(fn=cmd_breaks)
+    p = sp.add_parser("looks", help="built-in looks; the per-shot look map of a reference (looks ref ID)")
+    p.add_argument("action", choices=["list", "ref"]); p.add_argument("ref", nargs="?")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_looks)
     p = sp.add_parser("frames"); p.add_argument("ref"); p.add_argument("t", nargs="+")
     p.add_argument("--width", type=int, default=960); p.set_defaults(fn=cmd_frames)
     p = sp.add_parser("title", help="typed-title placement: where pos \"auto\" puts it, which held shot suits it")

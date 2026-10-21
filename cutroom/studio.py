@@ -1040,7 +1040,7 @@ def _split_seg(st, plan, tl, r, t):
         for k2 in ("overlays", "cutaways", "sfx"):
             if seg.get(k2):
                 A[k2], B[k2] = _part(seg[k2], rel)
-    elif typ in ("still", "title", "black"):
+    elif typ in ("still", "title", "black", "image"):
         A["dur"], B["dur"] = round(rel, 4), round(r["end"] - t, 4)
         for k2 in ("overlays", "cutaways", "sfx"):
             if seg.get(k2):
@@ -1117,7 +1117,7 @@ def op_trim(st, plan, tl, op):
             if dur:
                 nb = min(nb, dur)
             seg["out"] = round(nb, 4)
-    elif t in ("still", "title", "black"):
+    elif t in ("still", "title", "black", "image"):
         cur = float(seg.get("dur", 2.0 if t != "black" else 1.0))
         seg["dur"] = round(max(0.04, cur + (d if edge == "out" else -d)), 4)
         if t == "still" and edge == "in":

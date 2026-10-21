@@ -192,6 +192,99 @@ def montage_grid(beats, start, n, beats_per_cut=1):
     return out
 
 
+# --------------------------------------------------------------------------------------------- automation
+def auto_keys(spec, span=None, default=None):
+    """An automation value -> sorted [[t, v], ...] (t in seconds from the start of its segment / section).
+    Accepts a number (constant), [[t, v], ...], {"keys": [[t, v], ...]} or {"from": v0, "to": v1, "at": 0, "over": s}
+    (a linear move from `at` over `over` seconds; `over` defaults to the rest of `span`). None -> `default`."""
+    if spec is None:
+        return None if default is None else [[0.0, float(default)]]
+    if isinstance(spec, (int, float)):
+        return [[0.0, float(spec)]]
+    if isinstance(spec, dict) and spec.get("keys") is not None:
+        spec = spec["keys"]
+    if isinstance(spec, list):
+        ks = sorted([float(t), float(v)] for t, v in spec)
+        return ks or None
+    if isinstance(spec, dict) and spec.get("from") is not None:
+        at = float(spec.get("at", 0.0) or 0.0)
+        over = spec.get("over")
+        over = float(over) if over is not None else max(0.0, (float(span) if span else at) - at)
+        v0, v1 = float(spec["from"]), float(spec.get("to", spec["from"]))
+        return [[at, v0], [at + max(over, 1e-3), v1]]
+    raise ValueError(f"not an automation value: {spec!r}")
+
+
+def validate_auto(where, spec, lo, hi, unit):
+    """Plan-check messages for an automation value whose values must lie in [lo, hi]."""
+    try:
+        ks = auto_keys(spec)
+    except (TypeError, ValueError):
+        return [f"{where}: must be a number, [[t, {unit}], ...], {{\"keys\": [...]}} or {{\"from\", \"to\", \"at\", \"over\"}}"]
+    errs = []
+    for t, v in ks or []:
+        if t < 0:
+            errs.append(f"{where}: key time {t} must be >= 0")
+        if not lo <= v <= hi:
+            errs.append(f"{where}: {v:g} {unit} outside {lo:g}..{hi:g}")
+    return errs
+
+
+def curve(n, keys, sr=SR, t0=0.0):
+    """Per-sample values of [[t, v], ...] keys for n samples whose first sample is at time t0 (linear between
+    keys, held flat outside them)."""
+    ks = np.asarray(keys, np.float64).reshape(-1, 2)
+    t = t0 + np.arange(n, dtype=np.float64) / sr
+    return np.interp(t, ks[:, 0], ks[:, 1])
+
+
+LOWPASS_OPEN_HZ = 18000.0           # at or above this the filter is open (the dry signal)
+
+
+def lowpass_auto(x, hz, sr=SR, order=4):
+    """Time-varying low-pass: x (n, ch) through a cutoff that follows `hz` (per-sample array, or a number).
+    A bank of fixed Butterworth low-passes at third-octave cutoffs spanning the curve runs over the whole signal,
+    and each sample is a log-frequency crossfade of its two neighbouring filters (no coefficient switching, so
+    a fast 'slam' never clicks). Cutoffs >= LOWPASS_OPEN_HZ are the dry signal."""
+    from scipy.signal import butter, sosfilt
+    x = np.asarray(x, np.float32)
+    if x.ndim == 1:
+        x = x[:, None]
+    n = len(x)
+    hz = np.broadcast_to(np.asarray(hz, np.float64), (n,)) if np.ndim(hz) == 0 else np.asarray(hz, np.float64)[:n]
+    hz = np.clip(hz, 40.0, LOWPASS_OPEN_HZ)
+    lo, hi = float(hz.min()), float(hz.max())
+    if lo >= LOWPASS_OPEN_HZ - 1:
+        return x.copy()
+    steps = max(1, int(np.ceil(np.log2(hi / lo) * 3)))
+    bank_f = lo * (hi / lo) ** (np.arange(steps + 1) / max(steps, 1)) if hi > lo * 1.0001 else np.array([lo])
+    outs = []
+    for f in bank_f:
+        if f >= LOWPASS_OPEN_HZ - 1:
+            outs.append(x)
+        else:
+            sos = butter(order, min(f, 0.45 * sr), btype="low", fs=sr, output="sos")
+            outs.append(sosfilt(sos, x, axis=0).astype(np.float32))
+    if len(outs) == 1:
+        return outs[0]
+    pos = np.log(hz / bank_f[0]) / np.log(bank_f[-1] / bank_f[0]) * (len(bank_f) - 1)
+    i0 = np.clip(np.floor(pos).astype(int), 0, len(bank_f) - 2)
+    w = (pos - i0).astype(np.float32)[:, None]
+    stack = np.stack(outs)                                   # (bands, n, ch)
+    idx = np.arange(n)
+    return stack[i0, idx] * (1 - w) + stack[i0 + 1, idx] * w
+
+
+def band_split(a, sr=SR, sub_hz=120.0, high_hz=4000.0):
+    """(sub, mid, high) of a signal: Butterworth low-pass below sub_hz, high-pass above high_hz, and the mid as the
+    exact remainder, so sub + mid + high == a (an un-ducked bed is bit-identical)."""
+    from scipy.signal import butter, sosfiltfilt
+    # zero-phase (forward-backward) so the remainder holds no phase-shifted leftovers of the outer bands
+    low = sosfiltfilt(butter(4, sub_hz, btype="low", fs=sr, output="sos"), a, axis=0).astype(np.float32)
+    high = sosfiltfilt(butter(4, high_hz, btype="high", fs=sr, output="sos"), a, axis=0).astype(np.float32)
+    return low, (a - low - high).astype(np.float32), high
+
+
 # --------------------------------------------------------------------------------------------- bed
 def _decode(cfg, path, offset, dur):
     """Decode [offset, offset+dur] of a song to float32 stereo at 48 kHz, zero-padded to dur."""
@@ -293,7 +386,10 @@ def music_bed(cfg, con, sections_timeline, out_wav):
                          "mode": "duck"|"mute"|"full"|"under", "duck_db": -18, "start_edge": "cut"|{"fade"},
                          "end_edge": "cut"|{"fade"}, "lift_db": 7, "lift_ramp": 0.06,
                          "breaks": [(t_end, dur)], "under_db": -5, "voice_lufs": -16,
-                         "natural": [(t0, t1)], "natural_duck_db": 0}]
+                         "natural": [(t0, t1)], "natural_duck_db": 0,
+                         "duck_bands": {"sub": -25, "mid": -14, "high": -14} (frequency-dependent duck, duck mode),
+                         "gain_keys": [[t, dB], ...] (section-relative gain automation, e.g. an under_db ramp),
+                         "lowpass": [[t, Hz], ...] (section-relative low-pass automation)}]
     Structure (measured on a reference vlog): songs start and stop hard on the section's cut frames
     (8 ms ramps), sit `lift_db` higher wherever nobody talks (montage/b-roll ~7 LU above talk), drop ~30 dB
     for 0.2-0.4 s before a flash so the hit lands into silence, and duck only under real dialogue.
@@ -331,7 +427,16 @@ def music_bed(cfg, con, sections_timeline, out_wav):
                 talk = _span_env(n, rel, float(s.get("lift_ramp", 0.06)), centred=True) if rel else np.zeros(n, np.float32)
                 env *= (10 ** (ul / 20)) ** (1.0 - talk)
         else:
-            if mode in ("duck", "mute") and rel:
+            db_ = s.get("duck_bands")
+            if mode == "duck" and rel and db_:
+                # frequency-dependent duck (reference: the sub pulled out 20-30 dB under the voice, mids ~14 dB)
+                sub, mid, high = band_split(a)
+                dm = float(db_.get("mid", s.get("duck_db", -14)))
+                gains = {"sub": float(db_.get("sub", dm)), "mid": dm, "high": float(db_.get("high", dm))}
+                a = (sub * duck_envelope(n, rel, 10 ** (gains["sub"] / 20))[:, None]
+                     + mid * duck_envelope(n, rel, 10 ** (gains["mid"] / 20))[:, None]
+                     + high * duck_envelope(n, rel, 10 ** (gains["high"] / 20))[:, None]).astype(np.float32)
+            elif mode in ("duck", "mute") and rel:
                 floor = 0.0 if mode == "mute" else 10 ** (float(s.get("duck_db", -18)) / 20)
                 env *= duck_envelope(n, rel, floor)
             lift = float(s.get("lift_db", 0.0) or 0.0)
@@ -359,6 +464,10 @@ def music_bed(cfg, con, sections_timeline, out_wav):
                 t = np.arange(n) / SR
                 w = np.where(t >= e, np.clip(1 - (t - e) / 0.01, 0, 1), w).astype(np.float32)
                 env *= 1.0 - (1.0 - BREAK_GAIN) * w
+        if s.get("gain_keys"):
+            env *= (10 ** (curve(n, s["gain_keys"]) / 20)).astype(np.float32)
+        if s.get("lowpass"):
+            a = lowpass_auto(a, curve(n, s["lowpass"]))
         se = s.get("start_edge")
         ee = s.get("end_edge")
         if se is None:
@@ -406,6 +515,56 @@ SFX = {
 }
 
 
+# numpy-generated sounds with parameters: name -> (default params, default alignment)
+GEN_SFX = {
+    # long sub riser (reference: 4-8 s, 30-200 Hz, a ~3.6 Hz tremolo, climbing -50 -> -13 LUFS, stopping DEAD on the
+    # mark with all its low end): its END lands on the event (align "end")
+    "sub_riser": ({"dur": 6.0, "f0": 32.0, "f1": 110.0, "trem_hz": 3.6, "trem": 0.45, "rise_db": 36.0}, "end"),
+    # sub drop (60 -> 30 Hz over ~1.5 s, peak at the start): the hit lands on the cut
+    "sub_drop": ({"dur": 1.5, "f0": 60.0, "f1": 30.0}, "peak"),
+}
+SFX_PARAMS = {"dur": (0.3, 12.0)}
+
+
+def _gen_sfx(name, prm):
+    n = int(round(float(prm["dur"]) * SR))
+    t = np.arange(n, dtype=np.float64) / SR
+    rng = np.random.default_rng(7)
+    if name == "sub_riser":
+        d = float(prm["dur"])
+        u = t / max(d, 1e-6)
+        f = prm["f0"] * (prm["f1"] / prm["f0"]) ** u                     # exponential glide
+        ph = 2 * np.pi * np.cumsum(f) / SR
+        tone = np.sin(ph) + 0.35 * np.sin(2 * ph + 0.3)
+        from scipy.signal import butter, sosfilt
+        noise = sosfilt(butter(2, [30, 200], btype="band", fs=SR, output="sos"), rng.standard_normal(n))
+        noise /= max(1e-9, np.abs(noise).max())
+        x = tone + 0.6 * noise * u
+        amp = 10 ** ((-float(prm["rise_db"]) * (1 - u)) / 20)              # climbs rise_db, linear in dB (as measured)
+        trem = 1 - float(prm["trem"]) * 0.5 * (1 - np.cos(2 * np.pi * float(prm["trem_hz"]) * (t - d)))   # full on the mark
+        x = x * amp * trem
+        k = int(0.003 * SR)                                              # stops dead: 3 ms, no tail
+        x[-k:] *= np.linspace(1, 0, k)
+        x[:int(0.05 * SR)] *= np.linspace(0, 1, int(0.05 * SR))
+    elif name == "sub_drop":
+        f = prm["f1"] + (prm["f0"] - prm["f1"]) * np.exp(-t / (0.35 * float(prm["dur"])))
+        ph = 2 * np.pi * np.cumsum(f) / SR
+        x = np.sin(ph) * np.exp(-t / (0.42 * float(prm["dur"])))
+        a = int(0.004 * SR)
+        x[:a] *= np.linspace(0, 1, a)
+        x[-int(0.05 * SR):] *= np.linspace(1, 0, int(0.05 * SR))
+    else:
+        raise KeyError(name)
+    x = 0.89 * x / max(1e-9, np.abs(x).max())
+    return np.repeat(x.astype(np.float32)[:, None], 2, axis=1)
+
+
+def sfx_align(name):
+    """Default alignment of a sound on its event: 'peak' (transient on the frame) or 'end' (a riser that stops dead
+    on the mark)."""
+    return GEN_SFX[name][1] if name in GEN_SFX else "peak"
+
+
 _PEAKS = {}
 
 
@@ -431,12 +590,14 @@ def sfx_peak(path) -> float:
     return float(pk)
 
 
-def sfx(name, cfg=None) -> str:
-    """Path to a generated sound effect (whoosh | hit | tick | riser | burn | hiss), 48 kHz stereo WAV, cached
-    under <work>/cache/sfx/ (or a temp dir when no project is given)."""
+def sfx(name, cfg=None, **params) -> str:
+    """Path to a generated sound effect (whoosh | hit | tick | riser | burn | hiss | sub_riser | sub_drop), 48 kHz
+    stereo WAV, cached by content under <work>/cache/sfx/ (or a temp dir when no project is given).
+    `params` (dur, ...) apply to the parameterised sounds (GEN_SFX)."""
     import subprocess
-    if name not in SFX:
-        raise KeyError(f"unknown sfx {name!r}; choose from {sorted(SFX)}")
+    import hashlib
+    if name not in SFX and name not in GEN_SFX:
+        raise KeyError(f"unknown sfx {name!r}; choose from {sorted(ALL_SFX)}")
     if cfg is None:
         try:
             from .config import Config
@@ -445,14 +606,29 @@ def sfx(name, cfg=None) -> str:
             cfg = None
     d = cfg.p("cache", "sfx") if cfg is not None else Path(tempfile.gettempdir(), "cutroom-sfx")
     d.mkdir(parents=True, exist_ok=True)
-    out = d / f"{name}.wav"
-    if out.exists() and out.stat().st_size > 44:
+    if name in GEN_SFX:
+        prm = {**GEN_SFX[name][0], **{k: float(v) for k, v in params.items() if v is not None}}
+        import inspect
+        key = hashlib.sha1(json.dumps([name, prm, inspect.getsource(_gen_sfx)], sort_keys=True).encode()).hexdigest()[:12]
+        out = d / f"{name}_{key}.wav"
+        if not (out.exists() and out.stat().st_size > 44):
+            import soundfile as sf
+            tmp = d / f".{out.name}.{os.getpid()}.tmp.wav"
+            sf.write(str(tmp), _gen_sfx(name, prm), SR, subtype="PCM_24")
+            os.replace(tmp, out)
         return str(out)
     src, filt = SFX[name]
+    key = hashlib.sha1(json.dumps([name, src, filt]).encode()).hexdigest()[:10]     # content-keyed, never stale
+    out = d / f"{name}_{key}.wav"
+    if out.exists() and out.stat().st_size > 44:
+        return str(out)
     ff = getattr(cfg, "ffmpeg", "ffmpeg") if cfg is not None else "ffmpeg"
-    tmp = d / f".{name}.tmp.wav"
+    tmp = d / f".{out.name}.{os.getpid()}.tmp.wav"
     subprocess.run([ff, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", src,
                     "-af", f"{filt},aformat=channel_layouts=stereo", "-ar", str(SR), "-c:a", "pcm_s16le", str(tmp)],
                    check=True, capture_output=True)
     os.replace(tmp, out)
     return str(out)
+
+
+ALL_SFX = set(SFX) | set(GEN_SFX)

@@ -527,8 +527,10 @@ def fx_spans(res, fps) -> list:
     for p in v1:
         f0, f1 = int(round(p["start"] * fps)), int(round(p["end"] * fps))
         why = []
-        if p["kind"] == "card":
-            why.append("card")
+        if p["kind"] in ("card", "image"):
+            why.append(p["kind"])
+        if (p.get("slowmo") or {}).get("method") == "flow":
+            why.append("slowmo-flow")
         if p["kind"] == "still":
             why.append("freeze")
         if p.get("frame") and p["frame"] not in ("full", "none"):

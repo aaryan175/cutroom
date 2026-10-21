@@ -79,8 +79,8 @@ SHEET_COLS, SHEET_ROWS = 4, 6  # 24 tiles per sheet
 MAX_EVIDENCE = 400
 JPEG_Q = 72
 
-INTENTIONAL_STILL = {"still", "title", "black", "card", "freeze"}
-INTENTIONAL_BLACK = {"black", "title", "fade", "card"}
+INTENTIONAL_STILL = {"still", "title", "black", "card", "freeze", "image"}
+INTENTIONAL_BLACK = {"black", "title", "fade", "card", "image"}
 TALK_KINDS = {"talk", "speech", "aroll", "a-roll"}
 MONTAGE_KINDS = {"montage", "mont", "teaser", "tease"}
 
@@ -1407,7 +1407,7 @@ def _craft_checks(rep, vs, au, shots, real, fps, n, H, duration, raw, side, talk
                 detail="no caption size in the sidecar")
 
 
-DEVICE_KINDS = ("burn", "card", "inset", "gate", "letterbox", "typed_title", "film")
+DEVICE_KINDS = ("burn", "card", "inset", "gate", "letterbox", "pillarbox", "typed_title", "film")
 
 
 def device_rule_issues(raw):

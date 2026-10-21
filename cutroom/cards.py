@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 import os
+import threading
 import re
 from pathlib import Path
 
@@ -329,6 +330,13 @@ def frame_spec(fr):
         y0 = float(fr["y"]) if fr.get("y") is not None else (1 - h) / 2
         out = {"kind": "inset", "window": (x0, y0, x0 + w, y0 + h), "radius": float(fr.get("radius", INSET["radius"])),
                "feather": float(fr.get("feather", INSET["feather"])), "color": fr.get("bg", fr.get("color", INSET["bg"]))}
+    elif kind == "pillarbox":
+        # side bars: a narrower picture (default 5:3, the brand-film reference: 60 / 59 px bars at 1920) centred
+        # in the 16:9 frame, full height, hard edges
+        asp = float(fr.get("aspect", 5 / 3))
+        w = min(1.0, asp / (16 / 9))
+        out = {"kind": "pillarbox", "window": ((1 - w) / 2, 0.0, (1 + w) / 2, 1.0), "radius": float(fr.get("radius", 0)),
+               "feather": float(fr.get("feather", 0)), "color": fr.get("color", "#000000")}
     elif kind == "letterbox":
         asp = float(fr.get("aspect", 2.46))
         h = min(1.0, (16 / 9) / asp)
@@ -392,7 +400,7 @@ def matte_png(cache_dir, W, H, spec):
             rgb = rgb * (1 - a_out[..., None]) + icol * a_out[..., None]
             alpha = alpha + ring
         out = np.dstack([rgb, np.clip(alpha, 0, 1) * 255]).astype(np.uint8)
-        tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp.png")
+        tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp.png")
         Image.fromarray(out, "RGBA").save(tmp)
         os.replace(tmp, p)
     return str(p), box

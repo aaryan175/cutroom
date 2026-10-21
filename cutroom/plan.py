@@ -105,9 +105,10 @@ import copy
 import json
 from pathlib import Path
 
-SEG_TYPES = {"talk", "broll", "montage", "matchcut", "title", "black", "still", "card"}
+SEG_TYPES = {"talk", "broll", "montage", "matchcut", "title", "black", "still", "card", "image"}
+SLOWMO_METHODS = {"auto", "frames", "flow"}
 OVERLAY_KINDS = {"callout", "lower_third", "title", "label", "typed_title"}
-FRAME_KINDS = {"gate", "inset", "letterbox", "full", "none"}
+FRAME_KINDS = {"gate", "inset", "letterbox", "pillarbox", "full", "none"}
 POSITIONS = {"top-left", "top-right", "bottom-left", "bottom-right", "center", "auto"}
 
 TRANSITION_KINDS = {"flash", "dip", "dip_black", "dip_white", "whip", "burn", "cut"}
@@ -162,6 +163,8 @@ def transition_spec(tr):
     fi = int(fi) if fi is not None else fr - fr // 2
     out = {"kind": kind, "frames_out": max(0, fo), "frames_in": max(0, fi), "sfx": d.get("sfx"),
            "gain_db": float(d.get("gain_db", -6.0)), "break": float(d.get("break") or 0.0)}
+    if d.get("sfx_offset"):
+        out["sfx_offset"] = float(d["sfx_offset"])
     if kind == "burn":
         out.update({k: d[k] for k in BURN_KEYS if d.get(k) is not None})
     return out
@@ -213,6 +216,8 @@ def normalize(plan: dict, cfg=None) -> dict:
                 s.setdefault("dur", 2.0); s.setdefault("zoom", 1.08)
             elif t == "card":
                 s.setdefault("text", "COMING UP"); s.setdefault("dur", 0.84)
+            elif t == "image":
+                s.setdefault("dur", 2.5); s.setdefault("bg", "#000000"); s.setdefault("size", 0.3)
     return p
 
 
@@ -267,13 +272,26 @@ def validate(plan: dict, con=None) -> list:
                     chk_clip(f"{w} cutaway {k}", c.get("clip"), c.get("in"))
                     if c.get("dur", 0) <= 0:
                         errs.append(f"{w} cutaway {k}: dur must be > 0")
+                    if c.get("look") is not None:
+                        errs += validate_look(c["look"], f"{w} cutaway {k} look")
+                vo = s.get("voiceover")
+                if isinstance(vo, dict):
+                    if vo.get("clean") is not None and not isinstance(vo["clean"], bool):
+                        errs.append(f"{w}: voiceover.clean must be true or false (false = keep the raw recording)")
+                    if vo.get("gain_db") is not None and not -24 <= _num(vo["gain_db"], 99) <= 12:
+                        errs.append(f"{w}: voiceover.gain_db must be -24..12")
             elif t == "montage":
                 if not s.get("shots"):
                     errs.append(f"{w}: montage needs shots")
+                for k in ("min_shot", "max_shot"):
+                    if s.get(k) is not None and not 0.04 <= _num(s[k], -1) <= 30:
+                        errs.append(f"{w}: {k} must be 0.04-30 s (0.2 s = a 5-frame burst shot at 25 fps)")
                 for k, sh in enumerate(s.get("shots", [])):
                     chk_clip(f"{w} shot {k}", sh.get("clip"), sh.get("in"), sh.get("out"))
                     if sh.get("dur") is not None and not 0.04 <= _num(sh["dur"], -1) <= 30:
                         errs.append(f"{w} shot {k}: dur must be 0.04-30 s")
+                    if sh.get("look") is not None:
+                        errs += validate_look(sh["look"], f"{w} shot {k} look")
                     errs += _validate_craft(f"{w} shot {k}", "shot", sh)
             elif t == "matchcut":
                 for side in ("a", "b"):
@@ -283,6 +301,8 @@ def validate(plan: dict, con=None) -> list:
                         chk_clip(f"{w} {side}", s[side].get("clip"), s[side]["t"])
             elif t == "card":
                 errs += _validate_card(w, s)
+            elif t == "image":
+                errs += _validate_image(w, s)
             elif t in ("title", "black", "still"):
                 if t != "black" and t == "title" and not s.get("text"):
                     errs.append(f"{w}: title needs text")
@@ -366,13 +386,64 @@ def _validate_craft(w, t, s):
             errs.append(f"{w}: ramp must be {{\"to\": 1.1-8, \"over\": 0.12-3 s}}")
     if s.get("conform") is not None and s["conform"] not in CONFORM_MODES:
         errs.append(f"{w}: conform must be one of {sorted(CONFORM_MODES)}")
-    if s.get("exposure_stops") is not None and not -2.0 <= _num(s["exposure_stops"], 9) <= 2.0:
-        errs.append(f"{w}: exposure_stops must be -2..2")
+    if s.get("exposure_stops") is not None:
+        from .music import validate_auto
+        errs += validate_auto(f"{w}: exposure_stops", s["exposure_stops"], -2.0, 2.0, "stops")
+    sm = s.get("slowmo")
+    if sm is not None and sm is not False:
+        if t not in ("broll", "montage", "shot"):
+            errs.append(f"{w}: slowmo applies to broll and montage shots only (sync talk is never slowed)")
+        else:
+            f = _num(sm.get("factor") if isinstance(sm, dict) else sm, 0)
+            if not 1.05 <= f <= 16:
+                errs.append(f"{w}: slowmo factor must be 1.05-16 (8 = eight times slower)")
+            if isinstance(sm, dict) and sm.get("method", "auto") not in SLOWMO_METHODS:
+                errs.append(f"{w}: slowmo.method must be one of {sorted(SLOWMO_METHODS)}")
+    snd = s.get("sound")
+    if snd is not None:
+        errs += validate_sound(f"{w} sound", snd)
     if t == "broll" and s.get("audio") not in (None, "music", "natural", "mix", "none"):
         errs.append(f"{w}: broll audio must be music|natural|mix")
     for k, e in enumerate(s.get("sfx", []) or []):
         if e.get("on") is not None and e["on"] not in ("cut", "end", "transition"):
             errs.append(f"{w} sfx {k}: on must be cut|end|transition")
+        if e.get("dur") is not None and not 0.3 <= _num(e["dur"], 0) <= 12:
+            errs.append(f"{w} sfx {k}: dur must be 0.3-12 s (sub_riser 4-8 s)")
+        if e.get("offset") is not None and not -2 <= _num(e["offset"], 9) <= 2:
+            errs.append(f"{w} sfx {k}: offset must be -2..2 s")
+        if e.get("align") is not None and e["align"] not in ("peak", "end", "start"):
+            errs.append(f"{w} sfx {k}: align must be peak|end|start")
+    return errs
+
+
+def validate_sound(w, snd):
+    """segment.sound / section.sound: {"gain_db", "gain" (dB automation), "lowpass" (Hz automation)}."""
+    from .music import validate_auto
+    if not isinstance(snd, dict):
+        return [f"{w}: must be an object {{gain_db, gain, lowpass}}"]
+    errs = []
+    unknown = set(snd) - {"gain_db", "gain", "lowpass", "note"}
+    if unknown:
+        errs.append(f"{w}: unknown keys {sorted(unknown)} (gain_db, gain, lowpass)")
+    if snd.get("gain_db") is not None and not -60 <= _num(snd["gain_db"], 99) <= 24:
+        errs.append(f"{w}: gain_db must be -60..24")
+    if snd.get("gain") is not None:
+        errs += validate_auto(f"{w}: gain", snd["gain"], -60.0, 24.0, "dB")
+    if snd.get("lowpass") is not None:
+        errs += validate_auto(f"{w}: lowpass", snd["lowpass"], 40.0, 20000.0, "Hz")
+    return errs
+
+
+def _validate_image(w, s):
+    errs = []
+    if not str(s.get("file") or "").strip():
+        errs.append(f"{w}: image needs file (a PNG / JPG; PNG alpha is kept)")
+    if not 0.04 <= _num(s.get("dur", 2.5), 0) <= 60:
+        errs.append(f"{w}: image dur must be 0.04-60 s")
+    if s.get("size") is not None and not 0.02 <= _num(s["size"], 0) <= 1.0:
+        errs.append(f"{w}: image size must be 0.02-1 (image height / frame height)")
+    if not _color_ok(s.get("bg")):
+        errs.append(f"{w}: image bg must be #RRGGBB")
     return errs
 
 
@@ -396,7 +467,9 @@ def validate_frame(w, fr):
     if fr.get("radius") is not None and not 0 <= _num(fr["radius"], -1) <= 120:
         errs.append(f"{w}: radius must be 0-120 px (at 1080)")
     if fr.get("aspect") is not None and not 1.0 <= _num(fr["aspect"], 0) <= 4.0:
-        errs.append(f"{w}: aspect must be 1-4 (2.46 = scope letterbox)")
+        errs.append(f"{w}: aspect must be 1-4 (2.46 = scope letterbox, 1.667 = 5:3 pillarbox)")
+    if fr.get("kind") == "pillarbox" and _num(fr.get("aspect", 5 / 3), 0) >= 16 / 9:
+        errs.append(f"{w}: a pillarbox aspect must be narrower than the 16:9 frame (5:3 = 1.667)")
     for k in ("color", "bg"):
         if not _color_ok(fr.get(k)):
             errs.append(f"{w}: {k} must be a #RRGGBB colour")
@@ -462,10 +535,31 @@ def _validate_section(w, sec):
             errs.append(f"{w} music: montage_gain_db must be 0-12")
         if m.get("natural_duck_db") is not None and not -6 <= _num(m["natural_duck_db"], 1) <= 0:
             errs.append(f"{w} music: natural_duck_db must be -6..0 (ambience never ducks music hard)")
+        from .music import validate_auto
+        db_ = m.get("duck_bands")
+        if db_ is not None:
+            if not isinstance(db_, dict) or set(db_) - {"sub", "mid", "high"}:
+                errs.append(f"{w} music: duck_bands must be {{sub, mid, high}} dB (e.g. sub -25, mid -14)")
+            else:
+                for k, v in db_.items():
+                    if not -60 <= _num(v, 99) <= 0:
+                        errs.append(f"{w} music: duck_bands.{k} must be -60..0 dB")
+        ud = m.get("under_db")
+        if isinstance(ud, dict):
+            errs += validate_auto(f"{w} music: under_db", ud, -40.0, 12.0, "dB")
+        if m.get("gain_keys") is not None:
+            errs += validate_auto(f"{w} music: gain_keys", m["gain_keys"], -60.0, 24.0, "dB")
+        if m.get("lowpass") is not None:
+            errs += validate_auto(f"{w} music: lowpass", m["lowpass"], 40.0, 20000.0, "Hz")
         for k, b in enumerate(m.get("breaks") or []):
             if not isinstance(b, dict) or (b.get("at") is None and b.get("before") is None) \
                     or not 0.05 <= _num(b.get("dur", 0.3), 0) <= 1.0:
                 errs.append(f"{w} music break {k}: needs at|before and dur 0.05-1.0 s")
+    if sec.get("sound") is not None:
+        errs += validate_sound(f"{w} sound", sec["sound"])
+    rs = sec.get("ref_span")
+    if rs is not None and not (isinstance(rs, list) and len(rs) == 2 and 0 <= _num(rs[0], -1) < _num(rs[1], -1)):
+        errs.append(f"{w}: ref_span must be [ref_t0, ref_t1] seconds in the reference")
     pc = sec.get("pace")
     if pc is not None:
         if not isinstance(pc, dict):
@@ -499,6 +593,15 @@ def _validate_style(st):
     ld = st.get("loudness") or {}
     if ld.get("anchor") not in (None, "dialogue", "programme"):
         errs.append("style.loudness.anchor must be dialogue|programme")
+    dy = st.get("dynamics")
+    if dy is not None and dy is not False:
+        dd = {"match": dy} if isinstance(dy, str) else dy
+        if not isinstance(dd, dict) or dd.get("match") != "reference":
+            errs.append("style.dynamics must be {\"match\": \"reference\"} (or omitted)")
+        else:
+            for k, lo, hi in (("min_db", -40, 0), ("max_db", 0, 24), ("offset_db", -12, 12)):
+                if dd.get(k) is not None and not lo <= _num(dd[k], 99) <= hi:
+                    errs.append(f"style.dynamics.{k} must be {lo}..{hi}")
     return errs
 
 

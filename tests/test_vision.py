@@ -112,6 +112,67 @@ def test_dissolve_is_a_gradual_transition():
     assert len(r["cuts"]) == 1 and 14 <= r["cuts"][0] <= 20
 
 
+def _dark(seed, grey=True, level=0.08):
+    """A very dark, low-contrast picture (a night scene crushed by the grade): B&W or teal."""
+    img = _texture(seed).astype(np.float32) * level
+    if grey:
+        g = img.mean(axis=2, keepdims=True)
+        img = np.repeat(g, 3, axis=2)
+    else:
+        img = img * 0.4 + np.array([18, 14, 2], np.float32) * (img.mean(axis=2, keepdims=True) / 10 + 0.4)  # BGR teal
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def test_dark_bw_to_teal_grade_switch_is_a_cut():
+    """Two dark frames that look alike in grey, but black-and-white before and teal colour after: a cut."""
+    a = _dark(30, grey=True)
+    b = _dark(30, grey=False)
+    frames = [_jitter(a, k) for k in range(12)] + [_jitter(b, k) for k in range(12)]
+    assert _cuts(frames)["cuts"] == [12]
+
+
+def test_occluder_rising_from_the_bottom_is_not_a_cut():
+    """Someone jumps over the lens: black climbs up from the bottom over 5 frames and the shot holds black.
+    One take (no cut), however big each frame's change is."""
+    a = _texture(31)
+    frames = [_jitter(a, k) for k in range(12)]
+    for j in range(1, 6):
+        f = _jitter(a, 12 + j).copy()
+        f[int(H * (1 - j / 5)):] = 0
+        frames.append(f)
+    frames += [np.zeros_like(a) for _ in range(10)]
+    r = _cuts(frames)
+    assert [c for c in r["cuts"] if 12 <= c <= 17] == [], r["cuts"]
+
+
+def test_dark_tilt_drifting_across_black_is_not_a_boundary():
+    """A tilt off a dark floor: the picture brightens slowly past the black threshold. No cut there."""
+    a = _texture(32).astype(np.float32)
+    frames = [np.clip(_jitter(a.astype(np.uint8), k).astype(np.float32) * (0.04 + 0.004 * k), 0, 255).astype(np.uint8)
+              for k in range(40)]
+    assert _cuts(frames)["cuts"] == []
+
+
+def test_jump_out_to_a_wider_framing_is_a_cut_not_a_flash():
+    """A jump-out on the same scene: the wider picture looks like the old one again a few frames later in grey
+    blocks, but there is no step back, so it is a cut (not a flash that returns)."""
+    big = _texture(33, 640, 360)
+    tight = cv2.resize(big[90:270, 160:480], (W, H))
+    wide = cv2.resize(big, (W, H))
+    frames = [_jitter(tight, k) for k in range(12)] + [_jitter(wide, k) for k in range(12)]
+    assert _cuts(frames)["cuts"] == [12]
+
+
+def test_slow_light_drift_is_not_a_dissolve():
+    """Light changing steadily inside one take (a lamp dimming): the change is as fast before and after any
+    window, so no gradual transition is found."""
+    a = _texture(34).astype(np.float32)
+    b = np.clip(_texture(34).astype(np.float32) * 0.5 + np.linspace(0, 60, W)[None, :, None], 0, 255)
+    frames = [((1 - k / 59) * a + (k / 59) * b).astype(np.uint8) for k in range(60)]
+    r = _cuts(frames)
+    assert r["gradual"] == [] and r["cuts"] == [], r
+
+
 # ------------------------------------------------------------------------------------------------ faces
 
 def test_faces_fall_back_to_haar_offline(tmp_path, monkeypatch):

@@ -49,7 +49,7 @@ import numpy as np
 
 from . import governor, media
 
-VERSION = 2
+VERSION = 3                     # 3: beatless-score detection, act shares, cuts-follow-voice stats
 SCAN_W = 320                    # picture scan width (every frame)
 SCAN_VERSION = 2                # 2: + vision.ShotFeatures (colour hist, edge change, motion-compensated diff, same-picture)
 THUMB_BOX = (480, 270)          # thumbnails fit in this box
@@ -62,6 +62,14 @@ FACE_TALK_H = 0.12              # largest face at least this share of the frame 
 MONTAGE_SHOT = 1.2              # b-roll shots shorter than this, three or more in a row, form a montage
 SUSTAINED_SPEECH = 2.5          # seconds of continuous speech that end a cold open
 MUSIC_PERIODICITY = 0.32        # onset-envelope autocorrelation peak above this = rhythmic (music) window
+PULSE_BEATLESS = 0.17           # median predominant-local-pulse strength (30 s windows, speech left out) below this =
+                                # a beatless score (pads, swells, booms): measured 0.08-0.17 on a beatless film score,
+                                # 0.17-0.24 on a pop song, 0.31 on a click track; no BPM / beat sync is reported
+PULSE_WIN_S, PULSE_HOP_S = 30.0, 15.0
+VOICE_CUT_TOL = 0.13            # a cut within this of a word onset / a sentence break "follows the voice"
+SENTENCE_GAP = 0.25             # a pause between words at least this long (or . ? ! before it) = a sentence break
+HOLE_DB = 25.0                  # 1 s loudness bins this far under the programme for HOLE_MIN_S = a silence hole (an act)
+HOLE_MIN_S = 4
 STAGES = ("proxy", "scan", "frames", "audio", "asr", "assemble")
 WEIGHTS = {"proxy": 0.10, "scan": 0.40, "frames": 0.14, "audio": 0.10, "asr": 0.18, "assemble": 0.08}
 PROGRESS_PREFIX = "ref-progress"
@@ -1078,6 +1086,7 @@ def audio_stage(cfg, src, d, prog=None, label="audio") -> tuple:
              "tempo": bt["tempo"], "beats": bt["beats"], "downbeats": bt["downbeats"], "drops": bt["drops"],
              "onsets": [round(float(x), 3) for x in onsets], "beat_resolution_s": round(hop / sr, 4),
              "loudness_curve": loud}
+    facts.update(pulse_strength(y, sr, spans, hop=hop))
     return facts, y
 
 
@@ -1106,6 +1115,37 @@ def _music_windows(env, efps, y, sr, win_s=8.0, step_s=4.0):
             break
         k += 1
     return out
+
+
+def pulse_strength(y, sr, speech_spans=(), hop=256):
+    """{"pulse_strength", "pulse_windows", "beatless"}: how strongly the audio carries a regular beat. The median
+    of librosa's predominant-local-pulse (PLP) mean over 30 s windows (15 s hop) of the onset envelope, with the
+    speech spans left out when at least 20 s of non-speech audio remain (speech has a syllable pulse of its own, so a
+    beat tracker fits a "tempo" to a voice-over). A beatless score has no beat grid to cut to: BPM and beat sync
+    are then not reported."""
+    import librosa
+    y = np.asarray(y, np.float32)
+    if len(y) < sr * 2:
+        return {"pulse_strength": None, "pulse_windows": [], "beatless": None}
+    env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    efps = sr / hop
+    keep = np.ones(len(env), bool)
+    for a, b in speech_spans or []:
+        keep[max(0, int(float(a) * efps)):min(len(env), int(math.ceil(float(b) * efps)))] = False
+    if keep.sum() >= 20 * efps:
+        env = env[keep]
+    W, H = int(PULSE_WIN_S * efps), int(PULSE_HOP_S * efps)
+    starts = list(range(0, max(1, len(env) - W + 1), H)) if len(env) > W else [0]
+    vals = []
+    for a in starts:
+        e = env[a:a + W]
+        if len(e) < int(4 * efps) or float(e.max()) <= 1e-9:
+            continue
+        vals.append(round(float(librosa.beat.plp(onset_envelope=e, sr=sr, hop_length=hop).mean()), 3))
+    if not vals:
+        return {"pulse_strength": None, "pulse_windows": [], "beatless": None}
+    ps = round(float(np.median(vals)), 3)
+    return {"pulse_strength": ps, "pulse_windows": vals, "beatless": bool(ps < PULSE_BEATLESS)}
 
 
 def _merge_spans(spans, join=0.5):
@@ -1325,6 +1365,9 @@ def _section_name(r, rows):
 
 def _beat_sync(cut_times, audio, fps):
     beats = np.array(audio.get("beats") or [], float)
+    if audio.get("beatless"):
+        return {"beat_sync_pct": None, "beatless": True,
+                "note": f"no beat grid (beatless score, pulse strength {audio.get('pulse_strength')})"}
     if len(beats) < 4 or not cut_times:
         return {"beat_sync_pct": None, "note": "no beat grid (no rhythmic audio)"}
     tol = 1.0 / fps + 0.5 * float(audio.get("beat_resolution_s") or 0.016)
@@ -1502,9 +1545,117 @@ def assemble(arr, shots_raw, frames, audio, transcript, fps, dur, flashes, sidec
                               "warmth": r["warmth"]} for r in sections]}
     aud = {k: v for k, v in audio.items() if k != "music_windows"}
     aud.update(sync)
+    if aud.get("beatless"):
+        aud["tempo_note"] = "beat tracker tempo not reported: beatless score (fitted to speech / swells)"
     return {"shots": shots, "cuts": [round(t, 4) for t in cut_times], "flashes": flashes, "pacing": pacing,
             "sections": sections, "audio": aud, "captions": _captions_summary(shots, arr, fps, dur), "colour": colour,
-            "structure": structure}
+            "structure": structure, "section_shares": section_shares(sections, shots, audio, dur),
+            "voice_cuts": voice_cuts(cut_times, (transcript or {}).get("words"))}
+
+
+def _hole_starts(audio, cuts, dur):
+    """Act turns into a silence hole: a run of >= HOLE_MIN_S one-second loudness bins at least HOLE_DB under the
+    programme (the reference's 11 s of near-silence after its walk-out), snapped to the nearest cut within 1.5 s."""
+    lc = audio.get("loudness_curve") or []
+    I = audio.get("integrated_lufs")
+    if not lc or I is None:
+        return []
+    thr = float(I) - HOLE_DB
+    q = [(x is not None and x <= thr) or x is None for x in lc]
+    out, k = [], 0
+    while k < len(q):
+        if q[k]:
+            j = k
+            while j < len(q) and q[j]:
+                j += 1
+            if j - k >= HOLE_MIN_S and k >= 2 and j <= len(q) - 2:       # not the head or the tail fade
+                c = min(cuts, key=lambda x: abs(x - k)) if cuts else None
+                if c is not None and abs(c - k) <= 1.5:
+                    out.append(float(c))
+            k = j
+        else:
+            k += 1
+    return out
+
+
+def _end_card_start(shots, dur):
+    """Start of a trailing end card: the last shots, all near black (a logo / text on black), no speech, together at
+    least 1 s and at most 15 % of the runtime, after a picture shot."""
+    k = len(shots)
+    while k > 0 and shots[k - 1]["luma"] < 12.0 and shots[k - 1].get("speech", 0) < 0.1:
+        k -= 1
+    if k == 0 or k == len(shots):
+        return None
+    t = float(shots[k]["start"])
+    return t if 1.0 <= dur - t <= 0.15 * dur else None
+
+
+def section_shares(sections, shots, audio, dur) -> list:
+    """The acts as shares of the runtime: [{"name", "t0", "t1", "dur", "share"}] (share in %). The measured
+    sections, split further where a silence hole starts and where an end card starts (both are act turns a
+    rebuild keeps: noise -> silence -> voice -> leap -> end card)."""
+    cuts = [float(s["start"]) for s in shots[1:]]
+    edges = sorted({float(r["start"]) for r in sections} | {float(sections[-1]["end"]) if sections else float(dur)})
+    extra = {}
+    for t in _hole_starts(audio, cuts, dur):
+        extra[t] = "silence"
+    ec = _end_card_start(shots, dur)
+    if ec is not None:
+        extra[ec] = "end card"
+    for t in extra:
+        if all(abs(t - e) > 0.5 for e in edges):
+            edges.append(t)
+    edges = sorted(edges)
+    tot = max(float(dur), 1e-6)
+    out = []
+    for a, b in zip(edges, edges[1:]):
+        if b - a < 1e-6:
+            continue
+        name = next((v for t, v in extra.items() if abs(t - a) <= 0.5), None)
+        if name is None:
+            r = next((r for r in sections if r["start"] - 1e-6 <= a < r["end"] - 1e-6), None)
+            name = r["name"] if r else "section"
+        out.append({"name": name, "t0": round(a, 3), "t1": round(b, 3), "dur": round(b - a, 3),
+                    "share": round(100 * (b - a) / tot, 1)})
+    return out
+
+
+def voice_cuts(cut_times, words, tol=VOICE_CUT_TOL, gap=SENTENCE_GAP) -> dict:
+    """How the cuts sit against a voice (transcript word timestamps [[t0, t1, word], ...]):
+    {"n_under_voice", "on_break", "mid_sentence", "near_word_onset", "near_word_onset_30ms", "on_break_pct", "tol_s",
+     "cuts": [{"t", "on": "break"|"mid", "word", "onset_dt"}]}. A cut is under the voice when words are spoken within
+    3 s on both sides of it; it is on a sentence break when it falls in (or within tol of) a pause >= SENTENCE_GAP or
+    after a word ending in . ? !; otherwise mid-sentence."""
+    ws = [(float(w[0]), float(w[1]), str(w[2]) if len(w) > 2 else "") for w in (words or []) if w and len(w) >= 2]
+    if not ws:
+        return {"n_under_voice": 0, "note": "no transcript words"}
+    ons = np.array([w[0] for w in ws])
+    rows = []
+    for t in cut_times:
+        t = float(t)
+        before = [w for w in ws if w[1] <= t + tol]
+        after = [w for w in ws if w[0] >= t - tol]
+        if not before or not after or t - before[-1][1] > 3.0 or after[0][0] - t > 3.0:
+            continue
+        # the boundary between two words nearest the cut
+        k = int(np.searchsorted(ons, t))
+        cands = []
+        for j in (k - 1, k, k + 1):
+            if 1 <= j < len(ws):
+                pe, ns = ws[j - 1][1], ws[j][0]
+                brk = (ns - pe) >= gap or ws[j - 1][2].rstrip().endswith((".", "?", "!"))
+                cands.append((max(0.0, pe - t, t - ns), brk, ws[j][2]))
+        near = min(cands, key=lambda c: c[0]) if cands else (9.9, False, "")
+        on_break = near[1] and near[0] <= tol
+        j = int(np.argmin(np.abs(ons - t)))
+        rows.append({"t": round(t, 3), "on": "break" if on_break else "mid", "word": ws[j][2],
+                     "onset_dt": round(float(ons[j] - t), 3)})
+    n = len(rows)
+    nb = sum(1 for r in rows if r["on"] == "break")
+    return {"n_under_voice": n, "on_break": nb, "mid_sentence": n - nb,
+            "near_word_onset": sum(1 for r in rows if abs(r["onset_dt"]) <= tol),
+            "near_word_onset_30ms": sum(1 for r in rows if abs(r["onset_dt"]) <= 0.03),
+            "on_break_pct": round(100 * nb / n, 1) if n else None, "tol_s": tol, "cuts": rows}
 
 
 def _sheets(d, shots, fps, title, n_frames):
@@ -1607,6 +1758,11 @@ def measure(cfg, d, picture, audio_src, fps, title, prog, asr=True, sidecar=None
     y = None
     if audio is None:
         audio, y = audio_stage(cfg, audio_src, d, prog, label=f"audio {ref_label}")
+        _jsave(aj, audio)
+    elif audio.get("has_audio") and "pulse_strength" not in audio:     # audio measured before beatless detection
+        from . import asr as A
+        y = A.load_audio(cfg, audio_src)
+        audio.update(pulse_strength(y, A.SR, audio.get("speech_spans") or []))
         _jsave(aj, audio)
     prog.end()
     # asr
@@ -1791,7 +1947,8 @@ def summary_numbers(an) -> dict:
     return {"duration": (an.get("source") or {}).get("duration"), "n_shots": p.get("n_shots"), "asl": p.get("asl"),
             "first3_cuts": p.get("first3_cuts"), "cold_open_s": st.get("cold_open_s"), "talk_pct": st.get("talk_pct"),
             "broll_pct": st.get("broll_pct"), "montage_pct": st.get("montage_pct"),
-            "beat_sync_pct": au.get("beat_sync_pct"), "tempo": au.get("tempo"),
+            "beat_sync_pct": au.get("beat_sync_pct"), "tempo": None if au.get("beatless") else au.get("tempo"),
+            "beatless": au.get("beatless"), "pulse_strength": au.get("pulse_strength"),
             "integrated_lufs": au.get("integrated_lufs"), "captions": cap.get("position") if cap.get("detected") else None,
             "n_sections": len(an.get("sections") or [])}
 
@@ -1807,12 +1964,22 @@ def summary_lines(an) -> list:
            f"other {st['other_pct']:.0f}% · ending: {st['ending']['type']}"]
     secs = " | ".join(f"{s['name']} {_mmss(s['start'])}-{_mmss(s['end'])} ASL {s['asl']:.1f}s" for s in an["sections"])
     out.append(f"sections: {secs}")
+    if an.get("section_shares"):
+        out.append("acts (share of runtime): " + " | ".join(f"{a['name']} {_mmss(a['t0'])}-{_mmss(a['t1'])} {a['share']:.1f}%"
+                                                          for a in an["section_shares"]))
+    vc = an.get("voice_cuts") or {}
+    if vc.get("n_under_voice"):
+        out.append(f"cuts follow voice: {vc['n_under_voice']} cuts under the voice · {vc['on_break']} on a sentence break/pause "
+                   f"· {vc['mid_sentence']} mid-sentence · {vc['near_word_onset']} within {vc['tol_s']}s of a word onset "
+                   f"({vc['near_word_onset_30ms']} within 30 ms)")
     if au.get("has_audio"):
         bs = au.get("beat_sync_pct")
+        tempo = (f"no beat grid (beatless score, pulse {au.get('pulse_strength')})" if au.get("beatless") else
+                 f"tempo {au.get('tempo')} BPM · beat sync "
+                 + (f"{bs:.0f}% of {au.get('cuts_considered')} cuts (chance {au.get('chance_pct')}%)" if bs is not None
+                    else f"n/a ({au.get('note', '')})"))
         out.append(f"loudness {au.get('integrated_lufs')} LUFS, true peak {au.get('true_peak_dbtp')} dBTP · speech "
-                   f"{au.get('speech_pct')}% · music ~{au.get('music_pct')}% · tempo {au.get('tempo')} BPM · beat sync "
-                   + (f"{bs:.0f}% of {au.get('cuts_considered')} cuts (chance {au.get('chance_pct')}%)" if bs is not None
-                      else f"n/a ({au.get('note', '')})"))
+                   f"{au.get('speech_pct')}% · music ~{au.get('music_pct')}% · {tempo}")
     else:
         out.append("no audio")
     if cap.get("detected"):
@@ -2077,7 +2244,7 @@ def _compare_devices(ref, yours, row, gap, window_s=15.0):
         gap("burns", "big" if not yb else "small",
             f"the reference has {len(rb)} two-frame film burns in its first {window_s:.0f} s ("
             + ", ".join(f"{b['t']:.2f}s" for b in rb) + f"); yours has {len(yb)}")
-    for kind in ("inset", "gate", "letterbox"):
+    for kind in ("inset", "gate", "letterbox", "pillarbox"):
         rr = sum(r["t1"] - r["t0"] for r in rd.get("frames") or [] if r["kind"] == kind and r["t0"] < window_s)
         yy = sum(r["t1"] - r["t0"] for r in yd.get("frames") or [] if r["kind"] == kind and r["t0"] < window_s)
         row(f"frame_{kind}", f"{kind.capitalize()} frame time (first {window_s:.0f} s)", round(rr, 2), round(yy, 2), "s")
@@ -2087,7 +2254,7 @@ def _compare_devices(ref, yours, row, gap, window_s=15.0):
     # devices only the AI brain pass can name (scribbles, shape wipes, glitches, picture-in-picture, film frames)
     rb_ = ref.get("brain") or {}
     fps_ = float((ref.get("source") or {}).get("fps") or 25)
-    measurable = {"card", "burn", "inset", "gate", "letterbox", "typed_title", "title", "flash"}
+    measurable = {"card", "burn", "inset", "gate", "letterbox", "pillarbox", "typed_title", "title", "flash"}
     ai_only = {}
     for d in rb_.get("devices") or []:
         t0 = d["f0"] / fps_
@@ -2175,7 +2342,19 @@ def compare_analyses(ref, yours, mode="render", label="") -> dict:
                                      f"biggest difference is in {_pos_word(f)}: {ycurve[j]:.2f} cuts/s in yours vs "
                                      f"{rcurve[j]:.2f} in the reference", f * yd)
     rb, yb = ref["audio"].get("beat_sync_pct"), yours["audio"].get("beat_sync_pct")
-    row("beat_sync_pct", "Cuts on the beat", rb, yb, "%")
+    if ref["audio"].get("beatless"):
+        row("beat_grid", "Beat grid", f"none (beatless, pulse {ref['audio'].get('pulse_strength')})",
+            "none" if yours["audio"].get("beatless") else f"{yours['audio'].get('tempo')} BPM")
+        rb = yb = None                                  # no beat grid to cut to: on-beat % is meaningless
+    else:
+        row("beat_sync_pct", "Cuts on the beat", rb, yb, "%")
+    ra, ya = ref.get("section_shares") or [], yours.get("section_shares") or []
+    if ra:
+        row("act_shares", "Act shares (% of runtime)", " / ".join(f"{a['share']:.1f}" for a in ra),
+            " / ".join(f"{a['share']:.1f}" for a in ya) or "-")
+    rv, yv = ref.get("voice_cuts") or {}, yours.get("voice_cuts") or {}
+    if rv.get("n_under_voice"):
+        row("voice_cuts_on_break", "Voice cuts on a sentence break", rv.get("on_break_pct"), yv.get("on_break_pct"), "%")
     if rb is not None and yb is not None and rb - yb >= 20:
         gap("beat_sync", "big" if rb - yb >= 40 else "small",
             f"{rb:.0f}% of the reference's cuts land on a beat vs {yb:.0f}% of yours")
@@ -2230,7 +2409,7 @@ def compare_analyses(ref, yours, mode="render", label="") -> dict:
 # ==================================================================================================
 # devices: film burns, frame changes (inset / window-box gate / letterbox), title cards, type-on titles
 # ==================================================================================================
-DEV_VERSION = 2                  # 2: scope letterboxes nested inside a gate are their own run
+DEV_VERSION = 3                  # 2: scope letterboxes nested inside a gate are their own run; 3: pillarbox (side bars)
 DEV_W, DEV_H = 320, 180
 DEV_WINDOW_S = 60.0              # devices are measured in the opening minute (where intros live)
 
@@ -2262,6 +2441,19 @@ def device_features(rgb):
     content = np.abs(a - rc).max(axis=2) > 20
     box = _box_from(content) or (0.0, 0.0, 1.0, 1.0)
     out["box"] = [round(float(x), 4) for x in box]
+    # side bars (pillarbox): the left / right columns flat and dark while the top / bottom rows carry picture.
+    # The picture's horizontal extent = the columns where any pixel rises clearly above the bar level.
+    side = np.concatenate([a[:, :2].reshape(-1, 3), a[:, -2:].reshape(-1, 3)])
+    sc_ = np.median(side, axis=0)
+    out["pill"] = None
+    if float(np.abs(side - sc_).max(axis=1).mean()) < 4 and float(sc_.max()) < 40:
+        cols = np.where((np.abs(a - sc_).max(axis=2) > 12).sum(axis=0) >= max(2, h // 60))[0]
+        rows_live = float((np.abs(a[[0, 1, -2, -1]] - sc_).max(axis=2) > 12).mean())
+        if len(cols) and rows_live > 0.05:
+            px0, px1 = float(cols[0]) / w, float(cols[-1] + 1) / w
+            if 0.005 < px0 < 0.25 and 0.75 < px1 < 0.995:
+                out["pill"] = [round(px0, 4), round(px1, 4)]
+                out["pill_rgb"] = [float(x) for x in sc_]
     # an inner matte: inside the box, a second flat dark ring
     x0, y0, x1, y1 = (int(round(box[0] * w)), int(round(box[1] * h)), int(round(box[2] * w)), int(round(box[3] * h)))
     out["inner"] = None
@@ -2306,7 +2498,9 @@ def _hex(rgb):
 
 
 def _frame_kind(f):
-    """full | inset | gate | letterbox for one frame's features."""
+    """full | pillarbox | inset | gate | letterbox for one frame's features."""
+    if f.get("pill"):                                   # flat dark side bars, picture top to bottom (5:3 in 16:9)
+        return "pillarbox"
     x0, y0, x1, y1 = f["box"]
     w, h = x1 - x0, y1 - y0
     flat = f["ring_std"] < 7 and max(f["ring"]) < 50
@@ -2321,8 +2515,8 @@ def _frame_kind(f):
         if w >= 0.85 and h > 0 and (w / h) * 16 / 9 >= 2.2:
             return "letterbox"                           # a scope letterbox (2.2:1 and wider) nested inside the gate
         return "gate_inner"                              # a matte nested inside the gate
-    if w < 0.92 and h < 0.92 and 0.04 < x0 and 0.04 < y0:
-        return "inset"
+    if 0.3 <= w < 0.92 and 0.3 <= h < 0.92 and 0.04 < x0 and 0.04 < y0:
+        return "inset"                                   # (a lamp alone in a dark frame is not an inset picture)
     return "full"
 
 
@@ -2406,11 +2600,12 @@ def detect_devices(feats, fps, cuts=None):
                  "inner": {"box": [round(float(v), 4) for v in np.median(boxes, axis=0)], "color": "#000000"}}
             out["frames"].append(r)
             continue
-        boxes = np.array([feats[i]["box"] for i in range(f0, f1)])
+        boxes = np.array([([feats[i]["pill"][0], 0.0, feats[i]["pill"][1], 1.0] if kd == "pillarbox" else feats[i]["box"])
+                          for i in range(f0, f1)])
         inners = [feats[i]["inner"] for i in range(f0, f1) if feats[i].get("inner")]
         r = {"f0": f0, "f1": f1, "t0": round(f0 / fps, 4), "t1": round(f1 / fps, 4), "kind": kd,
              "box": [round(float(v), 4) for v in np.median(boxes, axis=0)],
-             "color": _hex(np.median([feats[i]["ring"] for i in range(f0, f1)], axis=0))}
+             "color": _hex(np.median([feats[i]["pill_rgb" if kd == "pillarbox" else "ring"] for i in range(f0, f1)], axis=0))}
         if len(inners) > (f1 - f0) / 2:
             r["inner"] = {"box": [round(float(v), 4) for v in np.median(np.array(inners), axis=0)], "color": "#000000"}
         prev = out["frames"][-1] if out["frames"] else None

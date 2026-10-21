@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 FPS = 24
@@ -154,6 +155,8 @@ def test_pacing_beats_loudness_captions_sheets(refproj):
     assert au["integrated_lufs"] is not None and au["true_peak_dbtp"] is not None
     assert 110 <= au["tempo"] <= 130 and au["music_pct"] > 50
     assert au["beat_sync_pct"] >= 80, au
+    assert au["beatless"] is False and au["pulse_strength"] >= R.PULSE_BEATLESS     # a click track has a beat
+    assert an["section_shares"] and abs(sum(a["share"] for a in an["section_shares"]) - 100) < 0.5
     assert au["chance_pct"] < au["beat_sync_pct"]
     cap = an["captions"]
     assert cap["detected"] and cap["band"] == "bottom" and cap["position"] in ("lower", "bottom")
@@ -345,3 +348,76 @@ def test_studio_reference_routes(refproj, srv):
     assert code == 200 and _wait_job(port, j["job"])["status"] == "done"
     assert _req(port, "POST", "/api/refs", {"src": "/no/such/file.mp4"})[0] == 404
     assert _req(port, "POST", "/api/refs", {})[0] == 400
+
+
+# ------------------------------------------------------------------------------------------------ reader units
+
+def test_pulse_strength_beatless_pad_vs_click_track():
+    """A sustained pad with slow swells (a beatless film score) has no beat grid; a click track does."""
+    from cutroom import reference as R
+    sr = 16000
+    t = np.arange(40 * sr) / sr
+    rng = np.random.default_rng(0)
+    pad = (0.3 * np.sin(2 * np.pi * 110 * t) * (0.6 + 0.4 * np.sin(2 * np.pi * 0.07 * t))
+           + 0.02 * rng.standard_normal(len(t))).astype(np.float32)
+    click = (np.sin(2 * np.pi * 1000 * t) * np.exp(-60 * (t % 0.5))).astype(np.float32)
+    p, c = R.pulse_strength(pad, sr), R.pulse_strength(click, sr)
+    assert p["beatless"] is True and p["pulse_strength"] < R.PULSE_BEATLESS, p
+    assert c["beatless"] is False and c["pulse_strength"] > 0.25, c
+    # a beatless reference reports no beat sync (no BPM fitted to speech or swells)
+    bs = R._beat_sync([1.0, 2.0, 3.0], {"beatless": True, "pulse_strength": 0.12, "beats": [0.5, 1.0, 1.5, 2.0]}, 24)
+    assert bs["beat_sync_pct"] is None and bs["beatless"] and "beatless" in bs["note"]
+
+
+def test_voice_cuts_breaks_mid_sentence_and_onsets():
+    from cutroom import reference as R
+    words = [[1.0, 1.2, "One"], [1.25, 1.5, "thing."], [2.2, 2.4, "You"], [2.45, 2.7, "did"], [2.75, 3.0, "it."],
+             [3.05, 3.3, "Love"], [3.35, 3.6, "you."]]
+    vc = R.voice_cuts([0.2, 1.9, 2.44, 3.04, 9.0], words)
+    # 0.2: no words before it; 9.0: none after within 3 s -> not under the voice
+    assert vc["n_under_voice"] == 3
+    by_t = {r["t"]: r for r in vc["cuts"]}
+    assert by_t[1.9]["on"] == "break"                       # in the 0.7 s pause after "thing."
+    assert by_t[2.44]["on"] == "mid"                        # between "You" and "did"
+    assert by_t[3.04]["on"] == "break"                      # after "it." (sentence end), right on "Love"
+    assert vc["on_break"] == 2 and vc["mid_sentence"] == 1
+    assert vc["near_word_onset"] == 2 and vc["near_word_onset_30ms"] == 2
+    assert R.voice_cuts([1.0], [])["n_under_voice"] == 0
+
+
+def test_section_shares_split_at_silence_hole_and_end_card():
+    """The reference's acts: noise, then a hard cut to a near-silent hole, voice, payoff, end card on black."""
+    from cutroom import reference as R
+    dur = 60.0
+    loud = [-12.0] * 10 + [-50.0] * 8 + [-14.0] * 38 + [-60.0, -70.0, None, None]
+    audio = {"integrated_lufs": -14.0, "loudness_curve": loud}
+    starts = [0.0, 4.0, 9.9, 14.0, 18.0, 30.0, 45.0, 56.0]
+    shots = [{"start": a, "end": b, "luma": 40.0, "speech": 0.0} for a, b in zip(starts, starts[1:] + [dur])]
+    shots[-1]["luma"] = 1.0                                  # a logo on black
+    sections = [{"start": 0.0, "end": 18.0, "name": "b-roll"}, {"start": 18.0, "end": 60.0, "name": "voice-over b-roll"}]
+    sh = R.section_shares(sections, shots, audio, dur)
+    assert [a["name"] for a in sh] == ["b-roll", "silence", "voice-over b-roll", "end card"], sh
+    assert [a["t0"] for a in sh] == [0.0, 9.9, 18.0, 56.0]
+    assert abs(sum(a["share"] for a in sh) - 100) < 0.5
+
+
+def test_pillarbox_frames_read_as_pillarbox():
+    """5:3 picture inside a 16:9 frame: flat black bars left and right, picture top to bottom (DC06: 60/59 px
+    bars at 1918 wide). It reads as its own device kind, never as a gate or an inset."""
+    from cutroom import reference as R
+    rng = np.random.default_rng(3)
+    feats = []
+    for k in range(30):
+        f = np.zeros((180, 320, 3), np.uint8)
+        pic = rng.integers(10, 200, (180, 300, 3), dtype=np.uint8)
+        f[:, 10:310] = pic                                    # 10 px bars each side at 320 = 3.1 %
+        feats.append(R.device_features(f))
+    assert all(R._frame_kind(x) == "pillarbox" for x in feats)
+    d = R.detect_devices(feats, 24.0)
+    fr = [r for r in d["frames"] if r["kind"] == "pillarbox"]
+    assert fr and abs(fr[0]["box"][0] - 10 / 320) < 0.01 and abs(fr[0]["box"][2] - 310 / 320) < 0.01
+    assert fr[0]["color"] == "#000000"
+    assert R.device_kinds({"devices": d}) == ["pillarbox"]
+    # a full-frame picture with dark edges only in the corners is not a pillarbox
+    g = np.full((180, 320, 3), 120, np.uint8)
+    assert R._frame_kind(R.device_features(g)) == "full"

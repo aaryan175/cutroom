@@ -444,7 +444,13 @@ def _is_jump(arr, i) -> bool:
     hist = float(hd[i]) >= 0.42 and d >= 6.0 and d >= 2.0 * (med + 1.5)
     col = float(arr["chd"][i]) >= 0.5 and d >= 5.0 and d >= 2.0 * (med + 1.5)
     edge = float(arr["ecr"][i]) >= 0.55 and d >= 5.0 and d >= 2.5 * (med + 1.5)
-    if not (rel or hist or col or edge):
+    # a new picture that matches none of the last SAME_LAGS frames, with a steady picture on both sides of the
+    # step (a cut out of a dark, soft foreground pass inside busy handheld footage stands out less from its
+    # neighbourhood than a clean cut does; fast motion or a fading flash never holds still either side)
+    n_ = len(mafd)
+    held = (2 <= i < n_ - 1 and same_pic(arr, i - 2, i - 1) >= 0.6 and same_pic(arr, i, i + 1) >= 0.6)
+    new = d >= 6.0 and d >= 1.8 * (med + 1.5) and held and _matches_none(arr, i)
+    if not (rel or hist or col or edge or new):
         return False
     # a fast pan / whip: the picture moved (a real global shift) and, shifted back, it matches
     mc = float(arr["mcd"][i])
@@ -459,6 +465,66 @@ def _is_jump(arr, i) -> bool:
     if _continuous(arr, i):
         return False
     return True
+
+
+def _matches_none(arr, i, thr=0.4) -> bool:
+    """The picture at i is like none of the SAME_LAGS frames before it (at least 3 stored scores, all below thr)."""
+    v = [float(arr[f"same{L}"][i]) for L in range(1, SAME_LAGS + 1) if f"same{L}" in arr and i < len(arr[f"same{L}"])]
+    v = [x for x in v if not np.isnan(x)]
+    return len(v) >= 3 and max(v) < thr
+
+
+def _progressive(arr, i) -> bool:
+    """A change spread over several frames that keeps going one way into darkness (an occluder crossing the lens,
+    a body filling the frame, a fade to black from one edge): the frames around it change almost as much, and the
+    brightness falls steadily for 5 frames to near black. A hard cut is a single step."""
+    n = len(arr["mafd"])
+    if i < 2 or i + 2 >= n:
+        return False
+    m = arr["mafd"]
+    d = float(m[i])
+    big = [float(m[j]) >= 0.35 * d for j in (i - 2, i - 1, i + 1, i + 2)]
+    # the change was already under way for two frames, or carries on for two, or surrounds the frame
+    if not ((big[0] and big[1]) or (big[2] and big[3]) or (big[1] and big[2])):
+        return False
+    lu = [float(x) for x in arr["luma"][i - 2:i + 3]]
+    st = np.diff(lu)
+    # covering the lens = darkening toward black (a light leak or a flare building over a cut brightens instead)
+    mono = (st <= 0.5).all() and lu[-1] <= 30.0
+    tot = abs(lu[-1] - lu[0])
+    # ... and no single step carries most of it (a hard cut out of a moving shot into a dark one is one step)
+    return bool(mono and tot >= 20.0 and float(np.abs(st).max()) < 0.7 * tot)
+
+
+def _ramped(luma, e, into=True, k=4) -> bool:
+    """The picture reaches (into) or leaves (not into) a black run at frame e by a steady ramp over k frames: no
+    single step carries most of the change. A fade or an occluder inside one take, not a cut to black."""
+    n = len(luma)
+    lu = [float(x) for x in (luma[max(0, e - k):e + 1] if into else luma[max(0, e - 1):min(n, e + k)])]
+    if len(lu) < 4:
+        return False
+    st = np.diff(lu) * (-1 if into else 1)              # positive = moving toward black (into) / out of it
+    tot = float(st.sum())
+    return bool(tot >= 20.0 and (st >= -0.5).all() and float(st.max()) < 0.7 * tot)
+
+
+GRADE_MONO = 4.0              # mean HSV saturation (0-255) below this = a black-and-white picture
+GRADE_COLOUR = 20.0           # ... above this = a colour picture
+
+
+def _grade_switch(arr, i, k=4) -> bool:
+    """A persistent switch between a black-and-white and a colour picture at frame i (B&W -> teal in the same
+    darkness): a grade change is a cut even when the two dark frames look alike in grey. A light event that
+    adds colour for a frame or two is not persistent, so it never counts."""
+    if "sat" not in arr:
+        return False
+    sat = arr["sat"]
+    n = len(sat)
+    if i - k < 0 or i + k + 1 > n:
+        return False
+    pre, post = sat[i - k:i], sat[i + 1:i + k + 1]
+    lo, hi = (pre, post) if float(np.median(pre)) < float(np.median(post)) else (post, pre)
+    return bool(float(lo.max()) < GRADE_MONO and float(hi.min()) >= GRADE_COLOUR)
 
 
 def _continuous(arr, i) -> bool:
@@ -508,7 +574,14 @@ def _gradual(arr, fps, hard):
         steady = float(np.max(steps)) < 3.5 * (float(np.median(steps)) + 0.5)
         moving = float(np.median(arr["mcd"][a + 1:b + 1])) < 0.6 * float(np.median(steps)) if "mcd" in arr else False
         different = block_match(A, B, 4, 3) < 0.35          # a flare fading on one picture is not a transition
-        if 0.2 < alpha < 0.8 and fit < 0.15 * dab and min(dam, dbm) > 0.25 * dab and steady and not moving and different:
+        # bounded: the picture changes faster inside the window than in the k frames before and after it (a slow
+        # light drift or a steady move inside one take changes at the same rate everywhere)
+        inside = float(np.mean(steps))
+        outside = max(float(np.mean(arr["mafd"][max(1, a - k + 1):a + 1])) if a >= 1 else 0.0,
+                      float(np.mean(arr["mafd"][b + 1:min(n, b + k + 1)])) if b + 1 < n else 0.0)
+        bounded = inside >= 1.3 * outside + 0.5
+        if 0.2 < alpha < 0.8 and fit < 0.15 * dab and min(dam, dbm) > 0.25 * dab and steady and not moving and different \
+                and bounded:
             return {"alpha": alpha, "fit": fit / dab, "dark": min(float(arr["luma"][a]), float(arr["luma"][b])) < 16}
         return None
     out = []
@@ -545,7 +618,11 @@ def detect_shots(arr, fps, extra_candidates=()) -> dict:
     4. black runs bound shots; dissolves / fades add a boundary at their middle"""
     n = int(arr["n"][0])
     luma = arr["luma"]
+    mafd = arr["mafd"]
     cand = [i for i in range(1, n) if _is_jump(arr, i)]
+    grade = {i for i in range(1, n) if _grade_switch(arr, i)
+             and float(mafd[i]) >= max(2.0, 2.0 * (_local_med(mafd, i) + 1.5))}
+    cand += [i for i in grade if not any(abs(i - x) <= 1 for x in cand)]
     pys = set(int(c) for c in list(arr.get("content_cuts", [])) + list(arr.get("adaptive_cuts", [])) + list(extra_candidates))
     for c in sorted(pys):
         if 0 < c < n and not any(abs(c - x) <= 2 for x in cand) and _soft_ok(arr, c):
@@ -557,9 +634,19 @@ def detect_shots(arr, fps, extra_candidates=()) -> dict:
     for c in cand:
         if c in drop:
             continue
-        # 2. flash return
+        if c in grade:                      # a B&W <-> colour switch: never a light event on one picture
+            continue
+        # a steady change over several frames (an occluder crossing the lens, a fade from one edge): not a cut
+        if _progressive(arr, c):
+            drop.add(c)
+            rejected.append({**boundary_score(arr, c), "why": "progressive change over several frames (occluder / "
+                                                              "body crossing the lens, fade from an edge)"})
+            continue
+        # 2. flash return: the picture before comes back AND the frame it comes back on is itself a step
+        # (a flash ends with a jump back; a jump-out to a similar wider framing just carries on)
         back = next((k for k in range(1, FLASH_MAX + 1) if c + k < n and same_pic(arr, c - 1, c + k) >= SAME
-                     and same_pic(arr, c - 1, c) < SAME), None)
+                     and same_pic(arr, c - 1, c) < SAME
+                     and (float(mafd[c + k]) >= max(4.0, 0.35 * float(mafd[c])) or _anomaly(arr, c + k))), None)
         if back:
             inside = [x for x in cand if c <= x <= c + back]
             for x in inside:
@@ -624,8 +711,16 @@ def detect_shots(arr, fps, extra_candidates=()) -> dict:
             s = i
         elif not v and s is not None:
             if i - s >= 2:
+                # a black run bounds shots when it is true black, or where its edge is a step; very dark footage
+                # drifting across the threshold (a tilt off a dark floor, a murky room) is not a boundary
+                deep = float(np.median(luma[s:i])) < 8.0
                 for e in (s, i):
-                    if 0 < e < n and not any(abs(e - c) <= 2 for c in cs):
+                    if not 0 < e < n or any(abs(e - c) <= 2 for c in cs):
+                        continue
+                    a_, b_ = float(np.mean(luma[max(0, e - 2):e])), float(np.mean(luma[e:min(n, e + 2)]))
+                    if _ramped(luma, e, into=(e == s)):
+                        continue                    # the take itself goes black (an occluder, a body over the lens)
+                    if deep or abs(a_ - b_) >= 6.0:
                         cs.add(e)
             s = None
     gradual = _gradual(arr, fps, cs)
@@ -651,12 +746,13 @@ def shot_features_from_frames(frames_bgr):
     """Test helper: the full scan feature set for a list of BGR frames (any size)."""
     import cv2
     sf = ShotFeatures()
-    L = {k: [] for k in ("luma", "std", "mafd", "hd")}
+    L = {k: [] for k in ("luma", "std", "sat", "mafd", "hd")}
     g32 = []
     prev_small = prev_hist = None
     for fr in frames_bgr:
         grey = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
         m, s = cv2.meanStdDev(grey)
+        L["sat"].append(float(cv2.cvtColor(fr, cv2.COLOR_BGR2HSV)[..., 1].mean()))      # as reference.scan_video
         L["luma"].append(float(m[0, 0]))
         L["std"].append(float(s[0, 0]))
         small = cv2.resize(grey, (64, 36), interpolation=cv2.INTER_AREA).astype(np.int16)

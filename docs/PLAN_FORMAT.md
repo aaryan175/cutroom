@@ -331,16 +331,84 @@ the typed title → burn into the edit. Optional: `inset` / `gate` (override the
 - The music runs `under` the voice (not ducked). Defaults: the first section's song.
 - Style "teaser" puts a flash (or a burn with `burns: true`) into the second block of micro-cuts.
 
+## Brand-film toolkit (a stylised cinematic reference)
+Built to rebuild a measured brand film (black-and-white + teal night grade, 5:3 pillarbox, a voice memo over
+pictures, a near-silent hole, a sub riser into the first word, a closing burst of callbacks, logo end cards).
+`cutroom looks ref <id>` maps each reference shot to a look; `cutroom ref show <id>` gives the act shares and how the
+cuts follow the voice. All fields are optional and off by default.
+
+**Picture**
+- Looks `bw_contrast` and `teal_night` (generated LUTs from the measured recipe, see Looks) per segment, per montage
+  shot (`shots[k].look`) and per cutaway (`cutaways[k].look`, wins over its segment's look).
+- `frame: {"kind": "pillarbox", "aspect": 1.667}`: black side bars, a 5:3 picture inside 16:9 (60 px a side at 1920).
+- `{"type": "image", "file": "logo.png", "dur": 2.8, "size": 0.3, "bg": "#000000"}`: an image / logo card, centred,
+  `size` = image height / frame height, PNG alpha kept, hard cut in and out, held. Full frame (no pillarbox) unless
+  the segment sets `frame`. The file is the creator's (path relative to the project).
+- `exposure_stops` takes an automation as well as a number: `{"from": -1.5, "to": 0, "at": 0, "over": 6}` or
+  `[[t, stops], ...]` (seconds from the segment start): an exposure ramp across one shot (log domain before the LUT,
+  as the fixed trim; quantised to ≤ 48 invisible steps).
+- `montage.min_shot` / `max_shot` go down to 0.04 s; a burst shot of 0.2 s = 5 frames at 25 fps (`shots[k].dur`).
+- `slowmo: 8` or `{"factor": 8, "method": "auto"|"frames"|"flow"}` on broll or a montage shot (1.05–16x). `frames`
+  when the source has them (source fps / factor ≥ output fps: a 100p source gives a real 4x in 25p, every frame a
+  new one); otherwise `flow`: the missing frames are optical-flow interpolated (`minterpolate`) after the grade, and
+  the render warns (flow warps on fast motion and edges; real 8x needs 200 fps footage). The piece's length is
+  (out − in) × factor; its natural sound is dropped (music / the bed carries it).
+
+**Sound**
+- `sound` on a segment (times from the segment start) or a section (times from the section start), on that
+  piece's own audio (natural sound or voice):
+  ```json
+  "sound": {"gain_db": -30, "gain": {"from": -30, "to": 0, "at": 4, "over": 2}, "lowpass": {"from": 1900, "to": 4500, "at": 11.8, "over": 4}}
+  ```
+  `gain_db` is static (−30 under a −24 LUFS ambience = the reference's −50 LUFS near-silence hole), `gain` is dB
+  automation, `lowpass` is cutoff automation in Hz (a bank of 4th-order low-passes crossfaded in log frequency, so
+  a slam to 2.2 kHz never clicks; ≥ 18 kHz = open). Automation values: a number, `[[t, v], ...]`,
+  `{"keys": [[t, v], ...]}` or `{"from", "to", "at", "over"}` (`over` defaults to the rest of the span).
+- `section.music.lowpass` (same automation, section time) muffles the song; `section.music.gain_keys` is dB
+  automation on the bed; `section.music.under_db` may be a ramp `{"from": -14, "to": 0}` (mode `under`).
+- `section.music.duck_bands: {"sub": -25, "mid": -14, "high": -14}` (mode `duck`): a frequency-dependent duck under
+  real dialogue: the bed is split at 120 Hz and 4 kHz (the mid is the exact remainder, so an un-ducked bed is
+  unchanged) and each band ducks by its own amount.
+- Voice-over from a voice memo: audio-only files under the library (WAV / M4A / MP3 ...) are registered by
+  `cutroom index` (status `audio`, no proxy), transcribed like any clip, and used as
+  `broll.voiceover: {"clip": "<memo>", "in", "out", "clean": false, "gain_db": 0}`. `clean: false` keeps the raw
+  recording (its hiss and phone character; no de-noise) for that voice-over only.
+- New sounds: `sub_riser` (`dur` 4–8 s, 32→110 Hz glide + 30–200 Hz noise, ~3.6 Hz tremolo, climbing ~36 dB; its
+  END lands on the event and it stops dead: `{"name": "sub_riser", "on": "end", "dur": 6}` on the silent segment
+  stops on the cut into the first word) and `sub_drop` (60→30 Hz over ~1.5 s, peak on the event). Any sfx takes
+  `offset` (s, e.g. −0.14: the impact leads its cut) and `align` (`peak` | `end`); a transition takes `sfx_offset`.
+- `style.dynamics: {"match": "reference", "reference": "<ref id>", "offset_db": 0, "min_db": -30, "max_db": 12}`
+  (or `plan.reference`): after loudness normalisation the WHOLE programme follows the reference's measured
+  momentary-loudness envelope (the cold-open solver extended: gain knots every 0.1 s, apply → limit → ebur128 →
+  correct). The time map is each section's `ref_span: [ref_t0, ref_t1]` (an act onto the reference's act), or
+  `style.dynamics.anchors: [[our_t, ref_t], ...]`, else a linear stretch. The sidecar records `programme_dynamics`.
+- `plan.reference: "<ref id>"`: the reference the whole edit rebuilds (QA rule 38 checks devices against it).
+
+**Story** (voice-over edits; `cutroom plan check` prints hints, never errors): see the edit-planning skill.
+`cutroom breaks <clip>` lists where a voice-over can be cut (sentence / clause / pause gaps).
+
 ## Looks
 `style.grade.look` colours the whole edit; `look` on a segment overrides it for that segment
 (`{"name": "natural"}` = no look there). Value: `{"name": ..., "intensity": 0-1}` or just the name
 (intensity 1). Built-ins: `natural`, `warm_film`, `cool_clean`, `golden_hour`, `teal_orange`,
-`moody_matte`, `punchy`, `soft_pastel`, `bw`, `vintage_fade`, `night_cinematic`; a `.cube` in the project's
-`luts/` folder is `"lut:<file name>"`. The look runs after the base grade (LUT / log curve, saturation)
+`moody_matte`, `punchy`, `soft_pastel`, `bw`, `bw_contrast`, `teal_night`, `vintage_fade`, `night_cinematic`; a
+`.cube` in the project's `luts/` folder is `"lut:<file name>"`.
+- `bw` is Rec.709 luma written to R = G = B (an RGB channel mix): neutral, chroma exactly 128 (ffmpeg's
+  `eq=saturation=0` wrote 127, a green cast).
+- `bw_contrast` and `teal_night` are generated 33³ LUTs from a measured recipe (`looks.GEN_RECIPES`, cached by
+  content in `cache/luts/`): `bw_contrast` = neutral low-key mono, crushed toe, white ceiling 0.85 (217);
+  `teal_night` = one cyan hue at every level, a 4/255 cyan floor, 0.94 ceiling, chroma ×0.70 (×0.35 on skin hues).
+- `teal_night` neutralises white balance first (`"neutralize": true` by default; any look takes the flag): grey-world
+  gains from the shot's own mid-tones (measured per piece and per cutaway), so warm daylight footage lands on the
+  same cyan as neutral footage. The look runs after the base grade (LUT / log curve, saturation)
 and the exposure correction, on every shot of the segment including its cutaways (`cutroom/looks.py`).
 Looks are opt-in (the house grade is the LUT only). Matching a reference's colour (`looks.match`, the
 Studio's "match look") never picks `night_cinematic` for daylight footage and caps the intensity so the
-black point stays ≥ 15 and saturation within +15 % of the LUT-only picture.
+black point stays ≥ 15 and saturation within +15 % of the LUT-only picture. **Reference look mode**
+(`looks.match(..., reference=True)`, on when the reference's own blacks are crushed: `looks.reference_mode`) lifts
+those guards, because then the crushed black and the night tint ARE the look. A stylised reference switches looks
+by shot: `cutroom looks ref <id>` classifies every reference shot (mono / cool / warm / natural) and names the look
+for it (in a teal film the warm shots get `teal_night` too: the same grade on practical light).
 
 ## Overlays
 `kind` is one of `callout`, `lower_third`, `title`, `label` or `typed_title` (above). `position` is one of `auto`, `top-left`,

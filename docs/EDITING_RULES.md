@@ -575,3 +575,26 @@ predecessor cut and a cutroom render. These rules hold the measured numbers. Ren
 128. **Vary the pace by section: fast blocks (ASL 0.5–0.9 s) between long holds (ASL 5–10 s), and cap the longest hold.** [measured-failure]
     Why: the reference's section ASLs run 0.47 / 10.3 / 1.85 / 0.67 / 6.3 / 0.85 / 8.8 / 0.63 / 1.8 / 4.7 / 2.2 / 5.0 s. One global pace reads flat.
     Check: `section.pace` takes the reference's ASL for that section type. No talk hold runs past `max_hold` unless it is on purpose.
+
+## 15. Voice-over edits (measured on a brand film cut to a voice memo)
+
+129. **Cut a voice-over at its sentence breaks and pauses, never inside a word.** [measured]
+    Why: in the reference, 8 of the 14 cuts under the voice memo land on a sentence break or pause; none lands inside a word. The cuts follow her words (9 of 16 within 0.13 s of a word onset), not a beat (the score is beatless).
+    Check: `cutroom breaks <memo>` lists the gaps; `cutroom plan check` hints every voice-over `in`/`out` that falls inside a word, and when fewer than 40 % of the voice-over cuts sit on a break.
+
+130. **Put hands and extreme close-ups under the most tender lines, and the brightest, most joyful shot under the peak line.** [measured]
+    Why: the reference lays hands holding hands under "I don't even know how you do it" and "Love you", and its brightest shot (a girl clapping, p50 117) under "I'm so proud of you".
+    Check: the planner names the tender lines and the peak line from the transcript and picks shots by the tags (ECU / hands / smiling) and measured luma; review the strip.
+
+131. **The closing burst remembers the film: replay at least three earlier images.** [measured]
+    Why: the reference's 13-shot memory burst (4–21 frames per shot, colour against black and white) repeats 4 earlier shots (the bowed head, the child in the panelled room, the pedalling legs, the profile).
+    Check: `cutroom plan check` hints a late montage of 6+ short shots with fewer than 3 shots within 1.5 s of an earlier use of the same clip.
+
+132. **Take the act structure from the reference's measured section shares, not from a template.** [measured]
+    Why: the reference is noise 13.7 % / silence 15.2 % / voice 38.7 % / leap 28.2 % / end card 4.3 %; the silence and the end card are acts in their own right.
+    Check: `cutroom ref show <id>` prints `acts (share of runtime)`; give each plan section its `ref_span` and `plan check` hints a section more than 5 points off its act's share.
+
+133. **A stylised reference's grade is the look: switch it by shot, and match it in reference look mode.** [measured]
+    Why: 70 % of the reference is neutral low-key black and white, 25 % one cyan tint; its blacks are crushed on purpose (p1 3), which the daylight match guards forbid.
+    Check: `cutroom looks ref <id>` gives the look per reference shot; the rebuild uses `bw_contrast` / `teal_night` on the segments that stand in for them (teal neutralises white balance first).
+

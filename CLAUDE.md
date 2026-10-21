@@ -19,7 +19,9 @@ only reads it.
 - `docs/PLAN_FORMAT.md`: the plan JSON (also documented at the top of `cutroom/plan.py`).
 - `docs/WORKFLOW.md`: the full loop with exact commands and time estimates for big libraries.
 - Skills in `.claude/skills/`: load the one matching the step you are on.
-- A reference video to match? `cutroom ref add <file|url>`, then the `reference-matching` skill.
+- A reference video to match? `cutroom ref add <file|url>`, then the `reference-matching` skill. A stylised brand
+  film cut to a voice-over (mono / tinted grade by shot, a voice memo, a silent act, a closing burst)? Also the
+  edit-planning skill's "Voice-over edits" and PLAN_FORMAT's "Brand-film toolkit".
 - A recap of a live event (stage speaker, crowd, music)? `cutroom detect events`, `cutroom recap`, then the
   `event-recap` skill.
 - Platform files, captions, chapters, thumbnails, cutdowns, or a multi-TB library? The

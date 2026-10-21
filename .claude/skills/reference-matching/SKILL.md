@@ -38,11 +38,26 @@ so both sides of every cut sit next to each other), then read the cut map. Check
   Confirm each one on the sheet.
 - **Cuts**: if a sheet shows two tiles of the same picture side by side, that cut is a false one (a
   whip pan or a flash inside a shot). If one tile clearly holds two different pictures, a cut was missed.
+  The detector handles dark low-key footage (a black-and-white ↔ colour switch counts as a cut even when both
+  frames are near black), cuts hidden behind a dark foreground pass, jump-outs on the same view, and an occluder
+  or body crossing the lens into black (one take, not a cut); slow light drifts and tilts are never dissolves.
+  On a hand-checked 118 s brand film it gets all 43 cuts frame-exact with no false ones; still look.
   For anything rule-45 exact, pull the frames: `ffmpeg -ss T -i refs/<id>/proxy.mp4 -frames:v 1 x.jpg`.
 - **Sections** are change points in pace, speech, talking-head share and loudness. Rename them in your
   own head by what happens ("teaser", "morning talk", "drive montage").
+- **Acts** (`section_shares`: `[{name, t0, t1, dur, share}]`, share in % of runtime) are the sections split
+  further where a silence hole starts (≥ 4 s of 1 s loudness bins 25 dB under the programme, on a cut) and
+  where an end card starts (trailing near-black shots with no speech). Build a rebuild's act lengths from these
+  shares, scaled to your runtime. `ref show` prints them as "acts (share of runtime)".
+- **Cuts follow voice** (`voice_cuts`: `n_under_voice`, `on_break`, `mid_sentence`, `on_break_pct`,
+  `near_word_onset`, `near_word_onset_30ms`, `tol_s`, and per cut `{t, on: break|mid, word, onset_dt}`): under a
+  voice-over, how many cuts land on a sentence break or pause (a gap ≥ 0.25 s, or after . ? !) versus
+  mid-sentence, and how many sit within 0.13 s of a word onset. Match that ratio, cutting at the transcript's
+  word timestamps.
 - **Beat sync** counts as meaningful only well above `chance_pct`. Music presence is an estimate from
-  rhythm.
+  rhythm. **A beatless score** (`audio.beatless: true`, `audio.pulse_strength` < 0.17: pads, swells, booms) has no
+  beat grid: `ref show` says "no beat grid" and reports no BPM or on-beat %, because a beat tracker fits a tempo
+  to the speech. Don't beat-sync such an edit; cut on the voice and on the score's hits instead.
 - **Captions**: `method: ocr` read real words (tesseract). `heuristic` only knows that text-like strokes
   are there. `outline: true` means a dark ring around the glyphs. Never copy that (rule 53).
 
@@ -73,7 +88,7 @@ For each reference shot (one-to-one) or section (feel):
 - **Devices (the reference wins, rule 38)**: the analysis has `devices` (card, burns, frames, titles) and
   every cut-map row lists the devices on its shot. Rebuild each one the reference has, with its measured
   numbers: `cold_open.style: "reference"` does it for intros; elsewhere use `transition.kind: "burn"`,
-  `frame` (gate / inset / letterbox), `card` segments and `typed_title` overlays. Don't add any device the
+  `frame` (gate / inset / letterbox / pillarbox), `card` segments and `typed_title` overlays. Don't add any device the
   reference lacks; QA `devices_vs_reference` fails it. Older analyses get devices with
   `reference.ensure_devices(cfg, id)` (no re-analysis).
 - **Colour and brightness**: compare `colour.by_section`, but start from the LUT-only house grade (rule 120).
@@ -86,6 +101,17 @@ For each reference shot (one-to-one) or section (feel):
   the look on a final render.
 - Where the creator's footage has nothing that fits, say which reference shot is missing and offer the
   nearest real beat (rule 116). Never fake it.
+
+### A stylised brand film (grade by shot, voice memo, silence, burst)
+- `cutroom looks ref <id>`: the look of every reference shot (`bw_contrast` / `teal_night`), the share of each, and
+  whether reference look mode is on (crushed blacks on purpose = the match guards are off). Give each rebuild
+  segment / montage shot / cutaway the look of the reference shot it stands in for.
+- `plan.reference: "<id>"`, a section per measured act with `ref_span`, `frame: {"kind": "pillarbox"}` when the
+  reference pillarboxes, `style.dynamics: {"match": "reference"}` for the whole film's loudness shape.
+- The voice act follows the edit-planning skill's "Voice-over edits" (cut on `cutroom breaks`, tender lines on hands,
+  the peak line on the brightest shot, callbacks in the burst). Its sound: `duck_bands`, `sound.lowpass`,
+  `sound.gain_db` for the silence, `sub_riser` ending on the first word (PLAN_FORMAT "Brand-film toolkit").
+- No high-frame-rate footage? `slowmo` falls back to optical flow and warns: tell the creator it is interpolated.
 
 ## 5. Build, render, compare, iterate
 ```bash

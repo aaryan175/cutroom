@@ -109,7 +109,7 @@ The defaults already do these. Change them only for a reason:
   `finish`, `saturation` and `look` are opt-ins for when the creator asks. Never a night look on daylight.
 - **Film / lens** (`style.film`: grain, soften, vignette, halation, bloom, ca, rolloff, black): off by
   default. Fill it only from a measurement (`cutroom.film.match(ref, ours)`), never by taste.
-- **Frames**: `"frame": {"kind": "gate"}` / `{"kind": "inset", "scale": 0.62}` / `{"kind": "letterbox",
+- **Frames**: `"frame": {"kind": "gate"}` / `{"kind": "pillarbox", "aspect": 1.667}` / `{"kind": "inset", "scale": 0.62}` / `{"kind": "letterbox",
   "aspect": 2.46}` on a section, segment or montage shot. Only when the reference has them.
 - **Music**: songs start and stop on the section cut. Montage and b-roll get +7 dB over talk. A flash
   gets a 0.3 s music break before it. For a drop on the first montage cut, set `offset` from
@@ -120,7 +120,28 @@ The defaults already do these. Change them only for a reason:
 - **Push-ins**: use `"push": {"to": 1.05}` on long held talk or static b-roll from 4K masters. Never on
   phone footage or 1080p sources.
 - **Speed ramps**: use `"ramp": {"to": 2.0, "over": 0.4}` on a b-roll or montage shot going into a cut
-  on a drop. Never on talk, and never as slow motion.
+  on a drop. Never on talk, and never as slow motion. Slow motion is `"slowmo": 8` (real frames when the
+  source fps allows, else optical flow with a warning: say so to the creator).
+
+## 7b. Voice-over edits (a memo, a narration, someone's words over pictures)
+Rules 129–133. The words are the grid, not a beat.
+1. **Structure first.** `cutroom ref show <id>` → `acts (share of runtime)`; one plan section per act, each with
+   `"ref_span": [t0, t1]` from that line. Size each section to its share of YOUR runtime.
+2. **Cut points.** `cutroom breaks <memo>` lists sentence / clause / pause gaps. Each b-roll segment carries the
+   next piece of the memo (`voiceover: {clip, in, out, clean: false}`) and its `in`/`out` sit on those gaps
+   (about half the cuts on a sentence break, the rest on clause breaks or pauses, never inside a word).
+3. **Shot to line.** Read the memo (`cutroom say`). Mark the tender lines → hands / ECU / bowed heads under them;
+   mark the peak line → the brightest, most joyful shot (tags: smiling, golden; highest luma). Open and close
+   the voice act on the same framing when the reference does.
+4. **The burst.** The last act's montage replays ≥ 3 earlier images (same clip, same moment, `dur` 0.2–0.9 s),
+   alternating looks (`shots[k].look`), slowing on its last shot, then the longest, widest hold with a push.
+5. **Sound.** A silent act = `sound.gain_db -30` on its b-roll (room tone, no music) plus a
+   `sub_riser` with `on: "end"` on its last segment so it stops dead on the first word; duck the bed with
+   `duck_bands` under the memo; `lowpass` automation where the reference muffles; `style.dynamics` to follow the
+   reference's loudness envelope across the whole film.
+6. **Look.** `cutroom looks ref <id>` → `bw_contrast` / `teal_night` per segment or shot; reference look mode is on
+   when the reference crushes its blacks on purpose.
+7. `cutroom plan check` prints story hints (words cut, missing callbacks, act shares off); fix or explain each.
 
 ## 8. Check and render
 Run `cutroom plan check <plan>`; it validates every clip and in/out against the library. Then

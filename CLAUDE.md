@@ -13,7 +13,7 @@ do the measuring and rendering. **Never modify, move or delete the creator's foo
 only reads it.
 
 ## Read before your first edit
-- `docs/EDITING_RULES.md`: 118 rules learned from real review rounds with a real creator. Each has
+- `docs/EDITING_RULES.md`: 133 rules learned from real review rounds with a real creator. Each has
   a *Why* and a machine *Check*. They are defaults. The creator's own notes always win, and the
   newest note wins over older ones.
 - `docs/PLAN_FORMAT.md`: the plan JSON (also documented at the top of `cutroom/plan.py`).

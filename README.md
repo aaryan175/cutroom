@@ -35,7 +35,7 @@ possible:
 - **Grows with you.** Ask for something it can't do yet and your AI extends the tool itself
   (`docs/ARCHITECTURE.md`).
 
-The taste comes from `docs/EDITING_RULES.md`: 118 rules learned over many review rounds with a real
+The taste comes from `docs/EDITING_RULES.md`: 133 rules learned over many review rounds with a real
 creator. Every rule has a *Why* and a machine-checkable *Check*.
 
 ## Quick start
